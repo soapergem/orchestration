@@ -1,0 +1,408 @@
+id: payment_processing
+namespace: orchestration.payments
+description: >
+  Payment Processing: Validate a payment against the database, process it through
+  a payment gateway with retries, record the result idempotently, and send
+  notifications. Failures are handled with a dedicated error path.
+
+inputs:
+  - id: payment_id
+    type: STRING
+    description: Unique payment identifier
+  - id: amount
+    type: STRING
+    description: Payment amount
+  - id: currency
+    type: STRING
+    defaults: USD
+    description: Currency code
+  - id: from_account
+    type: STRING
+    description: Source account ID
+  - id: to_account
+    type: STRING
+    description: Destination account ID
+  - id: idempotency_key
+    type: STRING
+    required: false
+    description: Idempotency key (defaults to payment_id if not provided)
+
+variables:
+  pg_host: postgres
+  pg_port: "5432"
+  pg_database: orchestration
+  pg_user: orchestration
+  pg_password: orchestration
+
+tasks:
+  - id: validate_payment
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Validate the payment: check that both accounts exist and are active,
+      verify sufficient balance, and check for duplicate payments.
+    retry:
+      type: exponential
+      maxAttempt: 3
+      interval: PT2S
+      maxInterval: PT30S
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import json
+
+      import psycopg2
+
+      payment_id = "{{ inputs.payment_id }}"
+      amount = float("{{ inputs.amount }}")
+      currency = "{{ inputs.currency }}"
+      from_account = "{{ inputs.from_account }}"
+      to_account = "{{ inputs.to_account }}"
+      idempotency_key = "{{ inputs.idempotency_key }}" if "{{ inputs.idempotency_key }}" != "" else payment_id
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      from kestra import Kestra
+
+      try:
+          with conn.cursor() as cur:
+              # Check source account exists and has sufficient balance
+              cur.execute(
+                  "SELECT balance, status FROM accounts WHERE account_id = %s",
+                  (from_account,),
+              )
+              row = cur.fetchone()
+
+              if row is None:
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Source account {from_account} not found",
+                  })
+                  exit()
+
+              balance, status = row
+
+              if status != "active":
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Source account {from_account} is {status}",
+                  })
+                  exit()
+
+              if float(balance) < amount:
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Insufficient balance: {balance} < {amount}",
+                  })
+                  exit()
+
+              # Check destination account exists and is active
+              cur.execute(
+                  "SELECT status FROM accounts WHERE account_id = %s",
+                  (to_account,),
+              )
+              row = cur.fetchone()
+
+              if row is None:
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Destination account {to_account} not found",
+                  })
+                  exit()
+
+              if row[0] != "active":
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Destination account {to_account} is {row[0]}",
+                  })
+                  exit()
+
+              # Check for duplicate payment (idempotency)
+              cur.execute(
+                  "SELECT status FROM transactions WHERE idempotency_key = %s",
+                  (idempotency_key,),
+              )
+              existing = cur.fetchone()
+
+              if existing is not None:
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Duplicate payment: existing transaction with status {existing[0]}",
+                  })
+                  exit()
+
+      finally:
+          conn.close()
+
+      Kestra.outputs({"is_valid": True, "reason": "none"})
+
+  - id: check_validation
+    type: io.kestra.plugin.core.flow.If
+    description: Branch on validation result
+    condition: "{{ outputs.validate_payment.vars.is_valid == true }}"
+    then:
+      - id: process_payment
+        type: io.kestra.plugin.scripts.python.Script
+        description: >
+          Call the simulated payment gateway. Uses an idempotency key to prevent
+          double-charging on retries. Simulates a flaky gateway with timeouts,
+          5xx errors, and declines.
+        retry:
+          type: exponential
+          maxAttempt: 5
+          interval: PT3S
+          maxInterval: PT30S
+        beforeCommands:
+          - pip install requests
+        script: |
+          import json
+          import random
+
+          payment_id = "{{ inputs.payment_id }}"
+          amount = float("{{ inputs.amount }}")
+          currency = "{{ inputs.currency }}"
+          from_account = "{{ inputs.from_account }}"
+          to_account = "{{ inputs.to_account }}"
+          idempotency_key = "{{ inputs.idempotency_key }}" if "{{ inputs.idempotency_key }}" != "" else payment_id
+
+          # Simulated payment gateway call
+          # In production this would call Stripe, PayPal, etc.
+          # The idempotency_key ensures retries do not cause duplicate charges.
+          roll = random.random()
+
+          if roll < 0.05:
+              raise Exception(
+                  json.dumps({
+                      "error_type": "PaymentDeclined",
+                      "payment_id": payment_id,
+                      "reason": "Card declined by issuing bank",
+                      "decline_code": "insufficient_funds",
+                  })
+              )
+          elif roll < 0.20:
+              raise Exception(
+                  f"PaymentGateway5xx: Payment gateway returned 500 for payment {payment_id}"
+              )
+          elif roll < 0.40:
+              raise Exception(
+                  f"PaymentGatewayTimeout: Payment gateway timed out for payment {payment_id}"
+              )
+
+          gateway_transaction_id = f"gw-txn-{payment_id}-{random.randint(10000, 99999)}"
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "payment_status": "success",
+              "gateway_transaction_id": gateway_transaction_id,
+              "amount_charged": amount,
+              "currency": currency,
+          })
+
+      - id: update_database
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: >
+          Idempotently record the payment: debit the source account, credit the
+          destination, and insert a transaction record. Skips if already recorded.
+        retry:
+          type: exponential
+          maxAttempt: 3
+          interval: PT2S
+          maxInterval: PT30S
+        url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+        username: "{{ vars.pg_user }}"
+        password: "{{ vars.pg_password }}"
+        sql: |
+          DO $$
+          DECLARE
+              v_existing_id INT;
+          BEGIN
+              -- Check idempotency: do not double-apply
+              SELECT id INTO v_existing_id
+              FROM transactions
+              WHERE idempotency_key = '{{ inputs.idempotency_key ?? inputs.payment_id }}';
+
+              IF v_existing_id IS NOT NULL THEN
+                  RAISE NOTICE 'Transaction already recorded (idempotent skip)';
+                  RETURN;
+              END IF;
+
+              -- Debit source account
+              UPDATE accounts
+              SET balance = balance - {{ inputs.amount }},
+                  updated_at = NOW()
+              WHERE account_id = '{{ inputs.from_account }}';
+
+              -- Credit destination account
+              UPDATE accounts
+              SET balance = balance + {{ inputs.amount }},
+                  updated_at = NOW()
+              WHERE account_id = '{{ inputs.to_account }}';
+
+              -- Record transaction
+              INSERT INTO transactions
+                  (payment_id, idempotency_key, from_account, to_account,
+                   amount, currency, status, gateway_transaction_id, created_at)
+              VALUES
+                  ('{{ inputs.payment_id }}',
+                   '{{ inputs.idempotency_key ?? inputs.payment_id }}',
+                   '{{ inputs.from_account }}',
+                   '{{ inputs.to_account }}',
+                   {{ inputs.amount }},
+                   '{{ inputs.currency }}',
+                   'completed',
+                   '{{ outputs.process_payment.vars.gateway_transaction_id }}',
+                   NOW());
+          END $$;
+
+      - id: send_notification
+        type: io.kestra.plugin.scripts.python.Script
+        description: Send a success notification. Failures here do not fail the flow.
+        allowFailure: true
+        retry:
+          type: constant
+          maxAttempt: 3
+          interval: PT2S
+        script: |
+          import json
+
+          payment_id = "{{ inputs.payment_id }}"
+          amount = "{{ inputs.amount }}"
+          currency = "{{ inputs.currency }}"
+          gateway_txn = "{{ outputs.process_payment.vars.gateway_transaction_id }}"
+
+          subject = f"Payment Successful: {payment_id}"
+          body = (
+              f"Payment {payment_id} for {amount} {currency} was processed successfully.\n"
+              f"Gateway Transaction ID: {gateway_txn}"
+          )
+
+          print(f"NOTIFICATION: {subject}")
+          print(f"BODY: {body}")
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "payment_id": payment_id,
+              "notification_status": "sent",
+              "subject": subject,
+              "channel": "simulated",
+          })
+    else:
+      - id: validation_failed_log
+        type: io.kestra.plugin.scripts.python.Script
+        description: Log the validation failure reason before entering error handling
+        script: |
+          from kestra import Kestra
+          reason = "{{ outputs.validate_payment.vars.reason }}"
+          Kestra.outputs({
+              "payment_id": "{{ inputs.payment_id }}",
+              "status": "validation_failed",
+              "reason": reason,
+          })
+
+errors:
+  - id: handle_payment_failure
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Record the payment failure in the database and prepare failure notification data.
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      import psycopg2
+
+      payment_id = "{{ inputs.payment_id }}"
+      idempotency_key = "{{ inputs.idempotency_key }}" if "{{ inputs.idempotency_key }}" != "" else payment_id
+      amount = "{{ inputs.amount }}"
+      currency = "{{ inputs.currency }}"
+      from_account = "{{ inputs.from_account }}"
+      to_account = "{{ inputs.to_account }}"
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      try:
+          with conn.cursor() as cur:
+              now = datetime.now(timezone.utc).isoformat()
+
+              # Record failed transaction (idempotent)
+              cur.execute(
+                  "SELECT id FROM transactions WHERE idempotency_key = %s",
+                  (idempotency_key,),
+              )
+              if cur.fetchone() is None:
+                  cur.execute(
+                      """INSERT INTO transactions
+                         (payment_id, idempotency_key, from_account, to_account,
+                          amount, currency, status, error_message, created_at)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                      (
+                          payment_id,
+                          idempotency_key,
+                          from_account,
+                          to_account,
+                          amount,
+                          currency,
+                          "failed",
+                          "Payment processing failed",
+                          now,
+                      ),
+                  )
+
+          conn.commit()
+      finally:
+          conn.close()
+
+      from kestra import Kestra
+      Kestra.outputs({
+          "payment_id": payment_id,
+          "status": "failed",
+          "failure_message": "Payment processing failed",
+      })
+
+  - id: send_failure_notification
+    type: io.kestra.plugin.scripts.python.Script
+    description: Send failure notification
+    allowFailure: true
+    retry:
+      type: constant
+      maxAttempt: 3
+      interval: PT2S
+    script: |
+      payment_id = "{{ inputs.payment_id }}"
+      amount = "{{ inputs.amount }}"
+      currency = "{{ inputs.currency }}"
+
+      subject = f"Payment Failed: {payment_id}"
+      body = (
+          f"Payment {payment_id} for {amount} {currency} has failed.\n"
+          f"Reason: Payment processing failed"
+      )
+
+      print(f"NOTIFICATION: {subject}")
+      print(f"BODY: {body}")
+
+      from kestra import Kestra
+      Kestra.outputs({
+          "payment_id": payment_id,
+          "notification_status": "sent",
+          "subject": subject,
+          "channel": "simulated",
+      })
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: payment-processing-trigger
+    disabled: true

@@ -1,0 +1,414 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: api-fanout-
+  labels:
+    workflow: api-fanout
+  annotations:
+    workflows.argoproj.io/description: >
+      API Fan-Out with Async Callback: Submits an async fetch request, polls for
+      completion (since Argo lacks native HTTP callback-into-step support), normalizes
+      the response, fans out parallel API requests for each item, and combines results.
+spec:
+  entrypoint: api-fanout-pipeline
+  arguments:
+    parameters:
+      - name: url
+        value: "https://api.github.com/orgs/argoproj/repos"
+      - name: api-key
+        value: ""
+      - name: callback-fetch-service-url
+        value: "http://callback-fetch-service:8090"
+      - name: poll-interval-seconds
+        value: "5"
+      - name: poll-max-attempts
+        value: "12"
+  templates:
+    # ---------- Main DAG ----------
+    - name: api-fanout-pipeline
+      dag:
+        tasks:
+          - name: submit-async-fetch
+            template: submit-async-fetch
+            arguments:
+              parameters:
+                - name: url
+                  value: "{{workflow.parameters.url}}"
+                - name: callback-fetch-service-url
+                  value: "{{workflow.parameters.callback-fetch-service-url}}"
+
+          - name: poll-for-completion
+            template: poll-for-completion
+            dependencies:
+              - submit-async-fetch
+            arguments:
+              parameters:
+                - name: correlation-id
+                  value: "{{tasks.submit-async-fetch.outputs.parameters.correlation-id}}"
+                - name: callback-fetch-service-url
+                  value: "{{workflow.parameters.callback-fetch-service-url}}"
+
+          - name: process-fetch-result
+            template: process-fetch-result
+            dependencies:
+              - poll-for-completion
+            arguments:
+              parameters:
+                - name: fetch-result
+                  value: "{{tasks.poll-for-completion.outputs.parameters.fetch-result}}"
+
+          - name: fan-out-api-requests
+            template: fan-out-api-requests
+            dependencies:
+              - process-fetch-result
+            arguments:
+              parameters:
+                - name: items
+                  value: "{{tasks.process-fetch-result.outputs.parameters.items}}"
+            # Skip fan-out if there are no items
+            when: "{{tasks.process-fetch-result.outputs.parameters.item-count}} > 0"
+
+          - name: combine-results
+            template: combine-results
+            dependencies:
+              - fan-out-api-requests
+            arguments:
+              parameters:
+                - name: api-results
+                  value: "{{tasks.fan-out-api-requests.outputs.parameters.api-results}}"
+                - name: source-url
+                  value: "{{workflow.parameters.url}}"
+            when: "{{tasks.process-fetch-result.outputs.parameters.item-count}} > 0"
+
+          - name: no-items-result
+            template: no-items-result
+            dependencies:
+              - process-fetch-result
+            when: "{{tasks.process-fetch-result.outputs.parameters.item-count}} == 0"
+
+    # ---------- Step 1: Submit Async Fetch ----------
+    - name: submit-async-fetch
+      inputs:
+        parameters:
+          - name: url
+          - name: callback-fetch-service-url
+      outputs:
+        parameters:
+          - name: correlation-id
+            valueFrom:
+              path: /tmp/correlation-id
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import urllib.request
+          import uuid
+
+          url = "{{inputs.parameters.url}}"
+          fetch_service_url = "{{inputs.parameters.callback-fetch-service-url}}"
+          api_key = "{{workflow.parameters.api-key}}"
+
+          correlation_id = str(uuid.uuid4())
+
+          # The callback_url would normally point to the Argo API to resume a suspended
+          # step. For the bake-off, we use a polling approach instead: the callback
+          # result is stored by the fetch service and we poll /status/<correlation_id>.
+          # In production, set callback_url to:
+          #   https://<argo-server>/api/v1/workflows/<namespace>/<name>/resume
+          callback_url = f"{fetch_service_url}/callback/{correlation_id}"
+
+          fetch_headers = {}
+          if api_key:
+              fetch_headers["Authorization"] = f"Bearer {api_key}"
+
+          payload = json.dumps({
+              "url": url,
+              "headers": fetch_headers,
+              "callback_url": callback_url,
+              "correlation_id": correlation_id,
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              f"{fetch_service_url}/fetch-async",
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "User-Agent": "orchestration-bakeoff/1.0",
+              },
+              method="POST",
+          )
+
+          try:
+              response = urllib.request.urlopen(req, timeout=10)
+              status_code = response.getcode()
+          except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8")[:500]
+              raise RuntimeError(f"Callback Fetch Service returned {e.code}: {body}")
+
+          if status_code not in (200, 202):
+              raise RuntimeError(f"Callback Fetch Service returned unexpected status {status_code}")
+
+          with open("/tmp/correlation-id", "w") as f:
+              f.write(correlation_id)
+
+          print(f"Submitted async fetch with correlation_id={correlation_id}")
+
+    # ---------- Step 1b: Poll for Completion ----------
+    # Since Argo doesn't have native callback-into-step support for HTTP callbacks,
+    # we poll the fetch service's status endpoint until the async job is done.
+    # In production, you could instead use a suspend node and have the callback
+    # service call the Argo API to resume the workflow.
+    - name: poll-for-completion
+      inputs:
+        parameters:
+          - name: correlation-id
+          - name: callback-fetch-service-url
+      outputs:
+        parameters:
+          - name: fetch-result
+            valueFrom:
+              path: /tmp/fetch-result.json
+      retryStrategy:
+        limit: "2"
+        retryPolicy: Always
+        backoff:
+          duration: "5s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import time
+          import urllib.request
+
+          correlation_id = "{{inputs.parameters.correlation-id}}"
+          fetch_service_url = "{{inputs.parameters.callback-fetch-service-url}}"
+          poll_interval = int("{{workflow.parameters.poll-interval-seconds}}")
+          max_attempts = int("{{workflow.parameters.poll-max-attempts}}")
+
+          print(f"Polling for completion of correlation_id={correlation_id}")
+          print(f"Poll interval: {poll_interval}s, max attempts: {max_attempts}")
+
+          for attempt in range(1, max_attempts + 1):
+              url = f"{fetch_service_url}/status/{correlation_id}"
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "orchestration-bakeoff/1.0"})
+                  response = urllib.request.urlopen(req, timeout=10)
+                  data = json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      print(f"Attempt {attempt}/{max_attempts}: Not ready yet (404)")
+                      if attempt < max_attempts:
+                          time.sleep(poll_interval)
+                          continue
+                      raise RuntimeError(f"Async fetch {correlation_id} not found after {max_attempts} attempts")
+                  raise
+
+              status = data.get("status")
+              print(f"Attempt {attempt}/{max_attempts}: status={status}")
+
+              if status == "completed":
+                  with open("/tmp/fetch-result.json", "w") as f:
+                      json.dump(data, f)
+                  print("Fetch completed successfully")
+                  exit(0)
+              elif status == "failed":
+                  raise RuntimeError(f"Async fetch failed: {data.get('error', 'unknown')}")
+              elif status in ("pending", "processing"):
+                  if attempt < max_attempts:
+                      time.sleep(poll_interval)
+                      continue
+                  raise RuntimeError(f"Async fetch {correlation_id} still {status} after {max_attempts} attempts")
+              else:
+                  raise RuntimeError(f"Unexpected status '{status}' from fetch service")
+
+          raise RuntimeError(f"Polling exhausted after {max_attempts} attempts")
+        activeDeadlineSeconds: 120
+
+    # ---------- Step 2: Process Fetch Result ----------
+    - name: process-fetch-result
+      inputs:
+        parameters:
+          - name: fetch-result
+      outputs:
+        parameters:
+          - name: items
+            valueFrom:
+              path: /tmp/items.json
+          - name: item-count
+            valueFrom:
+              path: /tmp/item-count
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+
+          raw = json.loads('''{{inputs.parameters.fetch-result}}''')
+
+          callback_status = raw.get("status")
+          if callback_status != "completed":
+              raise RuntimeError(
+                  f"Fetch service returned status '{callback_status}': "
+                  f"{raw.get('error', 'unknown error')}"
+              )
+
+          body = raw.get("body")
+          if body is None:
+              raise RuntimeError("Fetch service callback contained no body")
+
+          if isinstance(body, str):
+              body = json.loads(body)
+
+          items = []
+          if isinstance(body, list):
+              for item in body:
+                  items.append({
+                      "id": item.get("id"),
+                      "name": item.get("name", item.get("id")),
+                      "detail_url": item.get("url"),
+                  })
+
+          with open("/tmp/items.json", "w") as f:
+              json.dump(items, f)
+          with open("/tmp/item-count", "w") as f:
+              f.write(str(len(items)))
+
+          print(f"Processed {len(items)} items from fetch result")
+
+    # ---------- Step 3: Fan-Out API Requests ----------
+    - name: fan-out-api-requests
+      inputs:
+        parameters:
+          - name: items
+      outputs:
+        parameters:
+          - name: api-results
+            valueFrom:
+              parameter: "{{tasks.fetch-item-detail.outputs.parameters.detail-result}}"
+      dag:
+        tasks:
+          - name: fetch-item-detail
+            template: fetch-item-detail
+            arguments:
+              parameters:
+                - name: item
+                  value: "{{item}}"
+            withParam: "{{inputs.parameters.items}}"
+
+    # ---------- Step 3a: Fetch Single Item Detail ----------
+    - name: fetch-item-detail
+      inputs:
+        parameters:
+          - name: item
+      outputs:
+        parameters:
+          - name: detail-result
+            valueFrom:
+              path: /tmp/detail-result.json
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+          maxDuration: "30s"
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import urllib.request
+
+          item = json.loads('''{{inputs.parameters.item}}''')
+          api_key = "{{workflow.parameters.api-key}}"
+
+          detail_url = item["detail_url"]
+
+          headers = {"User-Agent": "orchestration-bakeoff/1.0"}
+          if api_key:
+              headers["Authorization"] = f"Bearer {api_key}"
+
+          req = urllib.request.Request(detail_url, headers=headers)
+          response = urllib.request.urlopen(req, timeout=30)
+
+          if response.getcode() != 200:
+              raise RuntimeError(
+                  f"Detail API request for {item['id']} failed with status {response.getcode()}"
+              )
+
+          detail = json.loads(response.read().decode("utf-8"))
+
+          result = {
+              "id": item["id"],
+              "name": item["name"],
+              "detail": detail,
+          }
+
+          with open("/tmp/detail-result.json", "w") as f:
+              json.dump(result, f)
+
+          print(f"Fetched detail for item {item['id']}")
+        activeDeadlineSeconds: 60
+
+    # ---------- Step 4: Combine Results ----------
+    - name: combine-results
+      inputs:
+        parameters:
+          - name: api-results
+          - name: source-url
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+
+          raw_results = '''{{inputs.parameters.api-results}}'''
+          source_url = "{{inputs.parameters.source-url}}"
+
+          # api-results from withParam fan-out arrives as a JSON array of results
+          api_results = json.loads(raw_results)
+
+          # If the result is a single item (not from a parallel), wrap it
+          if isinstance(api_results, dict):
+              api_results = [api_results]
+
+          combined = []
+          errors = []
+
+          for result in api_results:
+              if "error" in result:
+                  errors.append({"id": result.get("id"), "error": result["error"]})
+              else:
+                  combined.append({
+                      "id": result["id"],
+                      "name": result["name"],
+                      "detail": result.get("detail", {}),
+                  })
+
+          output = {
+              "status": "success",
+              "source_url": source_url,
+              "total_items": len(api_results),
+              "successful": len(combined),
+              "failed": len(errors),
+              "results": combined,
+              "errors": errors,
+          }
+
+          print(json.dumps(output, indent=2))
+
+    # ---------- No Items Path ----------
+    - name: no-items-result
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          result = {
+              "status": "no_items",
+              "message": "No items found from initial content fetch.",
+          }
+          print(json.dumps(result, indent=2))

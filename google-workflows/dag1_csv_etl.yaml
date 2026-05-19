@@ -1,0 +1,184 @@
+# CSV ETL Pipeline: Unzip, parallel load to Postgres, SQL transform, convert to Parquet
+# Deploy: gcloud workflows deploy csv-etl-pipeline --source=dag1_csv_etl.yaml
+#
+# Expected input:
+# {
+#   "zip_url": "https://storage.googleapis.com/bucket/data.zip",
+#   "extract_prefix": "extracted/",
+#   "db_config": { "host": "postgres", "port": 5432, "database": "orchestration", "user": "orchestration", "password": "orchestration" },
+#   "gcs_bucket": "my-bucket"
+# }
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - processing_service_url: "http://processing-service:8080"
+          - db_proxy_url: "http://db-proxy-service:8080"
+          - zip_url: ${input.zip_url}
+          - extract_prefix: ${default(map.get(input, "extract_prefix"), "extracted/")}
+          - db_config: ${input.db_config}
+          - gcs_bucket: ${input.gcs_bucket}
+
+    - unzip_file:
+        try:
+          call: http.post
+          args:
+            url: ${processing_service_url + "/unzip"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              zip_url: ${zip_url}
+              gcs_bucket: ${gcs_bucket}
+              extract_prefix: ${extract_prefix}
+            timeout: 120
+          result: unzip_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_unzip_error:
+                raise:
+                  code: "UNZIP_FAILED"
+                  message: ${"Unzip failed - " + json.encode_to_string(e)}
+
+    - extract_csv_keys:
+        assign:
+          - csv_keys: ${unzip_response.body.csv_keys}
+          - s3_bucket: ${unzip_response.body.gcs_bucket}
+
+    - process_csvs:
+        try:
+          parallel:
+            shared: [load_results]
+            for:
+              value: csv_key
+              in: ${csv_keys}
+              steps:
+                - load_csv_to_postgres:
+                    try:
+                      call: http.post
+                      args:
+                        url: ${db_proxy_url + "/load-csv"}
+                        headers:
+                          Content-Type: "application/json"
+                        body:
+                          gcs_bucket: ${s3_bucket}
+                          csv_key: ${csv_key}
+                          db_host: ${db_config.host}
+                          db_port: ${db_config.port}
+                          db_name: ${db_config.database}
+                          db_user: ${db_config.user}
+                          db_password: ${db_config.password}
+                        timeout: 120
+                      result: load_result
+                    retry:
+                      predicate: ${retry_on_server_error}
+                      max_retries: 6
+                      backoff:
+                        initial_delay: 2
+                        max_delay: 64
+                        multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_process_error:
+                raise:
+                  code: "CSV_PROCESSING_FAILED"
+                  message: ${"Parallel CSV load failed - " + json.encode_to_string(e)}
+
+    - run_sql_transform:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/execute-sql"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+              sql_template: "transform"
+              csv_keys: ${csv_keys}
+            timeout: 900
+          result: transform_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 2
+          backoff:
+            initial_delay: 10
+            max_delay: 40
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_transform_error:
+                raise:
+                  code: "SQL_TRANSFORM_FAILED"
+                  message: ${"SQL transform failed - " + json.encode_to_string(e)}
+
+    - convert_to_parquet:
+        try:
+          call: http.post
+          args:
+            url: ${processing_service_url + "/convert-to-parquet"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              gcs_bucket: ${gcs_bucket}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+              transform_result: ${transform_response.body}
+            timeout: 600
+          result: parquet_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 32
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_parquet_error:
+                raise:
+                  code: "PARQUET_CONVERSION_FAILED"
+                  message: ${"Parquet conversion failed - " + json.encode_to_string(e)}
+
+    - return_result:
+        return:
+          status: "completed"
+          csv_count: ${len(csv_keys)}
+          transform: ${transform_response.body}
+          parquet: ${parquet_response.body}
+
+retry_on_server_error:
+  params: [e]
+  steps:
+    - check_error:
+        switch:
+          - condition: ${e.code == 429}
+            return: true
+          - condition: ${e.code >= 500 and e.code < 600}
+            return: true
+          - condition: ${"ConnectionError" in e.message}
+            return: true
+          - condition: ${"TimeoutError" in e.message}
+            return: true
+        next: return_false
+    - return_false:
+        return: false

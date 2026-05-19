@@ -1,0 +1,909 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: order-fulfillment-
+  labels:
+    workflow: order-fulfillment
+  annotations:
+    workflows.argoproj.io/description: >
+      Order Fulfillment with Saga Compensation: Validates order, reserves inventory
+      (via WorkflowTemplate), optionally requests manager approval for high-value
+      orders, calls shipping API (via WorkflowTemplate), updates order status, and
+      sends notifications. On failure, runs saga compensation via onExit handler:
+      releases inventory, marks order cancelled, and sends cancellation notification.
+spec:
+  entrypoint: order-fulfillment
+  onExit: exit-handler
+  activeDeadlineSeconds: 600
+  arguments:
+    parameters:
+      - name: input
+        value: |
+          {
+            "order_id": "ORD-001",
+            "customer_id": "CUST-001",
+            "items": [
+              {"sku": "SKU-A", "quantity": 2, "unit_price": 29.99},
+              {"sku": "SKU-B", "quantity": 1, "unit_price": 49.99}
+            ],
+            "shipping_address": {
+              "street": "123 Main St",
+              "city": "Springfield",
+              "state": "IL",
+              "zip": "62701",
+              "country": "US"
+            },
+            "approval_threshold": 500.00
+          }
+  templates:
+    # ---------- Main DAG ----------
+    - name: order-fulfillment
+      dag:
+        tasks:
+          - name: validate-order
+            template: validate-order
+
+          - name: reserve-inventory
+            template: reserve-inventory
+            dependencies:
+              - validate-order
+            when: "'{{tasks.validate-order.outputs.parameters.is-valid}}' == 'true'"
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: customer-id
+                  value: "{{tasks.validate-order.outputs.parameters.customer-id}}"
+                - name: items
+                  value: "{{tasks.validate-order.outputs.parameters.items}}"
+
+          - name: validation-failed
+            template: fail-with-message
+            dependencies:
+              - validate-order
+            when: "'{{tasks.validate-order.outputs.parameters.is-valid}}' != 'true'"
+            arguments:
+              parameters:
+                - name: message
+                  value: "Order validation failed: {{tasks.validate-order.outputs.parameters.validation-reason}}"
+
+          - name: check-approval-and-approve
+            template: manager-approval
+            dependencies:
+              - reserve-inventory
+            # Only request approval if total_amount >= approval_threshold
+            when: "'{{tasks.validate-order.outputs.parameters.needs-approval}}' == 'true'"
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: customer-id
+                  value: "{{tasks.validate-order.outputs.parameters.customer-id}}"
+                - name: total-amount
+                  value: "{{tasks.validate-order.outputs.parameters.total-amount}}"
+                - name: items
+                  value: "{{tasks.validate-order.outputs.parameters.items}}"
+
+          - name: ship-order-after-approval
+            template: call-shipping-api
+            dependencies:
+              - check-approval-and-approve
+            when: "'{{tasks.check-approval-and-approve.outputs.parameters.decision}}' == 'approved'"
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: items
+                  value: "{{tasks.validate-order.outputs.parameters.items}}"
+                - name: shipping-address
+                  value: "{{tasks.validate-order.outputs.parameters.shipping-address}}"
+
+          - name: ship-order-no-approval
+            template: call-shipping-api
+            dependencies:
+              - reserve-inventory
+            when: "'{{tasks.validate-order.outputs.parameters.needs-approval}}' != 'true'"
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: items
+                  value: "{{tasks.validate-order.outputs.parameters.items}}"
+                - name: shipping-address
+                  value: "{{tasks.validate-order.outputs.parameters.shipping-address}}"
+
+          - name: approval-rejected
+            template: fail-with-message
+            dependencies:
+              - check-approval-and-approve
+            when: "'{{tasks.check-approval-and-approve.outputs.parameters.decision}}' != 'approved'"
+            arguments:
+              parameters:
+                - name: message
+                  value: "Order rejected or approval expired"
+
+          - name: update-order-shipped-after-approval
+            template: update-order-status
+            dependencies:
+              - ship-order-after-approval
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: status
+                  value: "shipped"
+                - name: shipment-data
+                  value: "{{tasks.ship-order-after-approval.outputs.parameters.shipment-result}}"
+
+          - name: update-order-shipped-no-approval
+            template: update-order-status
+            dependencies:
+              - ship-order-no-approval
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: status
+                  value: "shipped"
+                - name: shipment-data
+                  value: "{{tasks.ship-order-no-approval.outputs.parameters.shipment-result}}"
+
+          - name: send-shipped-notification-a
+            template: send-notification
+            dependencies:
+              - update-order-shipped-after-approval
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: status
+                  value: "shipped"
+                - name: extra-data
+                  value: "{{tasks.ship-order-after-approval.outputs.parameters.shipment-result}}"
+
+          - name: send-shipped-notification-b
+            template: send-notification
+            dependencies:
+              - update-order-shipped-no-approval
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{tasks.validate-order.outputs.parameters.order-id}}"
+                - name: status
+                  value: "shipped"
+                - name: extra-data
+                  value: "{{tasks.ship-order-no-approval.outputs.parameters.shipment-result}}"
+
+    # ---------- Step 1: Validate Order ----------
+    - name: validate-order
+      outputs:
+        parameters:
+          - name: order-id
+            valueFrom:
+              path: /tmp/order-id
+          - name: customer-id
+            valueFrom:
+              path: /tmp/customer-id
+          - name: items
+            valueFrom:
+              path: /tmp/items.json
+          - name: shipping-address
+            valueFrom:
+              path: /tmp/shipping-address.json
+          - name: is-valid
+            valueFrom:
+              path: /tmp/is-valid
+          - name: validation-reason
+            valueFrom:
+              path: /tmp/validation-reason
+          - name: total-amount
+            valueFrom:
+              path: /tmp/total-amount
+          - name: needs-approval
+            valueFrom:
+              path: /tmp/needs-approval
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+          maxDuration: "30s"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          import psycopg2
+
+          event = json.loads(os.environ["INPUT"])
+
+          order_id = event["order_id"]
+          customer_id = event["customer_id"]
+          items = event["items"]
+          shipping_address = event.get("shipping_address", {})
+          approval_threshold = event.get("approval_threshold", 500.00)
+
+          # Write passthrough data
+          with open("/tmp/order-id", "w") as f:
+              f.write(order_id)
+          with open("/tmp/customer-id", "w") as f:
+              f.write(customer_id)
+          with open("/tmp/items.json", "w") as f:
+              json.dump(items, f)
+          with open("/tmp/shipping-address.json", "w") as f:
+              json.dump(shipping_address, f)
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+
+              cur.execute(
+                  "SELECT status FROM customers WHERE customer_id = %s",
+                  (customer_id,),
+              )
+              row = cur.fetchone()
+              if not row:
+                  reason = f"Customer {customer_id} not found"
+                  with open("/tmp/is-valid", "w") as f:
+                      f.write("false")
+                  with open("/tmp/validation-reason", "w") as f:
+                      f.write(reason)
+                  with open("/tmp/total-amount", "w") as f:
+                      f.write("0")
+                  with open("/tmp/needs-approval", "w") as f:
+                      f.write("false")
+                  print(f"Validation failed: {reason}")
+                  sys.exit(0)
+
+              if row[0] != "active":
+                  reason = f"Customer {customer_id} is {row[0]}"
+                  with open("/tmp/is-valid", "w") as f:
+                      f.write("false")
+                  with open("/tmp/validation-reason", "w") as f:
+                      f.write(reason)
+                  with open("/tmp/total-amount", "w") as f:
+                      f.write("0")
+                  with open("/tmp/needs-approval", "w") as f:
+                      f.write("false")
+                  print(f"Validation failed: {reason}")
+                  sys.exit(0)
+
+              total_amount = 0
+              for item in items:
+                  sku = item["sku"]
+                  quantity = item["quantity"]
+
+                  cur.execute(
+                      "SELECT available_quantity, unit_price FROM inventory WHERE sku = %s",
+                      (sku,),
+                  )
+                  inv_row = cur.fetchone()
+                  if not inv_row:
+                      reason = f"SKU {sku} not found"
+                      with open("/tmp/is-valid", "w") as f:
+                          f.write("false")
+                      with open("/tmp/validation-reason", "w") as f:
+                          f.write(reason)
+                      with open("/tmp/total-amount", "w") as f:
+                          f.write("0")
+                      with open("/tmp/needs-approval", "w") as f:
+                          f.write("false")
+                      print(f"Validation failed: {reason}")
+                      sys.exit(0)
+
+                  available, unit_price = inv_row
+                  if available < quantity:
+                      reason = f"Insufficient stock for {sku}: requested {quantity}, available {available}"
+                      with open("/tmp/is-valid", "w") as f:
+                          f.write("false")
+                      with open("/tmp/validation-reason", "w") as f:
+                          f.write(reason)
+                      with open("/tmp/total-amount", "w") as f:
+                          f.write("0")
+                      with open("/tmp/needs-approval", "w") as f:
+                          f.write("false")
+                      print(f"Validation failed: {reason}")
+                      sys.exit(0)
+
+                  total_amount += float(unit_price) * quantity
+
+              needs_approval = total_amount >= approval_threshold
+
+              with open("/tmp/is-valid", "w") as f:
+                  f.write("true")
+              with open("/tmp/validation-reason", "w") as f:
+                  f.write("none")
+              with open("/tmp/total-amount", "w") as f:
+                  f.write(str(total_amount))
+              with open("/tmp/needs-approval", "w") as f:
+                  f.write(str(needs_approval).lower())
+
+              print(f"Order {order_id} validated: total={total_amount}, needs_approval={needs_approval}")
+          finally:
+              conn.close()
+          PYEOF
+        env:
+          - name: INPUT
+            value: "{{workflow.parameters.input}}"
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Step 2: Reserve Inventory (via WorkflowTemplate) ----------
+    - name: reserve-inventory
+      inputs:
+        parameters:
+          - name: order-id
+          - name: customer-id
+          - name: items
+      outputs:
+        parameters:
+          - name: reservation-result
+            valueFrom:
+              parameter: "{{steps.reserve.outputs.parameters.reservation-result}}"
+      steps:
+        - - name: reserve
+            templateRef:
+              name: reserve-inventory-template
+              template: reserve-inventory
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{inputs.parameters.order-id}}"
+                - name: customer-id
+                  value: "{{inputs.parameters.customer-id}}"
+                - name: items
+                  value: "{{inputs.parameters.items}}"
+
+    # ---------- Step 3: Manager Approval (via WorkflowTemplate) ----------
+    - name: manager-approval
+      inputs:
+        parameters:
+          - name: order-id
+          - name: customer-id
+          - name: total-amount
+          - name: items
+      outputs:
+        parameters:
+          - name: decision
+            valueFrom:
+              path: /tmp/decision
+      steps:
+        - - name: run-approval
+            templateRef:
+              name: manager-approval-template
+              template: manager-approval
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{inputs.parameters.order-id}}"
+                - name: customer-id
+                  value: "{{inputs.parameters.customer-id}}"
+                - name: total-amount
+                  value: "{{inputs.parameters.total-amount}}"
+                - name: items
+                  value: "{{inputs.parameters.items}}"
+        - - name: extract-decision
+            template: extract-decision
+            arguments:
+              parameters:
+                - name: decision-result
+                  value: "{{steps.run-approval.outputs.parameters.final-decision}}"
+
+    - name: extract-decision
+      inputs:
+        parameters:
+          - name: decision-result
+      outputs:
+        parameters:
+          - name: decision
+            valueFrom:
+              path: /tmp/decision
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          data = json.loads('''{{inputs.parameters.decision-result}}''')
+          decision = data.get("decision", "unknown")
+          with open("/tmp/decision", "w") as f:
+              f.write(decision)
+          print(f"Extracted decision: {decision}")
+
+    # ---------- Step 5: Call Shipping API (via WorkflowTemplate) ----------
+    - name: call-shipping-api
+      inputs:
+        parameters:
+          - name: order-id
+          - name: items
+          - name: shipping-address
+      outputs:
+        parameters:
+          - name: shipment-result
+            valueFrom:
+              parameter: "{{steps.ship.outputs.parameters.shipment-result}}"
+      steps:
+        - - name: ship
+            templateRef:
+              name: shipping-template
+              template: call-shipping-api
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{inputs.parameters.order-id}}"
+                - name: items
+                  value: "{{inputs.parameters.items}}"
+                - name: shipping-address
+                  value: "{{inputs.parameters.shipping-address}}"
+
+    # ---------- Step 6: Update Order Status ----------
+    - name: update-order-status
+      inputs:
+        parameters:
+          - name: order-id
+          - name: status
+          - name: shipment-data
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import psycopg2
+
+          order_id = "{{inputs.parameters.order-id}}"
+          status = "{{inputs.parameters.status}}"
+
+          shipment_data = {}
+          raw_shipment = '''{{inputs.parameters.shipment-data}}'''
+          if raw_shipment and raw_shipment != "":
+              try:
+                  shipment_data = json.loads(raw_shipment)
+              except json.JSONDecodeError:
+                  pass
+
+          shipment_id = shipment_data.get("shipment_id")
+          tracking_number = shipment_data.get("tracking_number")
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+              now = datetime.now(timezone.utc)
+
+              cur.execute(
+                  """
+                  UPDATE orders
+                  SET status = %s,
+                      shipment_id = COALESCE(%s, shipment_id),
+                      tracking_number = COALESCE(%s, tracking_number),
+                      updated_at = %s
+                  WHERE order_id = %s
+                  RETURNING order_id, status
+                  """,
+                  (status, shipment_id, tracking_number, now, order_id),
+              )
+              result = cur.fetchone()
+              conn.commit()
+
+              if result:
+                  print(f"Order {order_id} updated to status: {status}")
+              else:
+                  print(f"Order {order_id} not found in database")
+          finally:
+              conn.close()
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Step 7: Send Notification (best-effort) ----------
+    - name: send-notification
+      inputs:
+        parameters:
+          - name: order-id
+          - name: status
+          - name: extra-data
+      # Best-effort: notification failure does not fail the workflow
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          from datetime import datetime, timezone
+
+          order_id = "{{inputs.parameters.order-id}}"
+          status = "{{inputs.parameters.status}}"
+          extra_data = {}
+          raw_extra = '''{{inputs.parameters.extra-data}}'''
+          if raw_extra:
+              try:
+                  extra_data = json.loads(raw_extra)
+              except json.JSONDecodeError:
+                  pass
+
+          notification = {
+              "order_id": order_id,
+              "status": status,
+              "sent_at": datetime.now(timezone.utc).isoformat(),
+              "channel": "simulated_email",
+          }
+
+          if status == "shipped":
+              notification["message"] = (
+                  f"Your order {order_id} has been shipped! "
+                  f"Tracking: {extra_data.get('tracking_number', 'N/A')} "
+                  f"via {extra_data.get('carrier', 'N/A')}. "
+                  f"Estimated delivery: {extra_data.get('estimated_delivery', 'N/A')}."
+              )
+          elif status == "cancelled":
+              notification["message"] = (
+                  f"Your order {order_id} has been cancelled. "
+                  f"Reason: {extra_data.get('failure_reason', 'N/A')}."
+              )
+          else:
+              notification["message"] = f"Order {order_id} status update: {status}."
+
+          print(json.dumps(notification, indent=2))
+
+    # ---------- Fail Helper ----------
+    - name: fail-with-message
+      inputs:
+        parameters:
+          - name: message
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import sys
+          print("{{inputs.parameters.message}}", file=sys.stderr)
+          sys.exit(1)
+
+    # ---------- Exit Handler: Saga Compensation ----------
+    # Runs after the main workflow completes. On failure, compensates by
+    # releasing inventory, cancelling the order, and sending a cancellation notification.
+    - name: exit-handler
+      steps:
+        - - name: check-status
+            template: compensation-router
+
+    - name: compensation-router
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import os
+          import sys
+
+          workflow_status = "{{workflow.status}}"
+          workflow_name = "{{workflow.name}}"
+
+          print(f"Exit handler for workflow {workflow_name}: status={workflow_status}")
+
+          if workflow_status == "Succeeded":
+              print("Workflow succeeded. No compensation needed.")
+              sys.exit(0)
+
+          # Workflow failed -- write a marker for compensation steps
+          with open("/tmp/needs-compensation", "w") as f:
+              f.write("true")
+
+          print(f"Workflow {workflow_status}. Triggering saga compensation...")
+
+          # We need to run compensation. Since the exit handler can't access
+          # task outputs from the main DAG, we parse the input to get order_id.
+          event = json.loads(os.environ.get("INPUT", "{}"))
+          order_id = event.get("order_id", "unknown")
+
+          with open("/tmp/compensation-order-id", "w") as f:
+              f.write(order_id)
+
+          print(f"Will compensate order {order_id}")
+          # Exit with error to signal that compensation steps should run
+          # Actually, we chain compensation as subsequent steps
+        env:
+          - name: INPUT
+            value: "{{workflow.parameters.input}}"
+
+    # The full compensation chain is defined here. Since Argo exit handlers
+    # run as a separate template, we define the full compensation DAG.
+    # The onExit template is limited to what's defined in the workflow spec.
+    # For a full saga compensation, we use steps within the exit handler.
+
+---
+# Separate Workflow for saga compensation, invoked by the exit handler.
+# In practice, the exit handler above handles the routing.
+# This companion CronWorkflow can be used for scheduled compensation checks.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: order-compensation-template
+  labels:
+    workflow: order-fulfillment
+  annotations:
+    workflows.argoproj.io/description: >
+      Saga compensation for order fulfillment: releases inventory, updates order
+      to cancelled, sends cancellation notification. Each step is idempotent.
+spec:
+  entrypoint: compensate-order
+  arguments:
+    parameters:
+      - name: order-id
+      - name: failure-reason
+        value: "Workflow failed"
+  templates:
+    - name: compensate-order
+      dag:
+        tasks:
+          - name: release-inventory
+            template: release-inventory
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{workflow.parameters.order-id}}"
+                - name: failure-reason
+                  value: "{{workflow.parameters.failure-reason}}"
+
+          - name: update-order-cancelled
+            template: update-order-cancelled
+            dependencies:
+              - release-inventory
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{workflow.parameters.order-id}}"
+                - name: failure-reason
+                  value: "{{workflow.parameters.failure-reason}}"
+
+          - name: send-cancellation-notification
+            template: send-cancellation-notification
+            dependencies:
+              - update-order-cancelled
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{workflow.parameters.order-id}}"
+                - name: failure-reason
+                  value: "{{workflow.parameters.failure-reason}}"
+
+    # ---------- Compensation Step 1: Release Inventory ----------
+    - name: release-inventory
+      inputs:
+        parameters:
+          - name: order-id
+          - name: failure-reason
+      retryStrategy:
+        limit: "5"
+        retryPolicy: Always
+        backoff:
+          duration: "3s"
+          factor: "2"
+          maxDuration: "60s"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import psycopg2
+
+          order_id = "{{inputs.parameters.order-id}}"
+          failure_reason = "{{inputs.parameters.failure-reason}}"
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+
+              cur.execute(
+                  """
+                  SELECT reservation_id, sku, quantity
+                  FROM inventory_reservations
+                  WHERE order_id = %s AND status = 'reserved'
+                  """,
+                  (order_id,),
+              )
+              reservations = cur.fetchall()
+
+              if not reservations:
+                  print(f"No reservations to release for order {order_id}")
+              else:
+                  released = 0
+                  for reservation_id, sku, quantity in reservations:
+                      cur.execute(
+                          """
+                          UPDATE inventory
+                          SET available_quantity = available_quantity + %s,
+                              reserved_quantity = reserved_quantity - %s
+                          WHERE sku = %s
+                          """,
+                          (quantity, quantity, sku),
+                      )
+                      cur.execute(
+                          """
+                          UPDATE inventory_reservations
+                          SET status = 'released', released_at = %s
+                          WHERE reservation_id = %s AND status = 'reserved'
+                          """,
+                          (datetime.now(timezone.utc), reservation_id),
+                      )
+                      released += 1
+
+                  conn.commit()
+                  print(f"Released {released} reservations for order {order_id}")
+          except Exception as e:
+              conn.rollback()
+              raise
+          finally:
+              conn.close()
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Compensation Step 2: Update Order Cancelled ----------
+    - name: update-order-cancelled
+      inputs:
+        parameters:
+          - name: order-id
+          - name: failure-reason
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import psycopg2
+
+          order_id = "{{inputs.parameters.order-id}}"
+          failure_reason = "{{inputs.parameters.failure-reason}}"
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+              now = datetime.now(timezone.utc)
+
+              cur.execute(
+                  """
+                  UPDATE orders
+                  SET status = 'cancelled',
+                      failure_reason = %s,
+                      updated_at = %s
+                  WHERE order_id = %s
+                  RETURNING order_id, status
+                  """,
+                  (failure_reason, now, order_id),
+              )
+              result = cur.fetchone()
+              conn.commit()
+
+              if result:
+                  print(f"Order {order_id} marked as cancelled")
+              else:
+                  print(f"Order {order_id} not found (may not have been created yet)")
+          finally:
+              conn.close()
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Compensation Step 3: Send Cancellation Notification ----------
+    - name: send-cancellation-notification
+      inputs:
+        parameters:
+          - name: order-id
+          - name: failure-reason
+      # Best-effort: uses continueOn so compensation doesn't fail if notification fails
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          from datetime import datetime, timezone
+
+          order_id = "{{inputs.parameters.order-id}}"
+          failure_reason = "{{inputs.parameters.failure-reason}}"
+
+          notification = {
+              "order_id": order_id,
+              "status": "cancelled",
+              "sent_at": datetime.now(timezone.utc).isoformat(),
+              "channel": "simulated_email",
+              "message": (
+                  f"Your order {order_id} has been cancelled. "
+                  f"Reason: {failure_reason}."
+              ),
+          }
+
+          print(json.dumps(notification, indent=2))

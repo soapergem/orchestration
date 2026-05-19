@@ -1,0 +1,366 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: csv-etl-pipeline-
+  labels:
+    workflow: csv-etl-pipeline
+  annotations:
+    workflows.argoproj.io/description: >
+      CSV ETL Pipeline: Downloads a ZIP archive, extracts CSVs, loads each CSV
+      into Postgres in parallel, runs a SQL transform, and exports to Parquet.
+spec:
+  entrypoint: csv-etl-pipeline
+  arguments:
+    parameters:
+      - name: zip-url
+        value: "https://example.com/data/sample-data.zip"
+      - name: extract-dir
+        value: "/tmp/extracted"
+      - name: output-dir
+        value: "/tmp/output"
+  templates:
+    # ---------- Main DAG ----------
+    - name: csv-etl-pipeline
+      dag:
+        tasks:
+          - name: unzip-file
+            template: unzip-file
+            arguments:
+              parameters:
+                - name: zip-url
+                  value: "{{workflow.parameters.zip-url}}"
+                - name: extract-dir
+                  value: "{{workflow.parameters.extract-dir}}"
+
+          - name: process-csvs
+            template: process-csvs
+            dependencies:
+              - unzip-file
+            arguments:
+              parameters:
+                - name: csv-filenames
+                  value: "{{tasks.unzip-file.outputs.parameters.csv-filenames}}"
+
+          - name: run-sql-transform
+            template: run-sql-transform
+            dependencies:
+              - process-csvs
+
+          - name: convert-to-parquet
+            template: convert-to-parquet
+            dependencies:
+              - run-sql-transform
+            arguments:
+              parameters:
+                - name: table-name
+                  value: "{{tasks.run-sql-transform.outputs.parameters.table-name}}"
+                - name: row-count
+                  value: "{{tasks.run-sql-transform.outputs.parameters.row-count}}"
+
+    # ---------- Step 1: Unzip File ----------
+    - name: unzip-file
+      inputs:
+        parameters:
+          - name: zip-url
+          - name: extract-dir
+      outputs:
+        parameters:
+          - name: csv-filenames
+            valueFrom:
+              path: /tmp/csv-filenames.json
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import io
+          import json
+          import os
+          import urllib.request
+          import zipfile
+
+          zip_url = "{{inputs.parameters.zip-url}}"
+          extract_dir = "{{inputs.parameters.extract-dir}}"
+
+          os.makedirs(extract_dir, exist_ok=True)
+
+          print(f"Downloading ZIP from {zip_url}")
+          response = urllib.request.urlopen(zip_url)
+          zip_bytes = io.BytesIO(response.read())
+
+          csv_filenames = []
+
+          with zipfile.ZipFile(zip_bytes, "r") as zf:
+              for filename in zf.namelist():
+                  if not filename.endswith(".csv"):
+                      continue
+                  # Extract to the shared directory
+                  dest_path = os.path.join(extract_dir, os.path.basename(filename))
+                  with open(dest_path, "wb") as f:
+                      f.write(zf.read(filename))
+                  csv_filenames.append(os.path.basename(filename))
+                  print(f"Extracted: {filename} -> {dest_path}")
+
+          print(f"Extracted {len(csv_filenames)} CSV files")
+
+          with open("/tmp/csv-filenames.json", "w") as f:
+              json.dump(csv_filenames, f)
+
+    # ---------- Step 2: Process CSVs in Parallel ----------
+    - name: process-csvs
+      inputs:
+        parameters:
+          - name: csv-filenames
+      dag:
+        tasks:
+          - name: load-csv
+            template: load-csv-to-postgres
+            arguments:
+              parameters:
+                - name: csv-filename
+                  value: "{{item}}"
+            withParam: "{{inputs.parameters.csv-filenames}}"
+
+    # ---------- Step 2a: Load a Single CSV into Postgres ----------
+    - name: load-csv-to-postgres
+      inputs:
+        parameters:
+          - name: csv-filename
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "5s"
+          factor: "2"
+          maxDuration: "60s"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import csv
+          import io
+          import json
+          import os
+          import urllib.request
+          import zipfile
+
+          import psycopg2
+
+          csv_filename = "{{inputs.parameters.csv-filename}}"
+          zip_url = "{{workflow.parameters.zip-url}}"
+
+          # Re-download and extract the specific CSV from the ZIP.
+          # In a production pipeline you'd use a shared volume or artifact store.
+          print(f"Downloading ZIP to extract {csv_filename}")
+          response = urllib.request.urlopen(zip_url)
+          zip_bytes = io.BytesIO(response.read())
+
+          csv_text = None
+          with zipfile.ZipFile(zip_bytes, "r") as zf:
+              for name in zf.namelist():
+                  if os.path.basename(name) == csv_filename:
+                      csv_text = zf.read(name).decode("utf-8")
+                      break
+
+          if csv_text is None:
+              raise RuntimeError(f"CSV file {csv_filename} not found in ZIP")
+
+          # Derive table name from filename
+          table_name = csv_filename.replace(".csv", "").lower()
+
+          reader = csv.DictReader(io.StringIO(csv_text))
+          rows = list(reader)
+
+          if not rows:
+              print(json.dumps({"table": table_name, "rows_loaded": 0}))
+              exit(0)
+
+          columns = list(rows[0].keys())
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              with conn.cursor() as cur:
+                  # Create table if not exists (all columns as TEXT)
+                  col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
+                  cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({col_defs})')
+
+                  # Truncate and reload
+                  cur.execute(f'TRUNCATE TABLE "{table_name}"')
+
+                  # Bulk insert using COPY
+                  buf = io.StringIO()
+                  writer = csv.DictWriter(buf, fieldnames=columns)
+                  writer.writerows(rows)
+                  buf.seek(0)
+
+                  cur.copy_expert(
+                      f"""COPY "{table_name}" ({", ".join(f'"{c}"' for c in columns)})
+                          FROM STDIN WITH CSV""",
+                      buf,
+                  )
+
+              conn.commit()
+          finally:
+              conn.close()
+
+          print(f"Loaded {len(rows)} rows into table '{table_name}'")
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Step 3: Run SQL Transform ----------
+    - name: run-sql-transform
+      outputs:
+        parameters:
+          - name: table-name
+            valueFrom:
+              path: /tmp/table-name
+          - name: row-count
+            valueFrom:
+              path: /tmp/row-count
+      retryStrategy:
+        limit: "2"
+        retryPolicy: Always
+        backoff:
+          duration: "10s"
+          factor: "2"
+          maxDuration: "60s"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import os
+          import psycopg2
+
+          TRANSFORM_SQL = """
+          CREATE TABLE IF NOT EXISTS combined_report AS
+          SELECT
+              o.order_id,
+              o.customer_id,
+              c.customer_name,
+              c.email,
+              o.product_id,
+              p.product_name,
+              p.category,
+              CAST(o.quantity AS INTEGER) AS quantity,
+              CAST(p.price AS NUMERIC(10,2)) AS unit_price,
+              CAST(o.quantity AS INTEGER) * CAST(p.price AS NUMERIC(10,2)) AS total_amount,
+              o.order_date
+          FROM orders o
+          JOIN customers c ON o.customer_id = c.customer_id
+          JOIN products p ON o.product_id = p.product_id;
+          """
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              with conn.cursor() as cur:
+                  cur.execute("DROP TABLE IF EXISTS combined_report")
+                  cur.execute(TRANSFORM_SQL)
+                  cur.execute("SELECT COUNT(*) FROM combined_report")
+                  row_count = cur.fetchone()[0]
+              conn.commit()
+          finally:
+              conn.close()
+
+          with open("/tmp/table-name", "w") as f:
+              f.write("combined_report")
+          with open("/tmp/row-count", "w") as f:
+              f.write(str(row_count))
+
+          print(f"SQL transform complete: combined_report has {row_count} rows")
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Step 4: Convert to Parquet ----------
+    - name: convert-to-parquet
+      inputs:
+        parameters:
+          - name: table-name
+          - name: row-count
+      outputs:
+        artifacts:
+          - name: parquet-file
+            path: "/tmp/output/{{inputs.parameters.table-name}}.parquet"
+            optional: true
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary pandas pyarrow --quiet 2>/dev/null && python3 <<'PYEOF'
+          import io
+          import os
+
+          import pandas as pd
+          import pyarrow as pa
+          import pyarrow.parquet as pq
+          import psycopg2
+
+          table_name = "{{inputs.parameters.table-name}}"
+          output_dir = "{{workflow.parameters.output-dir}}"
+          os.makedirs(output_dir, exist_ok=True)
+          output_path = os.path.join(output_dir, f"{table_name}.parquet")
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              df = pd.read_sql(f'SELECT * FROM "{table_name}"', conn)
+          finally:
+              conn.close()
+
+          table = pa.Table.from_pandas(df)
+          pq.write_table(table, output_path)
+
+          print(f"Wrote {len(df)} rows to {output_path}")
+          print(f"File size: {os.path.getsize(output_path)} bytes")
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"

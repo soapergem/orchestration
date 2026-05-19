@@ -1,0 +1,266 @@
+# API Fan-Out with Async Callback: Create callback, submit fetch, await result, fan-out, combine
+# Deploy: gcloud workflows deploy api-fanout --source=dag2_api_fanout.yaml
+#
+# Google Workflows has first-class HTTP callback support via events.create_callback_endpoint
+# and events.await_callback. The workflow suspends with zero resource cost during the wait.
+#
+# Expected input:
+# {
+#   "url": "https://api.github.com/orgs/google/repos",
+#   "request_config": {
+#     "callback_fetch_service_url": "http://callback-fetch-service:8090",
+#     "api_key": "optional-bearer-token"
+#   }
+# }
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - fetch_url: ${input.url}
+          - request_config: ${default(map.get(input, "request_config"), {})}
+          - callback_fetch_service_url: ${default(map.get(request_config, "callback_fetch_service_url"), "http://callback-fetch-service:8090")}
+
+    # Step 1: Create a unique callback endpoint. Google Workflows generates a URL
+    # that external services can POST to in order to resume this workflow execution.
+    - create_callback:
+        call: events.create_callback_endpoint
+        args:
+          http_callback_method: "POST"
+        result: callback_details
+
+    # Step 2: Submit the async fetch request to the callback-fetch-service,
+    # providing the workflow's callback URL so the service can notify us when done.
+    - submit_fetch:
+        try:
+          call: http.post
+          args:
+            url: ${callback_fetch_service_url + "/fetch-async"}
+            headers:
+              Content-Type: "application/json"
+              User-Agent: "orchestration-bakeoff/1.0"
+            body:
+              url: ${fetch_url}
+              headers: ${default(map.get(request_config, "fetch_headers"), {})}
+              callback_url: ${callback_details.url}
+              correlation_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+            timeout: 10
+          result: submit_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_submit_error:
+                raise:
+                  code: "FETCH_SUBMIT_FAILED"
+                  message: ${"Failed to submit async fetch - " + json.encode_to_string(e)}
+
+    - check_submit_accepted:
+        switch:
+          - condition: ${submit_response.code != 202}
+            raise:
+              code: "FETCH_SUBMIT_REJECTED"
+              message: ${"Callback fetch service returned " + string(submit_response.code)}
+
+    # Step 3: Await the callback. The workflow suspends here with zero resource cost.
+    # It will resume when the callback-fetch-service POSTs to the callback URL.
+    # Timeout after 60 seconds if the external service does not respond.
+    - await_callback:
+        try:
+          call: events.await_callback
+          args:
+            callback: ${callback_details}
+            timeout: 60
+          result: callback_result
+        except:
+          as: e
+          steps:
+            - check_timeout:
+                switch:
+                  - condition: ${"TimeoutError" in e.message}
+                    raise:
+                      code: "CALLBACK_TIMEOUT"
+                      message: "Async fetch did not complete within 60 seconds"
+            - raise_callback_error:
+                raise:
+                  code: "CALLBACK_FAILED"
+                  message: ${"Callback await failed - " + json.encode_to_string(e)}
+
+    # Step 4: Process the callback payload. Normalize it into the standard items format.
+    - process_result:
+        call: process_fetch_result
+        args:
+          callback_payload: ${callback_result.http_request.body}
+          source_url: ${fetch_url}
+          request_config: ${request_config}
+        result: processed
+
+    # Step 5: Check if there are items to fan out over.
+    - check_items_exist:
+        switch:
+          - condition: ${processed.item_count == 0}
+            next: no_items_to_process
+
+    # Step 6: Fan out — make parallel HTTP GET requests for each item's detail URL.
+    - fan_out_api_requests:
+        try:
+          parallel:
+            shared: [api_results]
+            for:
+              value: item
+              in: ${processed.items}
+              steps:
+                - fetch_item_detail:
+                    try:
+                      call: http.get
+                      args:
+                        url: ${item.detail_url}
+                        headers:
+                          User-Agent: "orchestration-bakeoff/1.0"
+                        timeout: 30
+                      result: detail_response
+                    retry:
+                      predicate: ${retry_on_server_error}
+                      max_retries: 3
+                      backoff:
+                        initial_delay: 2
+                        max_delay: 16
+                        multiplier: 2
+                    except:
+                      as: e
+                      steps:
+                        - log_item_error:
+                            assign:
+                              - detail_response:
+                                  body:
+                                    id: ${item.id}
+                                    error: ${json.encode_to_string(e)}
+                                    status: "failed"
+                - build_detail_entry:
+                    assign:
+                      - detail_entry:
+                          id: ${item.id}
+                          name: ${item.name}
+                          data: ${detail_response.body}
+                - collect_detail:
+                    assign:
+                      - api_results: ${list.concat(default(api_results, []), [detail_entry])}
+        except:
+          as: e
+          steps:
+            - raise_fanout_error:
+                raise:
+                  code: "FANOUT_FAILED"
+                  message: ${"API fan-out failed - " + json.encode_to_string(e)}
+
+    # Step 7: Combine all results into the final output.
+    - combine_results:
+        call: combine
+        args:
+          source_url: ${fetch_url}
+          item_count: ${processed.item_count}
+          api_results: ${api_results}
+        result: combined
+
+    - return_result:
+        return: ${combined}
+
+    - no_items_to_process:
+        return:
+          status: "no_items"
+          message: "No items found from initial content fetch."
+          source_url: ${fetch_url}
+
+# Subworkflow: Normalize the callback payload into the items format
+process_fetch_result:
+  params: [callback_payload, source_url, request_config]
+  steps:
+    - validate_callback:
+        assign:
+          - callback_status: ${default(map.get(callback_payload, "status"), "unknown")}
+    - check_status:
+        switch:
+          - condition: ${callback_status != "completed"}
+            raise:
+              code: "FETCH_FAILED"
+              message: ${"Fetch service returned status '" + callback_status + "'"}
+    - extract_body:
+        assign:
+          - body: ${callback_payload.body}
+    - build_items:
+        assign:
+          - items: []
+    - iterate_body:
+        for:
+          value: raw_item
+          in: ${body}
+          steps:
+            - build_item:
+                assign:
+                  - new_item:
+                      id: ${raw_item.id}
+                      name: ${default(map.get(raw_item, "name"), string(raw_item.id))}
+                      detail_url: ${raw_item.url}
+            - append_item:
+                assign:
+                  - items: ${list.concat(items, [new_item])}
+    - return_processed:
+        return:
+          source_url: ${source_url}
+          item_count: ${len(items)}
+          items: ${items}
+          request_config: ${request_config}
+
+# Subworkflow: Combine fan-out results into a single response
+combine:
+  params: [source_url, item_count, api_results]
+  steps:
+    - count_successes:
+        assign:
+          - successful: 0
+          - failed: 0
+    - tally_results:
+        for:
+          value: result
+          in: ${api_results}
+          steps:
+            - check_result:
+                switch:
+                  - condition: ${default(map.get(result.data, "status"), "ok") == "failed"}
+                    assign:
+                      - failed: ${failed + 1}
+                  - condition: true
+                    assign:
+                      - successful: ${successful + 1}
+    - return_combined:
+        return:
+          status: "completed"
+          source_url: ${source_url}
+          total_items: ${item_count}
+          successful: ${successful}
+          failed: ${failed}
+          results: ${api_results}
+
+retry_on_server_error:
+  params: [e]
+  steps:
+    - check_error:
+        switch:
+          - condition: ${e.code == 429}
+            return: true
+          - condition: ${e.code >= 500 and e.code < 600}
+            return: true
+          - condition: ${"ConnectionError" in e.message}
+            return: true
+          - condition: ${"TimeoutError" in e.message}
+            return: true
+        next: return_false
+    - return_false:
+        return: false

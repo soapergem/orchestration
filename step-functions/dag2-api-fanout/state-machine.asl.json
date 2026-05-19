@@ -1,0 +1,199 @@
+{
+  "Comment": "API Fan-Out: Async callback fetch, fan out additional API requests, combine results",
+  "StartAt": "SubmitAsyncFetch",
+  "States": {
+    "SubmitAsyncFetch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${SubmitAsyncFetchFunctionArn}",
+        "Payload": {
+          "url.$": "$.url",
+          "request_config.$": "$.request_config",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "HeartbeatSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "Next": "FanOutFailed",
+          "ResultPath": "$.error"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FanOutFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ProcessFetchResult"
+    },
+
+    "ProcessFetchResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ProcessFetchResultFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FanOutFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckItemsExist"
+    },
+
+    "CheckItemsExist": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.items",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.items[0]",
+              "IsPresent": true
+            }
+          ],
+          "Next": "FanOutAPIRequests"
+        }
+      ],
+      "Default": "NoItemsToProcess"
+    },
+
+    "FanOutAPIRequests": {
+      "Type": "Map",
+      "ItemsPath": "$.items",
+      "ItemSelector": {
+        "item.$": "$$.Map.Item.Value",
+        "request_config.$": "$.request_config"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "FetchItemDetail",
+        "States": {
+          "FetchItemDetail": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${FetchItemDetailFunctionArn}",
+              "Payload.$": "$"
+            },
+            "OutputPath": "$.Payload",
+            "TimeoutSeconds": 30,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "MaxConcurrency": 20,
+      "ResultPath": "$.api_results",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FanOutFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CombineResults"
+    },
+
+    "CombineResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CombineResultsFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FanOutFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+
+    "NoItemsToProcess": {
+      "Type": "Pass",
+      "Result": {
+        "status": "no_items",
+        "message": "No items found from initial content fetch."
+      },
+      "End": true
+    },
+
+    "FanOutFailed": {
+      "Type": "Fail",
+      "Error": "FanOutError",
+      "Cause": "The API fan-out workflow encountered an unrecoverable error."
+    }
+  }
+}

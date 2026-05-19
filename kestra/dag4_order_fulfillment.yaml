@@ -1,0 +1,559 @@
+id: order_fulfillment
+namespace: orchestration.fulfillment
+description: >
+  Order Fulfillment: Validate the order, reserve inventory (subflow), optionally
+  request manager approval for high-value orders (Pause/webhook), ship via the
+  shipping service (subflow), update the order, and notify. Saga compensation on
+  failure releases inventory, cancels the order, and sends a cancellation notice.
+
+inputs:
+  - id: order_id
+    type: STRING
+    description: Unique order identifier
+  - id: customer_id
+    type: STRING
+    description: Customer placing the order
+  - id: items
+    type: STRING
+    description: JSON array of items with sku, quantity, and unit_price
+  - id: shipping_address
+    type: STRING
+    description: JSON object with the shipping address
+  - id: approval_threshold
+    type: STRING
+    defaults: "500.00"
+    description: Orders at or above this amount require manager approval
+
+variables:
+  pg_host: postgres
+  pg_port: "5432"
+  pg_database: orchestration
+  pg_user: orchestration
+  pg_password: orchestration
+
+tasks:
+  - id: validate_order
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Validate the order: check that the customer is active, all SKUs exist with
+      sufficient stock, and compute the total amount. Read-only, no side effects.
+    retry:
+      type: exponential
+      maxAttempt: 3
+      interval: PT2S
+      maxInterval: PT30S
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import json
+
+      import psycopg2
+
+      order_id = "{{ inputs.order_id }}"
+      customer_id = "{{ inputs.customer_id }}"
+      items = json.loads("""{{ inputs.items }}""")
+      approval_threshold = float("{{ inputs.approval_threshold }}")
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      from kestra import Kestra
+
+      try:
+          cur = conn.cursor()
+
+          cur.execute(
+              "SELECT status FROM customers WHERE customer_id = %s",
+              (customer_id,),
+          )
+          row = cur.fetchone()
+          if not row:
+              Kestra.outputs({"is_valid": False, "reason": f"Customer {customer_id} not found", "total_amount": 0})
+              exit()
+          if row[0] != "active":
+              Kestra.outputs({"is_valid": False, "reason": f"Customer {customer_id} is {row[0]}", "total_amount": 0})
+              exit()
+
+          total_amount = 0
+          for item in items:
+              sku = item["sku"]
+              quantity = item["quantity"]
+
+              cur.execute(
+                  "SELECT available_quantity, unit_price FROM inventory WHERE sku = %s",
+                  (sku,),
+              )
+              row = cur.fetchone()
+              if not row:
+                  Kestra.outputs({"is_valid": False, "reason": f"SKU {sku} not found", "total_amount": 0})
+                  exit()
+
+              available, unit_price = row
+              if available < quantity:
+                  Kestra.outputs({
+                      "is_valid": False,
+                      "reason": f"Insufficient stock for {sku}: requested {quantity}, available {available}",
+                      "total_amount": 0,
+                  })
+                  exit()
+              total_amount += float(unit_price) * quantity
+
+          Kestra.outputs({
+              "is_valid": True,
+              "reason": "none",
+              "total_amount": total_amount,
+              "approval_threshold": approval_threshold,
+              "needs_approval": total_amount >= approval_threshold,
+          })
+      finally:
+          conn.close()
+
+  - id: check_validation
+    type: io.kestra.plugin.core.flow.If
+    description: Proceed only if the order passes validation
+    condition: "{{ outputs.validate_order.vars.is_valid == true }}"
+    then:
+      - id: reserve_inventory
+        type: io.kestra.plugin.core.flow.Subflow
+        description: >
+          Call the reserve_inventory_flow subflow to atomically reserve
+          all items in the order.
+        retry:
+          type: exponential
+          maxAttempt: 3
+          interval: PT2S
+          maxInterval: PT30S
+        flowId: reserve_inventory_flow
+        namespace: orchestration.fulfillment.subflows
+        inputs:
+          order_id: "{{ inputs.order_id }}"
+          customer_id: "{{ inputs.customer_id }}"
+          items: "{{ inputs.items }}"
+        wait: true
+        transmitFailed: true
+
+      - id: check_approval
+        type: io.kestra.plugin.core.flow.If
+        description: >
+          If the total amount meets or exceeds the approval threshold,
+          request manager approval before shipping.
+        condition: "{{ outputs.validate_order.vars.needs_approval == true }}"
+        then:
+          - id: manager_approval
+            type: io.kestra.plugin.core.flow.Subflow
+            description: >
+              Call the manager_approval_flow subflow, which submits an approval
+              request to the approval service and waits for the decision via
+              Kestra's Pause/webhook resume.
+            flowId: manager_approval_flow
+            namespace: orchestration.fulfillment.subflows
+            inputs:
+              order_id: "{{ inputs.order_id }}"
+              customer_id: "{{ inputs.customer_id }}"
+              total_amount: "{{ outputs.validate_order.vars.total_amount }}"
+              items: "{{ inputs.items }}"
+            wait: true
+            transmitFailed: true
+
+          - id: check_decision
+            type: io.kestra.plugin.core.flow.If
+            description: >
+              If the manager approved, proceed to shipping. Otherwise,
+              compensate by releasing inventory.
+            condition: "{{ outputs.manager_approval.outputs.record_decision.vars.decision == 'approved' }}"
+            then:
+              - id: ship_after_approval
+                type: io.kestra.plugin.core.flow.Subflow
+                description: Ship the order after manager approval
+                retry:
+                  type: exponential
+                  maxAttempt: 3
+                  interval: PT3S
+                  maxInterval: PT30S
+                flowId: shipping_flow
+                namespace: orchestration.fulfillment.subflows
+                inputs:
+                  order_id: "{{ inputs.order_id }}"
+                  items: "{{ inputs.items }}"
+                  shipping_address: "{{ inputs.shipping_address }}"
+                wait: true
+                transmitFailed: true
+
+              - id: update_order_shipped_after_approval
+                type: io.kestra.plugin.jdbc.postgresql.Query
+                description: Update the order status to shipped
+                retry:
+                  type: constant
+                  maxAttempt: 3
+                  interval: PT2S
+                url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+                username: "{{ vars.pg_user }}"
+                password: "{{ vars.pg_password }}"
+                sql: |
+                  UPDATE orders
+                  SET status = 'shipped',
+                      shipment_id = '{{ outputs.ship_after_approval.outputs.ship.vars.shipment_id }}',
+                      tracking_number = '{{ outputs.ship_after_approval.outputs.ship.vars.tracking_number }}',
+                      updated_at = NOW()
+                  WHERE order_id = '{{ inputs.order_id }}';
+
+              - id: send_shipped_notification_after_approval
+                type: io.kestra.plugin.scripts.python.Script
+                description: Send a shipping confirmation notification
+                allowFailure: true
+                retry:
+                  type: constant
+                  maxAttempt: 3
+                  interval: PT2S
+                script: |
+                  import json
+                  from datetime import datetime, timezone
+
+                  order_id = "{{ inputs.order_id }}"
+                  tracking_number = "{{ outputs.ship_after_approval.outputs.ship.vars.tracking_number }}"
+                  carrier = "{{ outputs.ship_after_approval.outputs.ship.vars.carrier }}"
+                  estimated_delivery = "{{ outputs.ship_after_approval.outputs.ship.vars.estimated_delivery }}"
+
+                  message = (
+                      f"Your order {order_id} has been shipped! "
+                      f"Tracking: {tracking_number} via {carrier}. "
+                      f"Estimated delivery: {estimated_delivery}."
+                  )
+                  print(f"NOTIFICATION: {message}")
+
+                  from kestra import Kestra
+                  Kestra.outputs({
+                      "notification_sent": True,
+                      "order_id": order_id,
+                      "status": "shipped",
+                      "sent_at": datetime.now(timezone.utc).isoformat(),
+                  })
+            else:
+              - id: compensate_rejected
+                type: io.kestra.plugin.scripts.python.Script
+                description: >
+                  Order was rejected or approval timed out. Release inventory,
+                  cancel the order, and send a cancellation notification.
+                beforeCommands:
+                  - pip install psycopg2-binary
+                script: |
+                  import json
+                  from datetime import datetime, timezone
+
+                  import psycopg2
+
+                  order_id = "{{ inputs.order_id }}"
+
+                  conn = psycopg2.connect(
+                      host="{{ vars.pg_host }}",
+                      port={{ vars.pg_port }},
+                      dbname="{{ vars.pg_database }}",
+                      user="{{ vars.pg_user }}",
+                      password="{{ vars.pg_password }}",
+                  )
+
+                  try:
+                      cur = conn.cursor()
+
+                      # Release inventory reservations
+                      cur.execute(
+                          """
+                          SELECT reservation_id, sku, quantity
+                          FROM inventory_reservations
+                          WHERE order_id = %s AND status = 'reserved'
+                          """,
+                          (order_id,),
+                      )
+                      reservations = cur.fetchall()
+
+                      released = 0
+                      for reservation_id, sku, quantity in reservations:
+                          cur.execute(
+                              """
+                              UPDATE inventory
+                              SET available_quantity = available_quantity + %s,
+                                  reserved_quantity = reserved_quantity - %s
+                              WHERE sku = %s
+                              """,
+                              (quantity, quantity, sku),
+                          )
+                          cur.execute(
+                              """
+                              UPDATE inventory_reservations
+                              SET status = 'released', released_at = %s
+                              WHERE reservation_id = %s AND status = 'reserved'
+                              """,
+                              (datetime.now(timezone.utc), reservation_id),
+                          )
+                          released += 1
+
+                      # Update order to cancelled
+                      cur.execute(
+                          """
+                          UPDATE orders
+                          SET status = 'cancelled',
+                              failure_reason = 'Order rejected or approval timed out',
+                              updated_at = NOW()
+                          WHERE order_id = %s
+                          """,
+                          (order_id,),
+                      )
+
+                      conn.commit()
+
+                      notification = (
+                          f"Your order {order_id} has been cancelled. "
+                          f"Reason: Order rejected or approval timed out."
+                      )
+                      print(f"NOTIFICATION: {notification}")
+
+                      from kestra import Kestra
+                      Kestra.outputs({
+                          "order_id": order_id,
+                          "status": "cancelled",
+                          "released": released,
+                          "reason": "Order rejected or approval timed out",
+                      })
+                  except Exception:
+                      conn.rollback()
+                      raise
+                  finally:
+                      conn.close()
+
+      - id: ship_without_approval
+        type: io.kestra.plugin.core.flow.If
+        description: Ship directly if no approval was needed
+        condition: "{{ outputs.validate_order.vars.needs_approval == false }}"
+        then:
+          - id: call_shipping
+            type: io.kestra.plugin.core.flow.Subflow
+            description: Call the shipping subflow
+            retry:
+              type: exponential
+              maxAttempt: 3
+              interval: PT3S
+              maxInterval: PT30S
+            flowId: shipping_flow
+            namespace: orchestration.fulfillment.subflows
+            inputs:
+              order_id: "{{ inputs.order_id }}"
+              items: "{{ inputs.items }}"
+              shipping_address: "{{ inputs.shipping_address }}"
+            wait: true
+            transmitFailed: true
+
+          - id: update_order_shipped
+            type: io.kestra.plugin.jdbc.postgresql.Query
+            description: Update the order status to shipped
+            retry:
+              type: constant
+              maxAttempt: 3
+              interval: PT2S
+            url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+            username: "{{ vars.pg_user }}"
+            password: "{{ vars.pg_password }}"
+            sql: |
+              UPDATE orders
+              SET status = 'shipped',
+                  shipment_id = '{{ outputs.call_shipping.outputs.ship.vars.shipment_id }}',
+                  tracking_number = '{{ outputs.call_shipping.outputs.ship.vars.tracking_number }}',
+                  updated_at = NOW()
+              WHERE order_id = '{{ inputs.order_id }}';
+
+          - id: send_shipped_notification
+            type: io.kestra.plugin.scripts.python.Script
+            description: Send a shipping confirmation notification
+            allowFailure: true
+            retry:
+              type: constant
+              maxAttempt: 3
+              interval: PT2S
+            script: |
+              import json
+              from datetime import datetime, timezone
+
+              order_id = "{{ inputs.order_id }}"
+              tracking_number = "{{ outputs.call_shipping.outputs.ship.vars.tracking_number }}"
+              carrier = "{{ outputs.call_shipping.outputs.ship.vars.carrier }}"
+              estimated_delivery = "{{ outputs.call_shipping.outputs.ship.vars.estimated_delivery }}"
+
+              message = (
+                  f"Your order {order_id} has been shipped! "
+                  f"Tracking: {tracking_number} via {carrier}. "
+                  f"Estimated delivery: {estimated_delivery}."
+              )
+              print(f"NOTIFICATION: {message}")
+
+              from kestra import Kestra
+              Kestra.outputs({
+                  "notification_sent": True,
+                  "order_id": order_id,
+                  "status": "shipped",
+                  "sent_at": datetime.now(timezone.utc).isoformat(),
+              })
+
+errors:
+  - id: release_inventory
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Saga compensation: release all inventory reservations for the order.
+      Idempotent -- safe to call multiple times.
+    retry:
+      type: exponential
+      maxAttempt: 5
+      interval: PT3S
+      maxInterval: PT60S
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      import psycopg2
+
+      order_id = "{{ inputs.order_id }}"
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      try:
+          cur = conn.cursor()
+
+          cur.execute(
+              """
+              SELECT reservation_id, sku, quantity
+              FROM inventory_reservations
+              WHERE order_id = %s AND status = 'reserved'
+              """,
+              (order_id,),
+          )
+          reservations = cur.fetchall()
+
+          released = 0
+          for reservation_id, sku, quantity in reservations:
+              cur.execute(
+                  """
+                  UPDATE inventory
+                  SET available_quantity = available_quantity + %s,
+                      reserved_quantity = reserved_quantity - %s
+                  WHERE sku = %s
+                  """,
+                  (quantity, quantity, sku),
+              )
+              cur.execute(
+                  """
+                  UPDATE inventory_reservations
+                  SET status = 'released', released_at = %s
+                  WHERE reservation_id = %s AND status = 'reserved'
+                  """,
+                  (datetime.now(timezone.utc), reservation_id),
+              )
+              released += 1
+
+          conn.commit()
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "order_id": order_id,
+              "released": released,
+              "status": "inventory_released",
+          })
+      except Exception:
+          conn.rollback()
+          raise
+      finally:
+          conn.close()
+
+  - id: update_order_cancelled
+    type: io.kestra.plugin.scripts.python.Script
+    description: Saga compensation -- mark the order as cancelled in the database
+    retry:
+      type: constant
+      maxAttempt: 3
+      interval: PT2S
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import psycopg2
+      from datetime import datetime, timezone
+
+      order_id = "{{ inputs.order_id }}"
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      try:
+          cur = conn.cursor()
+          now = datetime.now(timezone.utc)
+
+          cur.execute(
+              """
+              UPDATE orders
+              SET status = 'cancelled',
+                  failure_reason = 'Order processing failed -- saga compensation triggered',
+                  updated_at = %s
+              WHERE order_id = %s
+              RETURNING order_id, status
+              """,
+              (now, order_id),
+          )
+          result = cur.fetchone()
+          conn.commit()
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "order_id": order_id,
+              "status": "cancelled",
+              "updated_at": now.isoformat(),
+          })
+      finally:
+          conn.close()
+
+  - id: send_cancellation_notification
+    type: io.kestra.plugin.scripts.python.Script
+    description: Saga compensation -- send a cancellation notification
+    allowFailure: true
+    retry:
+      type: constant
+      maxAttempt: 3
+      interval: PT2S
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      order_id = "{{ inputs.order_id }}"
+
+      message = (
+          f"Your order {order_id} has been cancelled. "
+          f"Reason: Order processing failed."
+      )
+      print(f"NOTIFICATION: {message}")
+
+      from kestra import Kestra
+      Kestra.outputs({
+          "notification_sent": True,
+          "order_id": order_id,
+          "status": "cancelled",
+          "sent_at": datetime.now(timezone.utc).isoformat(),
+      })
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: order-fulfillment-trigger
+    disabled: true

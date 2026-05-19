@@ -1,0 +1,347 @@
+# Payment Processing: Validate, process with retries, update DB, send notification
+# Deploy: gcloud workflows deploy payment-processing --source=dag3_payment.yaml
+#
+# Expected input:
+# {
+#   "payment_id": "PAY-001",
+#   "amount": 150.00,
+#   "currency": "USD",
+#   "from_account": "ACC-001",
+#   "to_account": "ACC-002",
+#   "idempotency_key": "idem-001",
+#   "db_config": { "host": "postgres", "port": 5432, "database": "orchestration", "user": "orchestration", "password": "orchestration" }
+# }
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - db_proxy_url: "http://db-proxy-service:8080"
+          - payment_gateway_url: "http://payment-gateway:8080"
+          - notification_service_url: "http://notification-service:8080"
+          - payment_id: ${input.payment_id}
+          - amount: ${input.amount}
+          - currency: ${input.currency}
+          - from_account: ${input.from_account}
+          - to_account: ${input.to_account}
+          - idempotency_key: ${default(map.get(input, "idempotency_key"), input.payment_id)}
+          - db_config: ${input.db_config}
+
+    # Step 1: Validate the payment against the database (account exists, balance, fraud checks)
+    - validate_payment:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/validate-payment"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              payment_id: ${payment_id}
+              amount: ${amount}
+              currency: ${currency}
+              from_account: ${from_account}
+              to_account: ${to_account}
+              idempotency_key: ${idempotency_key}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: validation_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - validation_exception:
+                assign:
+                  - failure_context:
+                      payment_id: ${payment_id}
+                      amount: ${amount}
+                      currency: ${currency}
+                      error:
+                        code: "VALIDATION_ERROR"
+                        message: ${json.encode_to_string(e)}
+                next: handle_payment_failure
+
+    - extract_validation:
+        assign:
+          - validation: ${validation_response.body.validation}
+
+    # Step 2: Check validation result
+    - check_validation:
+        switch:
+          - condition: ${validation.is_valid == true}
+            next: process_payment
+        next: validation_failed
+
+    - validation_failed:
+        assign:
+          - failure_context:
+              payment_id: ${payment_id}
+              amount: ${amount}
+              currency: ${currency}
+              error:
+                code: "VALIDATION_FAILED"
+                message: ${validation.reason}
+        next: handle_payment_failure
+
+    # Step 3: Process the payment via the payment gateway with aggressive retries.
+    # Uses try/retry/except: retries on gateway timeouts and 5xx errors,
+    # but routes declines directly to failure handling.
+    - process_payment:
+        try:
+          call: http.post
+          args:
+            url: ${payment_gateway_url + "/process"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              payment_id: ${payment_id}
+              amount: ${amount}
+              currency: ${currency}
+              from_account: ${from_account}
+              to_account: ${to_account}
+              idempotency_key: ${idempotency_key}
+            timeout: 60
+          result: payment_response
+        retry:
+          predicate: ${retry_on_gateway_error}
+          max_retries: 5
+          backoff:
+            initial_delay: 3
+            max_delay: 30
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - check_decline:
+                switch:
+                  - condition: ${e.code == 402}
+                    assign:
+                      - failure_context:
+                          payment_id: ${payment_id}
+                          amount: ${amount}
+                          currency: ${currency}
+                          error:
+                            code: "PAYMENT_DECLINED"
+                            message: "Payment declined by gateway"
+                            details: ${json.encode_to_string(e)}
+                    next: handle_payment_failure
+            - gateway_error:
+                assign:
+                  - failure_context:
+                      payment_id: ${payment_id}
+                      amount: ${amount}
+                      currency: ${currency}
+                      error:
+                        code: "GATEWAY_ERROR"
+                        message: ${"Payment gateway error after retries - " + json.encode_to_string(e)}
+                next: handle_payment_failure
+
+    - extract_payment_result:
+        assign:
+          - payment_result: ${payment_response.body}
+
+    # Step 4: Update the database to record the successful payment
+    - update_database:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/update-payment"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              payment_id: ${payment_id}
+              status: "completed"
+              gateway_transaction_id: ${payment_result.gateway_transaction_id}
+              amount_charged: ${payment_result.amount_charged}
+              currency: ${payment_result.currency}
+              from_account: ${from_account}
+              to_account: ${to_account}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: db_update_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - db_update_error:
+                assign:
+                  - failure_context:
+                      payment_id: ${payment_id}
+                      amount: ${amount}
+                      currency: ${currency}
+                      payment_result: ${payment_result}
+                      error:
+                        code: "DB_UPDATE_FAILED"
+                        message: ${json.encode_to_string(e)}
+                next: handle_payment_failure
+
+    # Step 5: Send success notification. Uses try/except for graceful degradation --
+    # if the notification fails, the payment is still valid.
+    - send_notification:
+        try:
+          call: http.post
+          args:
+            url: ${notification_service_url + "/notify"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              payment_id: ${payment_id}
+              status: "completed"
+              amount: ${amount}
+              currency: ${currency}
+              gateway_transaction_id: ${payment_result.gateway_transaction_id}
+            timeout: 30
+          result: notification_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            # Payment succeeded but notification failed. Payment is still valid.
+            - notification_failed:
+                return:
+                  status: "completed_notification_failed"
+                  payment_id: ${payment_id}
+                  payment_result: ${payment_result}
+                  notification_error: ${json.encode_to_string(e)}
+
+    - return_success:
+        return:
+          status: "completed"
+          payment_id: ${payment_id}
+          payment_result: ${payment_result}
+
+    # Step 6: Handle payment failure. Record the failure and send failure notification.
+    - handle_payment_failure:
+        steps:
+          - record_failure:
+              try:
+                call: http.post
+                args:
+                  url: ${db_proxy_url + "/record-failure"}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    payment_id: ${failure_context.payment_id}
+                    status: "failed"
+                    error_code: ${failure_context.error.code}
+                    error_message: ${failure_context.error.message}
+                    db_host: ${db_config.host}
+                    db_port: ${db_config.port}
+                    db_name: ${db_config.database}
+                    db_user: ${db_config.user}
+                    db_password: ${db_config.password}
+                  timeout: 30
+                result: failure_record_response
+              retry:
+                predicate: ${retry_on_server_error}
+                max_retries: 3
+                backoff:
+                  initial_delay: 2
+                  max_delay: 16
+                  multiplier: 2
+              except:
+                as: record_error
+                steps:
+                  - log_record_error:
+                      assign:
+                        - failure_record_response:
+                            body:
+                              status: "record_failed"
+                              error: ${json.encode_to_string(record_error)}
+          - send_failure_notification:
+              try:
+                call: http.post
+                args:
+                  url: ${notification_service_url + "/notify"}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    payment_id: ${failure_context.payment_id}
+                    status: "failed"
+                    error_code: ${failure_context.error.code}
+                    message: ${failure_context.error.message}
+                  timeout: 30
+              retry:
+                predicate: ${retry_on_server_error}
+                max_retries: 3
+                backoff:
+                  initial_delay: 2
+                  max_delay: 16
+                  multiplier: 2
+              except:
+                as: notify_error
+                steps:
+                  - ignore_notify_error:
+                      next: raise_payment_failed
+          - raise_payment_failed:
+              raise:
+                code: "PAYMENT_PROCESSING_FAILED"
+                message: '${"Payment " + failure_context.payment_id + " failed: " + failure_context.error.message}'
+
+# Retry predicate: retry on server errors (5xx) and rate limits (429)
+retry_on_server_error:
+  params: [e]
+  steps:
+    - check_error:
+        switch:
+          - condition: ${e.code == 429}
+            return: true
+          - condition: ${e.code >= 500 and e.code < 600}
+            return: true
+          - condition: ${"ConnectionError" in e.message}
+            return: true
+          - condition: ${"TimeoutError" in e.message}
+            return: true
+        next: return_false
+    - return_false:
+        return: false
+
+# Retry predicate for payment gateway: retry on timeouts and 5xx, but not on 4xx (declined)
+retry_on_gateway_error:
+  params: [e]
+  steps:
+    - check_error:
+        switch:
+          - condition: ${e.code == 504}
+            return: true
+          - condition: ${e.code == 503}
+            return: true
+          - condition: ${e.code == 502}
+            return: true
+          - condition: ${e.code == 500}
+            return: true
+          - condition: ${e.code == 429}
+            return: true
+          - condition: ${"TimeoutError" in e.message}
+            return: true
+          - condition: ${"ConnectionError" in e.message}
+            return: true
+        next: return_false
+    - return_false:
+        return: false

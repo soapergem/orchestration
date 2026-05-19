@@ -1,0 +1,119 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: shipping-template
+  labels:
+    workflow: order-fulfillment
+  annotations:
+    workflows.argoproj.io/description: >
+      Sub-workflow: Calls the Shipping Service API with retries and exponential
+      backoff. Non-retriable errors (InvalidAddress) fail immediately.
+spec:
+  entrypoint: call-shipping-api
+  arguments:
+    parameters:
+      - name: order-id
+      - name: items
+      - name: shipping-address
+  templates:
+    - name: call-shipping-api
+      inputs:
+        parameters:
+          - name: order-id
+            value: "{{workflow.parameters.order-id}}"
+          - name: items
+            value: "{{workflow.parameters.items}}"
+          - name: shipping-address
+            value: "{{workflow.parameters.shipping-address}}"
+      outputs:
+        parameters:
+          - name: shipment-result
+            valueFrom:
+              path: /tmp/result.json
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "3s"
+          factor: "2"
+          maxDuration: "15s"
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          SHIPPING_SERVICE_URL = os.environ.get("SHIPPING_SERVICE_URL", "http://shipping-service:8092")
+
+          order_id = "{{inputs.parameters.order-id}}"
+          items = json.loads('''{{inputs.parameters.items}}''')
+          shipping_address = json.loads('''{{inputs.parameters.shipping-address}}''')
+
+          idempotency_key = f"{order_id}-ship"
+
+          payload = json.dumps({
+              "order_id": order_id,
+              "items": items,
+              "shipping_address": shipping_address,
+              "idempotency_key": idempotency_key,
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              f"{SHIPPING_SERVICE_URL}/shipments",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          try:
+              response = urllib.request.urlopen(req, timeout=30)
+              body = json.loads(response.read().decode("utf-8"))
+
+              with open("/tmp/result.json", "w") as f:
+                  json.dump(body, f)
+              print(f"Shipment created for order {order_id}: {json.dumps(body)}")
+              sys.exit(0)
+
+          except urllib.error.HTTPError as e:
+              response_body = e.read().decode("utf-8")
+              try:
+                  body = json.loads(response_body)
+              except json.JSONDecodeError:
+                  body = {"detail": response_body}
+
+              error_type = "Unknown"
+              message = str(body)
+              if isinstance(body.get("detail"), dict):
+                  error_type = body["detail"].get("error_type", "Unknown")
+                  message = body["detail"].get("message", str(body))
+
+              if error_type == "InvalidAddress":
+                  # Non-retriable: write error and exit with code that won't be retried
+                  error_result = {
+                      "error": "InvalidAddress",
+                      "message": message,
+                      "order_id": order_id,
+                  }
+                  with open("/tmp/result.json", "w") as f:
+                      json.dump(error_result, f)
+                  print(f"InvalidAddress (non-retriable): {message}", file=sys.stderr)
+                  sys.exit(1)
+              elif error_type == "ShippingTimeout" or e.code == 504:
+                  print(f"ShippingTimeout (retriable): {message}", file=sys.stderr)
+                  sys.exit(1)
+              elif error_type == "ShippingServiceError" or e.code >= 500:
+                  print(f"ShippingServiceError (retriable): {message}", file=sys.stderr)
+                  sys.exit(1)
+              else:
+                  print(f"Unexpected shipping error ({e.code}): {message}", file=sys.stderr)
+                  sys.exit(1)
+
+          except Exception as e:
+              print(f"Shipping API connection error: {e}", file=sys.stderr)
+              sys.exit(1)
+        env:
+          - name: SHIPPING_SERVICE_URL
+            value: "http://shipping-service:8092"

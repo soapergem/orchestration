@@ -1,0 +1,314 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: manager-approval-template
+  labels:
+    workflow: order-fulfillment
+  annotations:
+    workflows.argoproj.io/description: >
+      Sub-workflow: Requests manager approval via the Approval Service, then polls
+      for a decision. In production, the Approval Service would call the Argo API
+      PUT /api/v1/workflows/{namespace}/{name}/resume endpoint to resume the workflow
+      directly. For the bake-off, we use a polling approach to avoid requiring
+      Argo server API configuration.
+spec:
+  entrypoint: manager-approval
+  arguments:
+    parameters:
+      - name: order-id
+      - name: customer-id
+      - name: total-amount
+      - name: items
+      - name: approval-service-url
+        value: "http://approval-service:8091"
+      - name: poll-interval-seconds
+        value: "5"
+      - name: poll-max-attempts
+        value: "24"
+  templates:
+    - name: manager-approval
+      dag:
+        tasks:
+          - name: request-approval
+            template: request-approval
+            arguments:
+              parameters:
+                - name: order-id
+                  value: "{{workflow.parameters.order-id}}"
+                - name: customer-id
+                  value: "{{workflow.parameters.customer-id}}"
+                - name: total-amount
+                  value: "{{workflow.parameters.total-amount}}"
+                - name: items
+                  value: "{{workflow.parameters.items}}"
+
+          - name: poll-approval-status
+            template: poll-approval-status
+            dependencies:
+              - request-approval
+            arguments:
+              parameters:
+                - name: approval-request-id
+                  value: "{{tasks.request-approval.outputs.parameters.approval-request-id}}"
+                - name: order-id
+                  value: "{{workflow.parameters.order-id}}"
+
+          - name: record-decision
+            template: record-decision
+            dependencies:
+              - poll-approval-status
+            arguments:
+              parameters:
+                - name: decision-result
+                  value: "{{tasks.poll-approval-status.outputs.parameters.decision-result}}"
+                - name: order-id
+                  value: "{{workflow.parameters.order-id}}"
+
+    # ---------- Step 1: Submit Approval Request ----------
+    - name: request-approval
+      inputs:
+        parameters:
+          - name: order-id
+          - name: customer-id
+          - name: total-amount
+          - name: items
+      outputs:
+        parameters:
+          - name: approval-request-id
+            valueFrom:
+              path: /tmp/approval-request-id
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import os
+          import sys
+          import urllib.request
+          import uuid
+
+          order_id = "{{inputs.parameters.order-id}}"
+          customer_id = "{{inputs.parameters.customer-id}}"
+          total_amount = float("{{inputs.parameters.total-amount}}")
+          items = json.loads('''{{inputs.parameters.items}}''')
+          approval_service_url = "{{workflow.parameters.approval-service-url}}"
+
+          approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
+
+          items_summary = ", ".join(
+              f"{item['quantity']}x {item['sku']}" for item in items
+          )
+
+          # In production, the callback_url would point to the Argo API:
+          #   https://<argo-server>/api/v1/workflows/<namespace>/<workflow-name>/resume
+          # For the bake-off, we omit callback_url and use polling instead.
+          payload = json.dumps({
+              "approval_request_id": approval_request_id,
+              "order_id": order_id,
+              "total_amount": total_amount,
+              "customer_id": customer_id,
+              "items_summary": items_summary,
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              f"{approval_service_url}/approval-requests",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          try:
+              response = urllib.request.urlopen(req, timeout=10)
+              if response.getcode() not in (200, 201):
+                  body = response.read().decode("utf-8")[:500]
+                  print(f"Approval Service returned {response.getcode()}: {body}", file=sys.stderr)
+                  sys.exit(1)
+          except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8")[:500]
+              print(f"Approval Service returned {e.code}: {body}", file=sys.stderr)
+              sys.exit(1)
+
+          with open("/tmp/approval-request-id", "w") as f:
+              f.write(approval_request_id)
+
+          print(f"Submitted approval request {approval_request_id} for order {order_id}")
+
+    # ---------- Step 2: Poll for Approval Decision ----------
+    # In production, replace this with an Argo suspend node + Argo API resume.
+    # The approval service would call:
+    #   PUT /api/v1/workflows/{namespace}/{name}/resume
+    # with the decision payload.
+    - name: poll-approval-status
+      inputs:
+        parameters:
+          - name: approval-request-id
+          - name: order-id
+      outputs:
+        parameters:
+          - name: decision-result
+            valueFrom:
+              path: /tmp/decision-result.json
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import sys
+          import time
+          import urllib.request
+
+          approval_request_id = "{{inputs.parameters.approval-request-id}}"
+          order_id = "{{inputs.parameters.order-id}}"
+          approval_service_url = "{{workflow.parameters.approval-service-url}}"
+          poll_interval = int("{{workflow.parameters.poll-interval-seconds}}")
+          max_attempts = int("{{workflow.parameters.poll-max-attempts}}")
+
+          print(f"Polling approval status for {approval_request_id}")
+
+          for attempt in range(1, max_attempts + 1):
+              url = f"{approval_service_url}/approval-requests/{approval_request_id}"
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "orchestration-bakeoff/1.0"})
+                  response = urllib.request.urlopen(req, timeout=10)
+                  data = json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      print(f"Attempt {attempt}/{max_attempts}: Not found yet")
+                      if attempt < max_attempts:
+                          time.sleep(poll_interval)
+                          continue
+                      # Treat as expired
+                      result = {
+                          "decision": "expired",
+                          "approver": None,
+                          "reason": "Approval request not found after polling",
+                          "decided_at": None,
+                      }
+                      with open("/tmp/decision-result.json", "w") as f:
+                          json.dump(result, f)
+                      sys.exit(0)
+                  raise
+
+              status = data.get("status", "pending")
+              print(f"Attempt {attempt}/{max_attempts}: status={status}")
+
+              if status in ("approved", "rejected"):
+                  result = {
+                      "decision": status,
+                      "approver": data.get("approver"),
+                      "reason": data.get("reason", ""),
+                      "decided_at": data.get("decided_at"),
+                  }
+                  with open("/tmp/decision-result.json", "w") as f:
+                      json.dump(result, f)
+                  print(f"Approval decision received: {status}")
+                  sys.exit(0)
+              elif status == "pending":
+                  if attempt < max_attempts:
+                      time.sleep(poll_interval)
+                      continue
+                  # Expired
+                  result = {
+                      "decision": "expired",
+                      "approver": None,
+                      "reason": "Approval request timed out",
+                      "decided_at": None,
+                  }
+                  with open("/tmp/decision-result.json", "w") as f:
+                      json.dump(result, f)
+                  print("Approval expired: polling exhausted")
+                  sys.exit(0)
+              else:
+                  print(f"Unexpected approval status: {status}", file=sys.stderr)
+                  sys.exit(1)
+
+          result = {
+              "decision": "expired",
+              "approver": None,
+              "reason": "Approval request timed out",
+              "decided_at": None,
+          }
+          with open("/tmp/decision-result.json", "w") as f:
+              json.dump(result, f)
+        activeDeadlineSeconds: 180
+
+    # ---------- Step 3: Record Decision in Database ----------
+    - name: record-decision
+      inputs:
+        parameters:
+          - name: decision-result
+          - name: order-id
+      outputs:
+        parameters:
+          - name: final-decision
+            valueFrom:
+              path: /tmp/final-decision.json
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+
+          import psycopg2
+
+          decision_data = json.loads('''{{inputs.parameters.decision-result}}''')
+          order_id = "{{inputs.parameters.order-id}}"
+
+          decision = decision_data.get("decision", "unknown")
+          approver = decision_data.get("approver")
+          reason = decision_data.get("reason", "")
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+              now = datetime.now(timezone.utc)
+
+              if order_id:
+                  new_status = "approved" if decision == "approved" else "rejected"
+                  cur.execute(
+                      "UPDATE orders SET status = %s, updated_at = %s WHERE order_id = %s",
+                      (new_status, now, order_id),
+                  )
+
+              conn.commit()
+
+              result = {
+                  "decision": decision,
+                  "approver": approver,
+                  "reason": reason,
+                  "decided_at": now.isoformat(),
+              }
+              with open("/tmp/final-decision.json", "w") as f:
+                  json.dump(result, f)
+              print(f"Recorded approval decision: {decision} for order {order_id}")
+          finally:
+              conn.close()
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"

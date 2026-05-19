@@ -1,0 +1,207 @@
+id: manager_approval_flow
+namespace: orchestration.fulfillment.subflows
+description: >
+  Sub-flow: Request manager approval for high-value orders and wait for the
+  external decision via Kestra's native Pause/webhook resume. The approval
+  service POSTs its decision to the Kestra resume URL when the manager acts.
+
+inputs:
+  - id: order_id
+    type: STRING
+    description: Order requiring approval
+  - id: customer_id
+    type: STRING
+    description: Customer who placed the order
+  - id: total_amount
+    type: STRING
+    description: Total order amount
+  - id: items
+    type: STRING
+    description: JSON array of order items
+
+variables:
+  pg_host: postgres
+  pg_port: "5432"
+  pg_database: orchestration
+  pg_user: orchestration
+  pg_password: orchestration
+  approval_service_url: "http://approval-service:8091"
+
+tasks:
+  - id: request_approval
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Submit an approval request to the approval service with the Kestra Pause
+      resume URL as the callback. Also records the approval request in the database.
+    retry:
+      type: exponential
+      maxAttempt: 3
+      interval: PT2S
+      maxInterval: PT15S
+    beforeCommands:
+      - pip install requests psycopg2-binary
+    script: |
+      import json
+      import uuid
+
+      import psycopg2
+      import requests
+
+      order_id = "{{ inputs.order_id }}"
+      customer_id = "{{ inputs.customer_id }}"
+      total_amount = float("{{ inputs.total_amount }}")
+      items = json.loads("""{{ inputs.items }}""")
+      approval_service_url = "{{ vars.approval_service_url }}"
+
+      approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
+
+      # The resume URL is provided by Kestra for the downstream Pause task.
+      resume_url = "{{ execution.resumeUrl }}"
+
+      items_summary = ", ".join(
+          f"{item['quantity']}x {item['sku']}" for item in items
+      )
+
+      payload = {
+          "approval_request_id": approval_request_id,
+          "order_id": order_id,
+          "total_amount": total_amount,
+          "customer_id": customer_id,
+          "callback_url": resume_url,
+          "items_summary": items_summary,
+      }
+
+      response = requests.post(
+          f"{approval_service_url}/approval-requests",
+          json=payload,
+          headers={"Content-Type": "application/json"},
+          timeout=10,
+      )
+
+      if response.status_code != 201:
+          raise Exception(
+              f"Approval Service returned {response.status_code}: "
+              f"{response.text[:500]}"
+          )
+
+      # Record the approval request in the database
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+      try:
+          cur = conn.cursor()
+          cur.execute(
+              """
+              INSERT INTO approval_requests (approval_request_id, order_id, total_amount, status)
+              VALUES (%s, %s, %s, 'pending')
+              ON CONFLICT (approval_request_id) DO NOTHING
+              """,
+              (approval_request_id, order_id, total_amount),
+          )
+          cur.execute(
+              "UPDATE orders SET status = 'pending_approval', updated_at = NOW() WHERE order_id = %s",
+              (order_id,),
+          )
+          conn.commit()
+      finally:
+          conn.close()
+
+      from kestra import Kestra
+      Kestra.outputs({
+          "approval_request_id": approval_request_id,
+          "status": "submitted",
+      })
+
+  - id: wait_for_approval
+    type: io.kestra.plugin.core.flow.Pause
+    description: >
+      Wait for the approval service to POST the manager's decision to the Kestra
+      resume URL. Times out after 120 seconds if no decision arrives.
+    timeout: PT120S
+
+  - id: record_decision
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Persist the approval decision to the database and produce the decision
+      output for the parent flow.
+    retry:
+      type: constant
+      maxAttempt: 3
+      interval: PT2S
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import json
+      from datetime import datetime, timezone
+
+      import psycopg2
+
+      # Parse the resume payload from the Pause task
+      raw_payload = """{{ outputs.wait_for_approval.onResume }}"""
+      try:
+          approval_data = json.loads(raw_payload)
+      except (json.JSONDecodeError, TypeError):
+          approval_data = {}
+
+      decision = approval_data.get("decision", "unknown")
+      approver = approval_data.get("approver")
+      reason = approval_data.get("reason", "")
+      order_id = "{{ inputs.order_id }}"
+      approval_request_id = "{{ outputs.request_approval.vars.approval_request_id }}"
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      try:
+          cur = conn.cursor()
+          now = datetime.now(timezone.utc)
+
+          if approval_request_id:
+              cur.execute(
+                  """
+                  UPDATE approval_requests
+                  SET status = %s, approver = %s, reason = %s, decided_at = %s
+                  WHERE approval_request_id = %s
+                  """,
+                  (decision, approver, reason, now, approval_request_id),
+              )
+
+          new_status = "approved" if decision == "approved" else "rejected"
+          cur.execute(
+              "UPDATE orders SET status = %s, updated_at = %s WHERE order_id = %s",
+              (new_status, now, order_id),
+          )
+
+          conn.commit()
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "decision": decision,
+              "approver": approver or "",
+              "reason": reason,
+              "decided_at": now.isoformat(),
+          })
+      finally:
+          conn.close()
+
+errors:
+  - id: approval_expired
+    type: io.kestra.plugin.scripts.python.Script
+    description: Handle approval timeout or unexpected error
+    script: |
+      from kestra import Kestra
+      Kestra.outputs({
+          "decision": "expired",
+          "approver": "",
+          "reason": "Approval request timed out",
+          "decided_at": "",
+      })

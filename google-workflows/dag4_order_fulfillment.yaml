@@ -1,0 +1,590 @@
+# Order Fulfillment: Validate, reserve inventory (subworkflow), optional manager approval
+# (callback), ship (subworkflow), with full saga compensation via try/except.
+# Deploy: gcloud workflows deploy order-fulfillment --source=dag4_order_fulfillment.yaml
+#
+# Google Workflows supports waits up to 1 year via events.await_callback, making it
+# ideal for human-in-the-loop approval patterns. During the wait, the workflow consumes
+# zero compute resources -- it is fully suspended and only resumes on callback.
+#
+# Expected input:
+# {
+#   "order_id": "ORD-001",
+#   "customer_id": "CUST-001",
+#   "items": [{"sku": "SKU-A", "quantity": 2}, {"sku": "SKU-B", "quantity": 1}],
+#   "shipping_address": {"street": "123 Main St", "city": "Seattle", "state": "WA", "zip": "98101"},
+#   "approval_threshold": 500.00,
+#   "db_config": { "host": "postgres", "port": 5432, "database": "orchestration", "user": "orchestration", "password": "orchestration" }
+# }
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - db_proxy_url: "http://db-proxy-service:8080"
+          - approval_service_url: "http://approval-service:8091"
+          - shipping_service_url: "http://shipping-service:8092"
+          - notification_service_url: "http://notification-service:8080"
+          - order_id: ${input.order_id}
+          - customer_id: ${input.customer_id}
+          - items: ${input.items}
+          - shipping_address: ${input.shipping_address}
+          - approval_threshold: ${default(map.get(input, "approval_threshold"), 500.00)}
+          - db_config: ${input.db_config}
+          - reservation: null
+
+    # Step 1: Validate the order -- check customer, SKUs, stock levels, compute total.
+    # This is read-only so no compensation is needed if it fails.
+    - validate_order:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/validate-order"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              customer_id: ${customer_id}
+              items: ${items}
+              approval_threshold: ${approval_threshold}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: validation_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_validation_error:
+                raise:
+                  code: "ORDER_FAILED"
+                  message: ${"Order validation failed before inventory reserved - " + json.encode_to_string(e)}
+
+    - extract_validation:
+        assign:
+          - validation: ${validation_response.body.validation}
+          - total_amount: ${validation_response.body.total_amount}
+
+    # Step 2: Check validation result
+    - check_validation:
+        switch:
+          - condition: ${validation.is_valid == true}
+            next: reserve_inventory
+    - order_validation_failed:
+        raise:
+          code: "ORDER_VALIDATION_FAILED"
+          message: '${"Order failed validation: " + validation.reason}'
+
+    # Step 3: Reserve inventory via subworkflow. After this point, failures
+    # require saga compensation (release inventory).
+    - reserve_inventory:
+        try:
+          call: reserve_inventory_subworkflow
+          args:
+            order_id: ${order_id}
+            items: ${items}
+            db_proxy_url: ${db_proxy_url}
+            db_config: ${db_config}
+          result: reservation
+        except:
+          as: e
+          steps:
+            - raise_reservation_error:
+                raise:
+                  code: "ORDER_FAILED"
+                  message: ${"Inventory reservation failed - " + json.encode_to_string(e)}
+
+    # Step 4: Check if manager approval is required (total >= threshold)
+    - check_approval_required:
+        switch:
+          - condition: ${total_amount >= approval_threshold}
+            next: manager_approval
+        next: call_shipping
+
+    # Build items summary string for the approval request
+    - build_items_summary:
+        assign:
+          - items_summary: ""
+    - build_summary_loop:
+        for:
+          value: item
+          in: ${items}
+          steps:
+            - append_summary:
+                assign:
+                  - separator: ${if(items_summary == "", "", ", ")}
+                  - items_summary: ${items_summary + separator + string(item.quantity) + "x " + item.sku}
+
+    # Step 5: Manager Approval via callback.
+    # Google Workflows supports waits up to 1 year. The workflow is fully suspended
+    # during the wait with zero resource cost. This is a flagship feature that makes
+    # Google Workflows excellent for human-in-the-loop patterns.
+    - manager_approval:
+        try:
+          steps:
+            - create_approval_callback:
+                call: events.create_callback_endpoint
+                args:
+                  http_callback_method: "POST"
+                result: approval_callback
+
+            - submit_approval_request:
+                call: http.post
+                args:
+                  url: ${approval_service_url + "/approval-requests"}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    approval_request_id: ${"APR-" + string(sys.now())}
+                    order_id: ${order_id}
+                    total_amount: ${total_amount}
+                    customer_id: ${customer_id}
+                    callback_url: ${approval_callback.url}
+                    items_summary: ${items_summary}
+                  timeout: 10
+                result: approval_submit_response
+
+            - check_approval_submitted:
+                switch:
+                  - condition: ${approval_submit_response.code != 201}
+                    raise:
+                      code: "APPROVAL_SUBMIT_FAILED"
+                      message: ${"Approval service returned " + string(approval_submit_response.code)}
+
+            - record_pending_approval:
+                call: http.post
+                args:
+                  url: ${db_proxy_url + "/update-order-status"}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    order_id: ${order_id}
+                    status: "pending_approval"
+                    db_host: ${db_config.host}
+                    db_port: ${db_config.port}
+                    db_name: ${db_config.database}
+                    db_user: ${db_config.user}
+                    db_password: ${db_config.password}
+                  timeout: 10
+
+            # Wait up to 120 seconds for the approval callback.
+            # In production, this could be set to days or weeks (up to 1 year).
+            - await_approval:
+                call: events.await_callback
+                args:
+                  callback: ${approval_callback}
+                  timeout: 120
+                result: approval_result
+
+            - extract_approval:
+                assign:
+                  - approval_decision: ${approval_result.http_request.body}
+
+            # Record the decision in the database
+            - record_decision:
+                call: http.post
+                args:
+                  url: ${db_proxy_url + "/record-approval-decision"}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    order_id: ${order_id}
+                    decision: ${approval_decision.decision}
+                    approver: ${default(map.get(approval_decision, "approver"), "unknown")}
+                    reason: ${default(map.get(approval_decision, "reason"), "")}
+                    db_host: ${db_config.host}
+                    db_port: ${db_config.port}
+                    db_name: ${db_config.database}
+                    db_user: ${db_config.user}
+                    db_password: ${db_config.password}
+                  timeout: 10
+
+        except:
+          as: e
+          steps:
+            # Approval timed out or errored -- treat as rejection and compensate
+            - approval_timeout_compensation:
+                assign:
+                  - approval_decision:
+                      decision: "expired"
+                      approver: null
+                      reason: '${"Approval error or timeout: " + json.encode_to_string(e)}'
+                next: compensate_from_approval
+
+    # Step 6: Check approval decision
+    - check_approval_decision:
+        switch:
+          - condition: ${approval_decision.decision == "approved"}
+            next: call_shipping
+
+    - compensate_from_approval:
+        call: saga_compensation
+        args:
+          order_id: ${order_id}
+          reservation_id: ${reservation.reservation_id}
+          items: ${items}
+          failure_reason: '${"Order rejected: " + default(map.get(approval_decision, "reason"), "approval denied or expired")}'
+          db_proxy_url: ${db_proxy_url}
+          db_config: ${db_config}
+          notification_service_url: ${notification_service_url}
+        result: compensation_result
+        next: order_cancelled
+
+    # Step 7: Call shipping API via subworkflow with retry
+    - call_shipping:
+        try:
+          call: shipping_subworkflow
+          args:
+            order_id: ${order_id}
+            items: ${items}
+            shipping_address: ${shipping_address}
+            shipping_service_url: ${shipping_service_url}
+          result: shipment
+        except:
+          as: e
+          steps:
+            - compensate_from_shipping:
+                call: saga_compensation
+                args:
+                  order_id: ${order_id}
+                  reservation_id: ${reservation.reservation_id}
+                  items: ${items}
+                  failure_reason: '${"Shipping failed: " + json.encode_to_string(e)}'
+                  db_proxy_url: ${db_proxy_url}
+                  db_config: ${db_config}
+                  notification_service_url: ${notification_service_url}
+                result: compensation_result
+                next: order_cancelled
+
+    # Step 8: Update order status to shipped
+    - update_order_shipped:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/update-order-status"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              status: "shipped"
+              shipment_id: ${shipment.shipment_id}
+              tracking_number: ${shipment.tracking_number}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: update_shipped_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - compensate_from_db_update:
+                call: saga_compensation
+                args:
+                  order_id: ${order_id}
+                  reservation_id: ${reservation.reservation_id}
+                  items: ${items}
+                  failure_reason: '${"DB update failed after shipping: " + json.encode_to_string(e)}'
+                  db_proxy_url: ${db_proxy_url}
+                  db_config: ${db_config}
+                  notification_service_url: ${notification_service_url}
+                result: compensation_result
+                next: order_cancelled
+
+    # Step 9: Send shipped notification (graceful degradation)
+    - send_shipped_notification:
+        try:
+          call: http.post
+          args:
+            url: ${notification_service_url + "/notify"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              status: "shipped"
+              tracking_number: ${shipment.tracking_number}
+              carrier: ${shipment.carrier}
+              estimated_delivery: ${shipment.estimated_delivery}
+            timeout: 30
+          result: notification_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            # Order shipped successfully but notification failed. Order is still valid.
+            - notification_failed:
+                return:
+                  status: "shipped_notification_failed"
+                  order_id: ${order_id}
+                  shipment: ${shipment}
+                  notification_error: ${json.encode_to_string(e)}
+
+    - return_success:
+        return:
+          status: "shipped"
+          order_id: ${order_id}
+          shipment: ${shipment}
+          reservation: ${reservation}
+
+    - order_cancelled:
+        raise:
+          code: "ORDER_CANCELLED"
+          message: ${"Order " + order_id + " was cancelled. Inventory has been released."}
+
+# ---------------------------------------------------------------------------
+# Subworkflow: Reserve inventory atomically
+# ---------------------------------------------------------------------------
+reserve_inventory_subworkflow:
+  params: [order_id, items, db_proxy_url, db_config]
+  steps:
+    - reserve_items:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/reserve-inventory"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              items: ${items}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: reserve_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+    - return_reservation:
+        return:
+          reservation_id: ${reserve_response.body.reservation_id}
+          items_reserved: ${reserve_response.body.items_reserved}
+          reserved_at: ${reserve_response.body.reserved_at}
+
+# ---------------------------------------------------------------------------
+# Subworkflow: Call shipping API with retries
+# Retries on timeouts and 5xx; does not retry on InvalidAddress (400).
+# ---------------------------------------------------------------------------
+shipping_subworkflow:
+  params: [order_id, items, shipping_address, shipping_service_url]
+  steps:
+    - ship:
+        try:
+          call: http.post
+          args:
+            url: ${shipping_service_url + "/shipments"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              items: ${items}
+              shipping_address: ${shipping_address}
+              idempotency_key: ${order_id + "-ship"}
+            timeout: 60
+          result: ship_response
+        retry:
+          predicate: ${retry_on_shipping_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 3
+            max_delay: 15
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - raise_shipping_failed:
+                raise:
+                  code: "SHIPPING_FAILED"
+                  message: ${"Shipping failed after retries - " + json.encode_to_string(e)}
+    - return_shipment:
+        return:
+          shipment_id: ${ship_response.body.shipment_id}
+          tracking_number: ${ship_response.body.tracking_number}
+          carrier: ${ship_response.body.carrier}
+          estimated_delivery: ${ship_response.body.estimated_delivery}
+
+# ---------------------------------------------------------------------------
+# Subworkflow: Saga compensation
+# Sequentially: release inventory, update order to cancelled, send cancellation notification.
+# Each step has its own error handling to maximize compensation success.
+# ---------------------------------------------------------------------------
+saga_compensation:
+  params: [order_id, reservation_id, items, failure_reason, db_proxy_url, db_config, notification_service_url]
+  steps:
+    - release_inventory:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/release-inventory"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              reservation_id: ${reservation_id}
+              items: ${items}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: release_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 5
+          backoff:
+            initial_delay: 3
+            max_delay: 30
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - compensation_failed:
+                raise:
+                  code: "COMPENSATION_FAILED"
+                  message: '${"Saga compensation failed: could not release inventory for order " + order_id + " - " + json.encode_to_string(e) + ". Manual intervention required."}'
+
+    - update_order_cancelled:
+        try:
+          call: http.post
+          args:
+            url: ${db_proxy_url + "/update-order-status"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              status: "cancelled"
+              failure_reason: ${failure_reason}
+              db_host: ${db_config.host}
+              db_port: ${db_config.port}
+              db_name: ${db_config.database}
+              db_user: ${db_config.user}
+              db_password: ${db_config.password}
+            timeout: 30
+          result: cancel_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            - cancel_update_failed:
+                raise:
+                  code: "COMPENSATION_FAILED"
+                  message: '${"Saga compensation failed: could not update order status for " + order_id + " - " + json.encode_to_string(e) + ". Manual intervention required."}'
+
+    - send_cancellation_notification:
+        try:
+          call: http.post
+          args:
+            url: ${notification_service_url + "/notify"}
+            headers:
+              Content-Type: "application/json"
+            body:
+              order_id: ${order_id}
+              status: "cancelled"
+              failure_reason: ${failure_reason}
+            timeout: 30
+          result: cancel_notification_response
+        retry:
+          predicate: ${retry_on_server_error}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 16
+            multiplier: 2
+        except:
+          as: e
+          steps:
+            # Notification failure during compensation is not fatal.
+            # Inventory was released and order was marked cancelled -- that is sufficient.
+            - ignore_notification_error:
+                assign:
+                  - cancel_notification_response:
+                      body:
+                        status: "notification_failed"
+                        error: ${json.encode_to_string(e)}
+
+    - return_compensation:
+        return:
+          status: "compensated"
+          order_id: ${order_id}
+          inventory_released: true
+          order_cancelled: true
+
+# Retry predicate: server errors and transient failures
+retry_on_server_error:
+  params: [e]
+  steps:
+    - check_error:
+        switch:
+          - condition: ${e.code == 429}
+            return: true
+          - condition: ${e.code >= 500 and e.code < 600}
+            return: true
+          - condition: ${"ConnectionError" in e.message}
+            return: true
+          - condition: ${"TimeoutError" in e.message}
+            return: true
+        next: return_false
+    - return_false:
+        return: false
+
+# Retry predicate for shipping: retry on 5xx and timeouts, but not 400 (InvalidAddress)
+retry_on_shipping_error:
+  params: [e]
+  steps:
+    - check_error:
+        switch:
+          - condition: ${e.code == 400}
+            return: false
+          - condition: ${e.code == 504}
+            return: true
+          - condition: ${e.code == 503}
+            return: true
+          - condition: ${e.code == 502}
+            return: true
+          - condition: ${e.code == 500}
+            return: true
+          - condition: ${e.code == 429}
+            return: true
+          - condition: ${"TimeoutError" in e.message}
+            return: true
+          - condition: ${"ConnectionError" in e.message}
+            return: true
+        next: return_false
+    - return_false:
+        return: false

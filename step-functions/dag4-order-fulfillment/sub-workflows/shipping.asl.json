@@ -1,0 +1,55 @@
+{
+  "Comment": "Sub-workflow: Call shipping API with retries and non-retriable error handling",
+  "StartAt": "Ship",
+  "States": {
+    "Ship": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CallShippingAPIFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["ShippingTimeout", "ShippingServiceError"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 15,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["InvalidAddress"],
+          "Next": "ShippingFailed",
+          "ResultPath": "$.error"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ShippingFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+
+    "ShippingFailed": {
+      "Type": "Fail",
+      "Error": "ShippingFailed",
+      "Cause": "Shipping could not be completed after all retries."
+    }
+  }
+}

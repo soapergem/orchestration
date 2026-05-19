@@ -1,0 +1,85 @@
+{
+  "Comment": "Sub-workflow: Request manager approval and wait for external decision via task token callback",
+  "StartAt": "RequestApproval",
+  "States": {
+    "RequestApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${RequestApprovalFunctionArn}",
+        "Payload": {
+          "order_id.$": "$.order_id",
+          "customer_id.$": "$.customer_id",
+          "total_amount.$": "$.total_amount",
+          "items.$": "$.items",
+          "db_config.$": "$.db_config",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSeconds": 120,
+      "HeartbeatSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "Next": "ApprovalExpired",
+          "ResultPath": "$.error"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ApprovalError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "RecordDecision"
+    },
+
+    "RecordDecision": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RecordApprovalDecisionFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+
+    "ApprovalExpired": {
+      "Type": "Pass",
+      "Result": {
+        "decision": "expired",
+        "approver": null,
+        "reason": "Approval request timed out",
+        "decided_at": null
+      },
+      "End": true
+    },
+
+    "ApprovalError": {
+      "Type": "Fail",
+      "Error": "ApprovalError",
+      "Cause": "Unexpected error during approval process."
+    }
+  }
+}

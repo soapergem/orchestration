@@ -1,0 +1,99 @@
+id: shipping_flow
+namespace: orchestration.fulfillment.subflows
+description: >
+  Sub-flow: Call the shipping service API with retries for transient errors.
+  Non-retriable errors (e.g., InvalidAddress) propagate immediately to the caller.
+
+inputs:
+  - id: order_id
+    type: STRING
+    description: Order to ship
+  - id: items
+    type: STRING
+    description: JSON array of items to include in the shipment
+  - id: shipping_address
+    type: STRING
+    description: JSON object with the shipping address
+
+variables:
+  shipping_service_url: "http://shipping-service:8092"
+
+tasks:
+  - id: ship
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      POST to the shipping service to create a shipment. Retries on transient
+      errors (timeouts, 5xx). Non-retriable errors like InvalidAddress are
+      raised immediately.
+    retry:
+      type: exponential
+      maxAttempt: 4
+      interval: PT3S
+      maxInterval: PT15S
+    beforeCommands:
+      - pip install requests
+    script: |
+      import json
+
+      import requests
+
+      order_id = "{{ inputs.order_id }}"
+      items = json.loads("""{{ inputs.items }}""")
+      shipping_address = json.loads("""{{ inputs.shipping_address }}""")
+      shipping_service_url = "{{ vars.shipping_service_url }}"
+
+      idempotency_key = f"{order_id}-ship"
+
+      payload = {
+          "order_id": order_id,
+          "items": items,
+          "shipping_address": shipping_address,
+          "idempotency_key": idempotency_key,
+      }
+
+      response = requests.post(
+          f"{shipping_service_url}/shipments",
+          json=payload,
+          headers={"Content-Type": "application/json"},
+          timeout=30,
+      )
+
+      body = response.json()
+
+      if response.status_code == 200:
+          from kestra import Kestra
+          Kestra.outputs({
+              "shipment_id": body.get("shipment_id"),
+              "tracking_number": body.get("tracking_number"),
+              "carrier": body.get("carrier"),
+              "estimated_delivery": body.get("estimated_delivery"),
+          })
+      else:
+          detail = body.get("detail", {})
+          if isinstance(detail, dict):
+              error_type = detail.get("error_type", "Unknown")
+              message = detail.get("message", str(body))
+          else:
+              error_type = "Unknown"
+              message = str(body)
+
+          if error_type == "InvalidAddress":
+              # Non-retriable: raise immediately without retry
+              raise Exception(f"InvalidAddress: {message}")
+          elif error_type == "ShippingTimeout" or response.status_code == 504:
+              raise Exception(f"ShippingTimeout: {message}")
+          elif error_type == "ShippingServiceError" or response.status_code >= 500:
+              raise Exception(f"ShippingServiceError: {message}")
+          else:
+              raise Exception(f"Unexpected shipping error ({response.status_code}): {message}")
+
+errors:
+  - id: shipping_failed
+    type: io.kestra.plugin.scripts.python.Script
+    description: Log shipping failure details
+    script: |
+      from kestra import Kestra
+      Kestra.outputs({
+          "status": "failed",
+          "message": "Shipping could not be completed after all retries.",
+      })

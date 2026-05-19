@@ -1,0 +1,237 @@
+id: csv_etl_pipeline
+namespace: orchestration.etl
+description: >
+  CSV ETL Pipeline: Download/extract a ZIP file, load each CSV into Postgres
+  in parallel, run a SQL transformation, and export the result as Parquet.
+
+inputs:
+  - id: zip_url
+    type: STRING
+    description: URL of the ZIP file to download
+  - id: extract_dir
+    type: STRING
+    defaults: /tmp/extracted
+    description: Local directory for extracted CSV files
+
+variables:
+  pg_host: postgres
+  pg_port: "5432"
+  pg_database: orchestration
+  pg_user: orchestration
+  pg_password: orchestration
+
+tasks:
+  - id: unzip_file
+    type: io.kestra.plugin.scripts.python.Script
+    description: Download the ZIP file and extract all CSV files
+    retry:
+      type: exponential
+      maxAttempt: 3
+      interval: PT2S
+      maxInterval: PT30S
+    beforeCommands:
+      - pip install requests
+    outputFiles:
+      - "extracted/**"
+    script: |
+      import io
+      import os
+      import zipfile
+      import json
+
+      import requests
+
+      zip_url = "{{ inputs.zip_url }}"
+      extract_dir = "{{ inputs.extract_dir }}"
+
+      response = requests.get(zip_url, timeout=60)
+      response.raise_for_status()
+
+      zip_bytes = io.BytesIO(response.content)
+
+      os.makedirs("extracted", exist_ok=True)
+      csv_files = []
+
+      with zipfile.ZipFile(zip_bytes, "r") as zf:
+          for filename in zf.namelist():
+              if not filename.endswith(".csv"):
+                  continue
+
+              csv_data = zf.read(filename)
+              dest_path = os.path.join("extracted", os.path.basename(filename))
+              with open(dest_path, "wb") as f:
+                  f.write(csv_data)
+              csv_files.append(os.path.basename(filename))
+
+      from kestra import Kestra
+      Kestra.outputs({"csv_files": csv_files, "csv_count": len(csv_files)})
+
+  - id: process_csvs
+    type: io.kestra.plugin.core.flow.EachParallel
+    description: Load each extracted CSV into Postgres in parallel
+    value: "{{ outputs.unzip_file.vars.csv_files }}"
+    tasks:
+      - id: load_csv_to_postgres
+        type: io.kestra.plugin.scripts.python.Script
+        description: Read a single CSV and bulk-load it into a Postgres table
+        retry:
+          type: exponential
+          maxAttempt: 3
+          interval: PT5S
+          maxInterval: PT60S
+        beforeCommands:
+          - pip install psycopg2-binary
+        inputFiles:
+          extracted/: "{{ outputs.unzip_file.outputFiles }}"
+        script: |
+          import csv
+          import io
+          import os
+
+          import psycopg2
+
+          csv_filename = "{{ taskrun.value }}"
+          table_name = csv_filename.replace(".csv", "").lower()
+          csv_path = os.path.join("extracted", csv_filename)
+
+          conn = psycopg2.connect(
+              host="{{ vars.pg_host }}",
+              port={{ vars.pg_port }},
+              dbname="{{ vars.pg_database }}",
+              user="{{ vars.pg_user }}",
+              password="{{ vars.pg_password }}",
+          )
+
+          try:
+              with open(csv_path, "r") as f:
+                  reader = csv.DictReader(f)
+                  rows = list(reader)
+
+              if not rows:
+                  from kestra import Kestra
+                  Kestra.outputs({"table": table_name, "rows_loaded": 0})
+              else:
+                  columns = list(rows[0].keys())
+
+                  with conn.cursor() as cur:
+                      col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
+                      cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({col_defs})')
+
+                      cur.execute(f'TRUNCATE TABLE "{table_name}"')
+
+                      buf = io.StringIO()
+                      writer = csv.DictWriter(buf, fieldnames=columns)
+                      writer.writerows(rows)
+                      buf.seek(0)
+
+                      cur.copy_expert(
+                          f"""COPY "{table_name}" ({", ".join(f'"{c}"' for c in columns)})
+                              FROM STDIN WITH CSV""",
+                          buf,
+                      )
+
+                  conn.commit()
+
+                  from kestra import Kestra
+                  Kestra.outputs({"table": table_name, "rows_loaded": len(rows)})
+          finally:
+              conn.close()
+
+  - id: run_sql_transform
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: >
+      Join orders, customers, and products into a combined_report table.
+    retry:
+      type: exponential
+      maxAttempt: 3
+      interval: PT10S
+      maxInterval: PT120S
+    url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+    username: "{{ vars.pg_user }}"
+    password: "{{ vars.pg_password }}"
+    sql: |
+      DROP TABLE IF EXISTS combined_report;
+
+      CREATE TABLE combined_report AS
+      SELECT
+          o.order_id,
+          o.customer_id,
+          c.customer_name,
+          c.email,
+          o.product_id,
+          p.product_name,
+          p.category,
+          CAST(o.quantity AS INTEGER) AS quantity,
+          CAST(p.price AS NUMERIC(10,2)) AS unit_price,
+          CAST(o.quantity AS INTEGER) * CAST(p.price AS NUMERIC(10,2)) AS total_amount,
+          o.order_date
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.customer_id
+      JOIN products p ON o.product_id = p.product_id;
+
+  - id: get_transform_row_count
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Get the row count from the combined_report table
+    url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+    username: "{{ vars.pg_user }}"
+    password: "{{ vars.pg_password }}"
+    sql: SELECT COUNT(*) AS row_count FROM combined_report;
+    fetchOne: true
+
+  - id: convert_to_parquet
+    type: io.kestra.plugin.scripts.python.Script
+    description: Read the combined_report table and write it as a Parquet file
+    retry:
+      type: constant
+      maxAttempt: 3
+      interval: PT5S
+    beforeCommands:
+      - pip install psycopg2-binary pandas pyarrow
+    outputFiles:
+      - "output/**"
+    script: |
+      import os
+
+      import pandas as pd
+      import psycopg2
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      try:
+          df = pd.read_sql("SELECT * FROM combined_report", conn)
+      finally:
+          conn.close()
+
+      os.makedirs("output", exist_ok=True)
+      output_path = "output/combined_report.parquet"
+      df.to_parquet(output_path, index=False)
+
+      from kestra import Kestra
+      Kestra.outputs({
+          "status": "success",
+          "output_path": output_path,
+          "row_count": len(df),
+      })
+
+errors:
+  - id: pipeline_failed
+    type: io.kestra.plugin.scripts.python.Script
+    description: Log ETL pipeline failure details
+    script: |
+      from kestra import Kestra
+      Kestra.outputs({
+          "status": "failed",
+          "message": "The CSV ETL pipeline encountered an unrecoverable error.",
+      })
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 2 * * *"
+    disabled: true

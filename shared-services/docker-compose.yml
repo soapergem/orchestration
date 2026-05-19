@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: orchestration
+      POSTGRES_USER: orchestration
+      POSTGRES_PASSWORD: orchestration
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestration"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  callback-fetch-service:
+    build: ./callback-fetch-service
+    ports:
+      - "8090:8090"
+    environment:
+      FETCH_DELAY_MIN_SECONDS: "2"
+      FETCH_DELAY_MAX_SECONDS: "10"
+      FETCH_TIMEOUT_SECONDS: "30"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  approval-service:
+    build: ./approval-service
+    ports:
+      - "8091:8091"
+    environment:
+      AUTO_DECIDE_DELAY_SECONDS: "10"
+      AUTO_DECIDE_ACTION: "approved"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  shipping-service:
+    build: ./shipping-service
+    ports:
+      - "8092:8092"
+    environment:
+      SHIPPING_SUCCESS_RATE: "0.70"
+      SHIPPING_TIMEOUT_RATE: "0.15"
+      SHIPPING_SERVER_ERROR_RATE: "0.10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

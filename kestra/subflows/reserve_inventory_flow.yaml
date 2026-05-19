@@ -1,0 +1,132 @@
+id: reserve_inventory_flow
+namespace: orchestration.fulfillment.subflows
+description: >
+  Sub-flow: Atomically reserve inventory for all items in an order.
+  Creates reservation records and decrements available_quantity in a single transaction.
+  Idempotent -- if a reservation already exists for the order, it returns the existing one.
+
+inputs:
+  - id: order_id
+    type: STRING
+    description: The order to reserve inventory for
+  - id: customer_id
+    type: STRING
+    defaults: "unknown"
+    description: Customer placing the order
+  - id: items
+    type: STRING
+    description: JSON array of items with sku, quantity, and unit_price
+
+variables:
+  pg_host: postgres
+  pg_port: "5432"
+  pg_database: orchestration
+  pg_user: orchestration
+  pg_password: orchestration
+
+tasks:
+  - id: reserve_items
+    type: io.kestra.plugin.scripts.python.Script
+    description: >
+      Atomically reserve all items. Uses a single database transaction so the
+      reservation is all-or-nothing. Checks for existing reservations first
+      for idempotency.
+    retry:
+      type: exponential
+      maxAttempt: 4
+      interval: PT2S
+      maxInterval: PT30S
+    beforeCommands:
+      - pip install psycopg2-binary
+    script: |
+      import json
+      import uuid
+      from datetime import datetime, timezone
+
+      import psycopg2
+
+      order_id = "{{ inputs.order_id }}"
+      customer_id = "{{ inputs.customer_id }}"
+      items = json.loads("""{{ inputs.items }}""")
+
+      reservation_id = f"RES-{uuid.uuid4().hex[:12].upper()}"
+
+      conn = psycopg2.connect(
+          host="{{ vars.pg_host }}",
+          port={{ vars.pg_port }},
+          dbname="{{ vars.pg_database }}",
+          user="{{ vars.pg_user }}",
+          password="{{ vars.pg_password }}",
+      )
+
+      from kestra import Kestra
+
+      try:
+          cur = conn.cursor()
+
+          # Check for existing reservation (idempotency)
+          cur.execute(
+              "SELECT reservation_id FROM inventory_reservations WHERE order_id = %s AND status = 'reserved' LIMIT 1",
+              (order_id,),
+          )
+          existing = cur.fetchone()
+          if existing:
+              Kestra.outputs({
+                  "reservation_id": existing[0],
+                  "items_reserved": json.dumps([i["sku"] for i in items]),
+                  "reserved_at": datetime.now(timezone.utc).isoformat(),
+                  "idempotent": True,
+              })
+          else:
+              items_reserved = []
+              for item in items:
+                  sku = item["sku"]
+                  quantity = item["quantity"]
+
+                  cur.execute(
+                      """
+                      UPDATE inventory
+                      SET available_quantity = available_quantity - %s,
+                          reserved_quantity = reserved_quantity + %s
+                      WHERE sku = %s AND available_quantity >= %s
+                      RETURNING sku
+                      """,
+                      (quantity, quantity, sku, quantity),
+                  )
+                  if cur.fetchone() is None:
+                      conn.rollback()
+                      raise Exception(f"InsufficientStock: Cannot reserve {quantity} of {sku}")
+
+                  cur.execute(
+                      """
+                      INSERT INTO inventory_reservations (reservation_id, order_id, sku, quantity, status)
+                      VALUES (%s, %s, %s, %s, 'reserved')
+                      """,
+                      (f"{reservation_id}-{sku}", order_id, sku, quantity),
+                  )
+                  items_reserved.append(sku)
+
+              # Create the order record
+              total = sum(i["quantity"] * i["unit_price"] for i in items)
+              cur.execute(
+                  """
+                  INSERT INTO orders (order_id, customer_id, total_amount, status)
+                  VALUES (%s, %s, %s, 'reserved')
+                  ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+                  """,
+                  (order_id, customer_id, total),
+              )
+
+              conn.commit()
+
+              Kestra.outputs({
+                  "reservation_id": reservation_id,
+                  "items_reserved": json.dumps(items_reserved),
+                  "reserved_at": datetime.now(timezone.utc).isoformat(),
+                  "idempotent": False,
+              })
+      except Exception:
+          conn.rollback()
+          raise
+      finally:
+          conn.close()

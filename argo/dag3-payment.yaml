@@ -1,0 +1,549 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: payment-processing-
+  labels:
+    workflow: payment-processing
+  annotations:
+    workflows.argoproj.io/description: >
+      Payment Processing: Validates payment, processes with retries and exponential
+      backoff, updates database idempotently, and sends notifications. Failed payments
+      are recorded and trigger failure notifications. Uses onExit for failure handling.
+spec:
+  entrypoint: payment-pipeline
+  onExit: exit-handler
+  activeDeadlineSeconds: 300
+  arguments:
+    parameters:
+      - name: input
+        value: |
+          {
+            "payment_id": "PAY-001",
+            "amount": 100.00,
+            "currency": "USD",
+            "from_account": "ACCT-001",
+            "to_account": "ACCT-002",
+            "idempotency_key": "PAY-001"
+          }
+  templates:
+    # ---------- Main DAG ----------
+    - name: payment-pipeline
+      dag:
+        tasks:
+          - name: validate-payment
+            template: validate-payment
+
+          - name: check-validation-and-process
+            template: process-valid-payment
+            dependencies:
+              - validate-payment
+            when: "'{{tasks.validate-payment.outputs.parameters.is-valid}}' == 'true'"
+            arguments:
+              parameters:
+                - name: validated-input
+                  value: "{{tasks.validate-payment.outputs.parameters.result}}"
+
+          - name: handle-validation-failure
+            template: handle-payment-failure
+            dependencies:
+              - validate-payment
+            when: "'{{tasks.validate-payment.outputs.parameters.is-valid}}' != 'true'"
+            arguments:
+              parameters:
+                - name: failure-input
+                  value: "{{tasks.validate-payment.outputs.parameters.result}}"
+
+    # ---------- Sub-DAG: Process Valid Payment ----------
+    - name: process-valid-payment
+      inputs:
+        parameters:
+          - name: validated-input
+      dag:
+        tasks:
+          - name: process-payment
+            template: process-payment
+            arguments:
+              parameters:
+                - name: input
+                  value: "{{inputs.parameters.validated-input}}"
+
+          - name: update-database
+            template: update-database
+            dependencies:
+              - process-payment
+            arguments:
+              parameters:
+                - name: input
+                  value: "{{tasks.process-payment.outputs.parameters.result}}"
+
+          - name: send-notification
+            template: send-success-notification
+            dependencies:
+              - update-database
+            arguments:
+              parameters:
+                - name: input
+                  value: "{{tasks.update-database.outputs.parameters.result}}"
+
+    # ---------- Step 1: Validate Payment ----------
+    - name: validate-payment
+      outputs:
+        parameters:
+          - name: result
+            valueFrom:
+              path: /tmp/result.json
+          - name: is-valid
+            valueFrom:
+              path: /tmp/is-valid
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+          maxDuration: "30s"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          import psycopg2
+
+          event = json.loads(os.environ["INPUT"])
+
+          payment_id = event["payment_id"]
+          amount = event["amount"]
+          currency = event["currency"]
+          from_account = event["from_account"]
+          to_account = event["to_account"]
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          is_valid = False
+
+          try:
+              cur = conn.cursor()
+
+              # Check source account exists and has sufficient balance
+              cur.execute(
+                  "SELECT balance, status FROM accounts WHERE account_id = %s",
+                  (from_account,),
+              )
+              row = cur.fetchone()
+
+              if row is None:
+                  reason = f"Source account {from_account} not found"
+              elif row[1] != "active":
+                  reason = f"Source account {from_account} is {row[1]}"
+              elif row[0] < amount:
+                  reason = f"Insufficient balance: {row[0]} < {amount}"
+              else:
+                  # Check destination account
+                  cur.execute(
+                      "SELECT status FROM accounts WHERE account_id = %s",
+                      (to_account,),
+                  )
+                  dest_row = cur.fetchone()
+
+                  if dest_row is None:
+                      reason = f"Destination account {to_account} not found"
+                  elif dest_row[0] != "active":
+                      reason = f"Destination account {to_account} is {dest_row[0]}"
+                  else:
+                      # Check for duplicate payment
+                      cur.execute(
+                          "SELECT status FROM transactions WHERE idempotency_key = %s",
+                          (event.get("idempotency_key", payment_id),),
+                      )
+                      existing = cur.fetchone()
+                      if existing is not None:
+                          reason = f"Duplicate payment: existing transaction with status {existing[0]}"
+                      else:
+                          is_valid = True
+                          reason = None
+          finally:
+              conn.close()
+
+          result = {**event, "validation": {"is_valid": is_valid, "reason": reason}}
+
+          with open("/tmp/result.json", "w") as f:
+              json.dump(result, f)
+          with open("/tmp/is-valid", "w") as f:
+              f.write(str(is_valid).lower())
+
+          if is_valid:
+              print(f"Payment {payment_id} validated successfully")
+          else:
+              print(f"Payment {payment_id} validation failed: {reason}")
+          PYEOF
+        env:
+          - name: INPUT
+            value: "{{workflow.parameters.input}}"
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Step 3: Process Payment ----------
+    - name: process-payment
+      inputs:
+        parameters:
+          - name: input
+      outputs:
+        parameters:
+          - name: result
+            valueFrom:
+              path: /tmp/result.json
+      retryStrategy:
+        limit: "5"
+        retryPolicy: Always
+        backoff:
+          duration: "3s"
+          factor: "2"
+          maxDuration: "30s"
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+          import random
+          import sys
+
+          event = json.loads('''{{inputs.parameters.input}}''')
+
+          payment_id = event["payment_id"]
+          amount = event["amount"]
+          currency = event["currency"]
+          idempotency_key = event.get("idempotency_key", payment_id)
+
+          # Simulated payment gateway call.
+          # The idempotency_key ensures retries don't cause duplicate charges.
+          #   - 60% success
+          #   - 20% timeout (retriable)
+          #   - 15% 5xx error (retriable)
+          #   - 5% declined (not retriable)
+          roll = random.random()
+
+          if roll < 0.05:
+              print(f"PaymentDeclined: Card declined for payment {payment_id}", file=sys.stderr)
+              # Write error info so the exit handler can read it
+              with open("/tmp/result.json", "w") as f:
+                  json.dump({
+                      **event,
+                      "error": {
+                          "Error": "PaymentDeclined",
+                          "reason": "Card declined by issuing bank",
+                          "decline_code": "insufficient_funds",
+                      },
+                  }, f)
+              sys.exit(1)
+          elif roll < 0.20:
+              print(f"PaymentGateway5xx: 500 error for payment {payment_id}", file=sys.stderr)
+              sys.exit(1)
+          elif roll < 0.40:
+              print(f"PaymentGatewayTimeout: Timeout for payment {payment_id}", file=sys.stderr)
+              sys.exit(1)
+
+          gateway_transaction_id = f"gw-txn-{payment_id}-{random.randint(10000, 99999)}"
+
+          result = {
+              **event,
+              "payment_result": {
+                  "status": "success",
+                  "gateway_transaction_id": gateway_transaction_id,
+                  "amount_charged": amount,
+                  "currency": currency,
+              },
+          }
+
+          with open("/tmp/result.json", "w") as f:
+              json.dump(result, f)
+
+          print(f"Payment {payment_id} processed: txn={gateway_transaction_id}")
+
+    # ---------- Step 4: Update Database ----------
+    - name: update-database
+      inputs:
+        parameters:
+          - name: input
+      outputs:
+        parameters:
+          - name: result
+            valueFrom:
+              path: /tmp/result.json
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+          maxDuration: "30s"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import psycopg2
+
+          event = json.loads('''{{inputs.parameters.input}}''')
+
+          payment_id = event["payment_id"]
+          amount = event["amount"]
+          from_account = event["from_account"]
+          to_account = event["to_account"]
+          idempotency_key = event.get("idempotency_key", payment_id)
+          payment_result = event["payment_result"]
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+              now = datetime.now(timezone.utc).isoformat()
+
+              # Check idempotency
+              cur.execute(
+                  "SELECT id FROM transactions WHERE idempotency_key = %s",
+                  (idempotency_key,),
+              )
+              if cur.fetchone() is not None:
+                  conn.rollback()
+                  result = {
+                      **event,
+                      "db_update": {
+                          "status": "skipped",
+                          "reason": "Transaction already recorded (idempotent)",
+                      },
+                  }
+                  with open("/tmp/result.json", "w") as f:
+                      json.dump(result, f)
+                  print("Idempotent skip: transaction already recorded")
+                  exit(0)
+
+              # Debit source account
+              cur.execute(
+                  "UPDATE accounts SET balance = balance - %s, updated_at = %s WHERE account_id = %s",
+                  (amount, now, from_account),
+              )
+              # Credit destination account
+              cur.execute(
+                  "UPDATE accounts SET balance = balance + %s, updated_at = %s WHERE account_id = %s",
+                  (amount, now, to_account),
+              )
+              # Record transaction
+              cur.execute(
+                  """INSERT INTO transactions
+                     (payment_id, idempotency_key, from_account, to_account,
+                      amount, currency, status, gateway_transaction_id, created_at)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                  (
+                      payment_id, idempotency_key, from_account, to_account,
+                      amount, event["currency"], "completed",
+                      payment_result["gateway_transaction_id"], now,
+                  ),
+              )
+              conn.commit()
+
+              result = {
+                  **event,
+                  "db_update": {"status": "success", "recorded_at": now},
+              }
+              with open("/tmp/result.json", "w") as f:
+                  json.dump(result, f)
+              print(f"Database updated for payment {payment_id}")
+          finally:
+              conn.close()
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Step 5: Send Success Notification (best-effort) ----------
+    - name: send-success-notification
+      inputs:
+        parameters:
+          - name: input
+      # continueOn allows the DAG to succeed even if notification fails
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+
+          event = json.loads('''{{inputs.parameters.input}}''')
+
+          payment_id = event["payment_id"]
+          amount = event.get("amount")
+          currency = event.get("currency")
+          gateway_txn = event.get("payment_result", {}).get("gateway_transaction_id", "N/A")
+
+          subject = f"Payment Successful: {payment_id}"
+          body = (
+              f"Payment {payment_id} for {amount} {currency} was processed successfully.\n"
+              f"Gateway Transaction ID: {gateway_txn}"
+          )
+
+          print(f"NOTIFICATION: {subject}")
+          print(f"BODY: {body}")
+
+          result = {
+              "payment_id": payment_id,
+              "notification": {
+                  "status": "sent",
+                  "subject": subject,
+                  "channel": "simulated",
+              },
+          }
+          print(json.dumps(result))
+
+    # ---------- Step 6: Handle Payment Failure ----------
+    - name: handle-payment-failure
+      inputs:
+        parameters:
+          - name: failure-input
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff:
+          duration: "2s"
+          factor: "2"
+      script:
+        image: python:3.12-slim
+        command: [sh, -c]
+        source: |
+          pip install psycopg2-binary --quiet 2>/dev/null && python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+
+          import psycopg2
+
+          event = json.loads('''{{inputs.parameters.failure-input}}''')
+
+          payment_id = event["payment_id"]
+          idempotency_key = event.get("idempotency_key", payment_id)
+          error_info = event.get("error", event.get("validation", {}))
+          error_message = error_info.get("Cause", error_info.get("reason", "Unknown error"))
+
+          conn = psycopg2.connect(
+              host=os.environ.get("PGHOST", "postgres"),
+              port=int(os.environ.get("PGPORT", "5432")),
+              dbname=os.environ.get("PGDATABASE", "orchestration"),
+              user=os.environ.get("PGUSER", "orchestration"),
+              password=os.environ.get("PGPASSWORD", "orchestration"),
+          )
+
+          try:
+              cur = conn.cursor()
+              now = datetime.now(timezone.utc).isoformat()
+
+              cur.execute(
+                  "SELECT id FROM transactions WHERE idempotency_key = %s",
+                  (idempotency_key,),
+              )
+              if cur.fetchone() is None:
+                  cur.execute(
+                      """INSERT INTO transactions
+                         (payment_id, idempotency_key, from_account, to_account,
+                          amount, currency, status, error_message, created_at)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                      (
+                          payment_id, idempotency_key,
+                          event.get("from_account"), event.get("to_account"),
+                          event.get("amount"), event.get("currency"),
+                          "failed", error_message, now,
+                      ),
+                  )
+              conn.commit()
+          finally:
+              conn.close()
+
+          # Send failure notification
+          subject = f"Payment Failed: {payment_id}"
+          body = f"Payment {payment_id} for {event.get('amount')} {event.get('currency')} has failed.\nReason: {error_message}"
+          print(f"NOTIFICATION: {subject}")
+          print(f"BODY: {body}")
+
+          # Exit with error to mark the workflow as failed
+          sys.exit(1)
+          PYEOF
+        env:
+          - name: PGHOST
+            value: "postgres"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "orchestration"
+          - name: PGUSER
+            value: "orchestration"
+          - name: PGPASSWORD
+            value: "orchestration"
+
+    # ---------- Exit Handler ----------
+    # Runs after the main workflow completes (success or failure).
+    # On failure, ensures the payment failure is recorded.
+    - name: exit-handler
+      steps:
+        - - name: check-and-handle-exit
+            template: exit-handler-logic
+
+    - name: exit-handler-logic
+      script:
+        image: python:3.12-slim
+        command: [python]
+        source: |
+          import json
+
+          workflow_status = "{{workflow.status}}"
+          workflow_name = "{{workflow.name}}"
+
+          print(f"Exit handler running for workflow {workflow_name}")
+          print(f"Workflow status: {workflow_status}")
+
+          if workflow_status == "Failed":
+              print("Payment workflow failed. Failure was handled inline by handle-payment-failure step.")
+              print("Exit handler confirms failure recording is complete.")
+          elif workflow_status == "Succeeded":
+              print("Payment workflow completed successfully.")
+          else:
+              print(f"Payment workflow ended with status: {workflow_status}")
