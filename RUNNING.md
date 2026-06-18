@@ -218,3 +218,213 @@ and DAG 4 will time out.
   run — they're flagged inline above and in `docker-compose.yml`.
 - `init-engines.sql` (the empty `hatchet`/`kestra` DBs) only runs on a **fresh**
   `pgdata` volume. On an existing volume, create them manually (see that file).
+
+---
+
+## 7. Argo Workflows (Kubernetes)
+
+Installed on EKS (Fargate) via the upstream manifest, not Helm.
+
+### Installation
+
+```bash
+# Create namespace
+kubectl create namespace argo
+
+# Install Argo Workflows (server-side apply required for large CRDs)
+kubectl apply -n argo --server-side \
+  -f https://github.com/argoproj/argo-workflows/releases/latest/download/install.yaml
+
+# Grant the default service account permission to report task results
+kubectl apply -n argo -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: executor
+  namespace: argo
+rules:
+- apiGroups:
+  - argoproj.io
+  resources:
+  - workflowtaskresults
+  verbs:
+  - create
+  - patch
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: executor-default
+  namespace: argo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: executor
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: argo
+EOF
+
+# Disable HTTPS and fix readiness probe for port-forward access
+kubectl patch deployment argo-server -n argo --type json -p='[
+  {"op":"replace","path":"/spec/template/spec/containers/0/args","value":["server","--auth-mode=server","--secure=false"]},
+  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/scheme","value":"HTTP"}
+]'
+```
+
+### Accessing the UI
+
+```bash
+kubectl port-forward -n argo svc/argo-server 2746:2746
+# Visit http://localhost:2746
+```
+
+### Submitting workflows
+
+```bash
+kubectl create -n argo -f argo/dag1-csv-etl.yaml
+kubectl create -n argo -f argo/dag2-api-fanout.yaml
+kubectl create -n argo -f argo/dag3-payment.yaml
+```
+
+Submitted workflows appear in the **Workflows** tab (not Workflow Templates).
+
+### Notes
+
+- The `--server-side` flag is required because some CRDs exceed the 262KB annotation limit for client-side apply.
+- The default executor is emissary (the only option in Argo v4+), which is compatible with Fargate.
+- HTTPS was disabled for local port-forward convenience. Do not expose this without TLS in a real environment.
+
+---
+
+## 8. Flyte (Kubernetes)
+
+Installed on EKS (Fargate) via Helm using the `flyte-core` chart with a standalone Postgres deployment.
+
+### Installation
+
+The `flyte-binary` chart bundles Postgres as a sidecar container, which does not work on Fargate due to init container ordering issues. Use `flyte-core` with a standalone Postgres instead.
+
+```bash
+# Add Helm repo
+helm repo add flyteorg https://flyteorg.github.io/flyte
+helm repo update
+
+# Create namespace and deploy Postgres
+kubectl create namespace flyte
+
+kubectl apply -n flyte -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: flyte
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: flyte
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: POSTGRES_DB
+          value: flyteadmin
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+EOF
+
+kubectl rollout status deployment/postgres -n flyte --timeout=120s
+
+# Install Flyte
+helm install flyte flyteorg/flyte-core -n flyte \
+  --set postgres.enabled=false \
+  --set common.ingress.enabled=false \
+  --set db.admin.database.host=postgres \
+  --set db.admin.database.port=5432 \
+  --set db.admin.database.dbname=flyteadmin \
+  --set db.admin.database.username=postgres \
+  --set db.admin.database.passwordPath="" \
+  --set db.datacatalog.database.host=postgres \
+  --set db.datacatalog.database.port=5432 \
+  --set db.datacatalog.database.dbname=flyteadmin \
+  --set db.datacatalog.database.username=postgres \
+  --set db.datacatalog.database.passwordPath="" \
+  --timeout 10m \
+  --wait
+```
+
+### Accessing the UI
+
+```bash
+kubectl port-forward -n flyte svc/flyteconsole 8080:80
+# Visit http://localhost:8080
+```
+
+### Notes
+
+- Postgres is running on Fargate with ephemeral storage (no PV). Data is lost if the pod restarts. This is acceptable for bake-off evaluation.
+- Estimated Fargate cost for the Postgres pod: ~$9/month.
+- For production use, replace with RDS or a Postgres deployment with persistent volumes.
+- Credentials are hardcoded (`postgres`/`postgres`). Do not use in a real environment.
+
+---
+
+## Teardown
+
+### Local (Podman)
+
+```bash
+cd shared-services
+
+# Stop a specific profile
+podman compose --profile temporal down
+podman compose --profile hatchet down
+podman compose --profile kestra down
+
+# Stop shared services and remove volumes
+podman compose down -v
+```
+
+### Kubernetes
+
+```bash
+# Argo Workflows
+kubectl delete -n argo -f https://github.com/argoproj/argo-workflows/releases/latest/download/install.yaml
+kubectl delete namespace argo
+
+# Flyte
+helm uninstall flyte -n flyte
+kubectl delete deployment postgres -n flyte
+kubectl delete service postgres -n flyte
+kubectl delete namespace flyte
+```

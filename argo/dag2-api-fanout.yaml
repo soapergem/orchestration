@@ -225,7 +225,7 @@ spec:
                   raise RuntimeError(f"Unexpected status '{status}' from fetch service")
 
           raise RuntimeError(f"Polling exhausted after {max_attempts} attempts")
-        activeDeadlineSeconds: 120
+      activeDeadlineSeconds: 120
 
     # ---------- Step 2: Process Fetch Result ----------
     - name: process-fetch-result
@@ -351,7 +351,7 @@ spec:
               json.dump(result, f)
 
           print(f"Fetched detail for item {item['id']}")
-        activeDeadlineSeconds: 60
+      activeDeadlineSeconds: 60
 
     # ---------- Step 4: Combine Results ----------
     - name: combine-results
