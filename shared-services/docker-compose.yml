@@ -1,4 +1,26 @@
+# Shared services + orchestrator engines for the bake-off.
+#
+# Base services (postgres + the three mock services) have NO profile, so they
+# always start with `podman compose up`. Each orchestrator engine is gated
+# behind a profile so you bring up ONE at a time:
+#
+#   podman compose up                       # just the shared backbone
+#   podman compose --profile temporal up    # backbone + Temporal
+#   podman compose --profile hatchet  up     # backbone + Hatchet
+#   podman compose --profile kestra   up     # backbone + Kestra
+#
+# Why profiles: the bake-off tests one orchestrator at a time, several of the
+# engines want overlapping host ports, and running all three at once is heavy.
+#
+# Podman note: everything here shares one compose network, so services reach
+# each other by service name (postgres, callback-fetch-service, etc.). The
+# DAG code already defaults to these names. The only cross-boundary case is a
+# worker running on the HOST (outside compose) that a container must call back
+# into -- for that, use `host.containers.internal` (Podman's host gateway).
+# See RUNNING.md for the per-orchestrator details.
+
 services:
+  # ------------------------------------------------------------------ backbone
   postgres:
     image: postgres:16
     environment:
@@ -8,7 +30,8 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - ./init-db.sql:/docker-entrypoint-initdb.d/00-init-db.sql:ro
+      - ./init-engines.sql:/docker-entrypoint-initdb.d/01-init-engines.sql:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U orchestration"]
@@ -51,5 +74,96 @@ services:
       postgres:
         condition: service_healthy
 
+  # ------------------------------------------------------------------ temporal
+  # Server + Web UI run as containers. The worker and signal-relay server run
+  # on the HOST via `uv run` (no Dockerfiles exist for them, and the SDK lives
+  # in pyproject). See RUNNING.md for the host env block, including the
+  # host.containers.internal wiring for the signal server callback.
+  temporal:
+    image: temporalio/auto-setup:1.27.2  # verify/bump tag as needed
+    profiles: ["temporal"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12              # driver name for PostgreSQL in auto-setup
+      DB_PORT: "5432"
+      POSTGRES_USER: orchestration
+      POSTGRES_PWD: orchestration
+      POSTGRES_SEEDS: postgres    # auto-setup creates the temporal + temporal_visibility DBs
+    ports:
+      - "7233:7233"               # gRPC -- host worker connects here
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0   # verify/bump tag as needed
+    profiles: ["temporal"]
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8233
+    ports:
+      - "8233:8080"               # http://localhost:8233
+
+  # ------------------------------------------------------------------- hatchet
+  # PostgreSQL-only engine via the all-in-one hatchet-lite image (engine + API
+  # + dashboard). The worker runs on the HOST via `uv run` after you mint a
+  # client token (see RUNNING.md -- the token can't be baked in statically).
+  hatchet-engine:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:latest  # verify port layout against current docs
+    profiles: ["hatchet"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://orchestration:orchestration@postgres:5432/hatchet?sslmode=disable"
+      SERVER_AUTH_COOKIE_SECRETS: "changeme-cookie-secret-1 changeme-cookie-secret-2"
+      SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
+      SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
+      SERVER_GRPC_INSECURE: "true"
+      SERVER_GRPC_BROADCAST_ADDRESS: "hatchet-engine:7077"
+      SERVER_DEFAULT_ENGINE_VERSION: "V1"
+    ports:
+      - "8888:8888"               # dashboard + REST API -> http://localhost:8888
+      - "7077:7077"               # gRPC -- host worker connects here
+
+  # -------------------------------------------------------------------- kestra
+  # Kestra runs its YAML flows itself -- no separate worker. The `kestra.url`
+  # setting below is the critical bit: it's the base of the resumeUrl handed to
+  # the callback/approval services, so it MUST be an in-network address those
+  # containers can reach (the service name `kestra`), not localhost.
+  kestra:
+    image: kestra/kestra:latest   # verify/pin tag as needed
+    profiles: ["kestra"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: server standalone
+    user: "root"
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: orchestration
+            password: orchestration
+        kestra:
+          repository:
+            type: postgres
+          queue:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          url: http://kestra:8080/
+    ports:
+      - "8080:8080"               # http://localhost:8080
+    volumes:
+      - kestra-data:/app/storage
+      - ../kestra:/flows:ro       # flow YAMLs; load via UI or `kestra flow namespace update`
+
 volumes:
   pgdata:
+  kestra-data:
