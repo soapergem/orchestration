@@ -80,7 +80,7 @@ services:
   # in pyproject). See RUNNING.md for the host env block, including the
   # host.containers.internal wiring for the signal server callback.
   temporal:
-    image: temporalio/auto-setup:1.27.2  # verify/bump tag as needed
+    image: docker.io/temporalio/auto-setup:1.27.2
     profiles: ["temporal"]
     depends_on:
       postgres:
@@ -95,7 +95,7 @@ services:
       - "7233:7233"               # gRPC -- host worker connects here
 
   temporal-ui:
-    image: temporalio/ui:2.34.0   # verify/bump tag as needed
+    image: docker.io/temporalio/ui:2.34.0
     profiles: ["temporal"]
     depends_on:
       - temporal
@@ -118,6 +118,7 @@ services:
     environment:
       DATABASE_URL: "postgres://orchestration:orchestration@postgres:5432/hatchet?sslmode=disable"
       SERVER_AUTH_COOKIE_SECRETS: "changeme-cookie-secret-1 changeme-cookie-secret-2"
+      SERVER_AUTH_COOKIE_DOMAIN: "localhost"
       SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
       SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
       SERVER_GRPC_INSECURE: "true"
@@ -133,7 +134,7 @@ services:
   # the callback/approval services, so it MUST be an in-network address those
   # containers can reach (the service name `kestra`), not localhost.
   kestra:
-    image: kestra/kestra:latest   # verify/pin tag as needed
+    image: docker.io/kestra/kestra:latest
     profiles: ["kestra"]
     depends_on:
       postgres:
