@@ -94,6 +94,27 @@ services:
     ports:
       - "7233:7233"               # gRPC -- host worker connects here
 
+  temporal-worker:
+    build:
+      context: ..
+      dockerfile: temporal/Dockerfile
+    profiles: ["temporal"]
+    depends_on:
+      - temporal
+      - postgres
+    volumes:
+      - ../test-data:/app/test-data:ro
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: orchestration
+      POSTGRES_USER: orchestration
+      POSTGRES_PASSWORD: orchestration
+      CALLBACK_FETCH_SERVICE_URL: http://callback-fetch-service:8090
+      APPROVAL_SERVICE_URL: http://approval-service:8091
+      SHIPPING_SERVICE_URL: http://shipping-service:8092
+
   temporal-ui:
     image: docker.io/temporalio/ui:2.34.0
     profiles: ["temporal"]
@@ -127,6 +148,29 @@ services:
     ports:
       - "8888:8888"               # dashboard + REST API -> http://localhost:8888
       - "7077:7077"               # gRPC -- host worker connects here
+
+  hatchet-worker:
+    build:
+      context: ..
+      dockerfile: hatchet/Dockerfile
+    profiles: ["hatchet"]
+    depends_on:
+      - hatchet-engine
+      - postgres
+    volumes:
+      - ../test-data:/app/test-data:ro
+    environment:
+      HATCHET_CLIENT_TOKEN: "${HATCHET_CLIENT_TOKEN}"
+      HATCHET_CLIENT_TLS_STRATEGY: none
+      HATCHET_CLIENT_HOST_PORT: hatchet-engine:7077
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: orchestration
+      POSTGRES_USER: orchestration
+      POSTGRES_PASSWORD: orchestration
+      CALLBACK_FETCH_SERVICE_URL: http://callback-fetch-service:8090
+      APPROVAL_SERVICE_URL: http://approval-service:8091
+      SHIPPING_SERVICE_URL: http://shipping-service:8092
 
   # -------------------------------------------------------------------- kestra
   # Kestra runs its YAML flows itself -- no separate worker. The `kestra.url`

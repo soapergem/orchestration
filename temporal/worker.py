@@ -125,10 +125,8 @@ async def main() -> None:
     )
 
     logger.info(
-        "Worker started. Listening on task queue '%s'. Registered %d workflows, %d activities.",
+        "Worker started. Listening on task queue '%s'.",
         TASK_QUEUE,
-        len(worker._workflow_worker._workflow_classes) if hasattr(worker, "_workflow_worker") else 7,
-        len(worker._activity_worker._activities) if hasattr(worker, "_activity_worker") else 19,
     )
 
     await worker.run()

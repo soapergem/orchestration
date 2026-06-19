@@ -101,10 +101,8 @@ class LoadCSVToPostgresWorkflow:
             with conn.cursor() as cur:
                 # Create table if not exists (all columns as TEXT for simplicity)
                 col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
-                cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({col_defs})')
-
-                # Truncate and reload
-                cur.execute(f'TRUNCATE TABLE "{table_name}"')
+                cur.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+                cur.execute(f'CREATE TABLE "{table_name}" ({col_defs})')
 
                 # Bulk insert using COPY
                 buf = io.StringIO()

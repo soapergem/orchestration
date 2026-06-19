@@ -132,8 +132,8 @@ async def load_csv_to_postgres(input: LoadCSVInput) -> LoadCSVOutput:
     try:
         with conn.cursor() as cur:
             col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
-            cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({col_defs})')
-            cur.execute(f'TRUNCATE TABLE "{table_name}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+            cur.execute(f'CREATE TABLE "{table_name}" ({col_defs})')
 
             buf = io.StringIO()
             writer = csv.DictWriter(buf, fieldnames=columns)
@@ -227,11 +227,11 @@ async def convert_to_parquet(input: ConvertToParquetInput) -> ConvertToParquetOu
     finally:
         conn.close()
 
-    # Build a PyArrow table and write to Parquet
+    # Build a PyArrow table and write to Parquet (let PyArrow infer types)
     arrays = []
     for col_idx in range(len(columns)):
         col_data = [row[col_idx] for row in rows]
-        arrays.append(pa.array(col_data, type=pa.string()))
+        arrays.append(pa.array(col_data))
 
     table = pa.table(dict(zip(columns, arrays)))
     pq.write_table(table, output_file)
