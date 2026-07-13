@@ -1,17 +1,26 @@
-import os
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 app = FastAPI(title="Shipping Service")
 
-SUCCESS_RATE = float(os.getenv("SHIPPING_SUCCESS_RATE", "0.70"))
-TIMEOUT_RATE = float(os.getenv("SHIPPING_TIMEOUT_RATE", "0.15"))
-SERVER_ERROR_RATE = float(os.getenv("SHIPPING_SERVER_ERROR_RATE", "0.10"))
-# Remaining probability is InvalidAddress (non-retriable)
+
+class Settings(BaseSettings):
+    """Service configuration, sourced from environment variables."""
+
+    model_config = SettingsConfigDict(case_sensitive=False)
+
+    shipping_success_rate: float = 0.70
+    shipping_timeout_rate: float = 0.15
+    shipping_server_error_rate: float = 0.10
+    # Remaining probability is InvalidAddress (non-retriable)
+
+
+settings = Settings()
 
 
 class ShipmentRequest(BaseModel):
@@ -46,7 +55,7 @@ async def create_shipment(req: ShipmentRequest):
         )
 
     roll = random.random()
-    if roll < SUCCESS_RATE:
+    if roll < settings.shipping_success_rate:
         result = {
             "shipment_id": f"SHIP-{uuid.uuid4().hex[:12].upper()}",
             "order_id": req.order_id,
@@ -61,13 +70,13 @@ async def create_shipment(req: ShipmentRequest):
             completed_shipments[req.idempotency_key] = result
         return result
 
-    if roll < SUCCESS_RATE + TIMEOUT_RATE:
+    if roll < settings.shipping_success_rate + settings.shipping_timeout_rate:
         raise HTTPException(
             status_code=504,
             detail={"error_type": "ShippingTimeout", "message": "Carrier API timed out"},
         )
 
-    if roll < SUCCESS_RATE + TIMEOUT_RATE + SERVER_ERROR_RATE:
+    if roll < settings.shipping_success_rate + settings.shipping_timeout_rate + settings.shipping_server_error_rate:
         raise HTTPException(
             status_code=503,
             detail={"error_type": "ShippingServiceError", "message": "Carrier API returned 503"},

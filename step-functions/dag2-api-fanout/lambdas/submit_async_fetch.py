@@ -1,22 +1,21 @@
 """
 Lambda: SubmitAsyncFetch
-Sends the fetch request to the Callback Fetch Service and provides a callback URL
-that will call SendTaskSuccess with the task token when the fetch completes.
+Registers the fetch request with the Callback Fetch Service, handing it the
+state machine's task token as the provider-specific resume handle.
 
-The state machine uses .waitForTaskToken, so it suspends until the callback arrives.
+The state machine uses .waitForTaskToken, so it suspends until something calls
+POST /resume/<correlation_id> on the fetch service, at which point the service
+calls SendTaskSuccess/SendTaskFailure with this token itself -- no relay Lambda
+in between.
 """
 
 import json
 import os
 import uuid
 
-import boto3
 import urllib3
 
-sfn = boto3.client("stepfunctions")
 http = urllib3.PoolManager()
-
-CALLBACK_RELAY_URL = os.environ.get("CALLBACK_RELAY_URL")
 
 
 def handler(event, context):
@@ -27,18 +26,17 @@ def handler(event, context):
     fetch_service_url = request_config.get(
         "callback_fetch_service_url", "http://callback-fetch-service:8090"
     )
-    correlation_id = str(uuid.uuid4())
-
-    # The callback URL points to a relay endpoint (API Gateway + Lambda or similar)
-    # that receives the fetch result and calls SendTaskSuccess/SendTaskFailure
-    # with the embedded task token.
-    callback_url = f"{CALLBACK_RELAY_URL}?task_token={task_token}"
+    # Allow the caller to pin a correlation_id so an external trigger knows which
+    # request to /resume; otherwise generate one.
+    correlation_id = event.get("correlation_id") or str(uuid.uuid4())
 
     headers = {"Content-Type": "application/json", "User-Agent": "orchestration-bakeoff/1.0"}
 
     # Build request headers for the actual fetch (API key if configured)
     fetch_headers = {}
     if "api_key_secret_arn" in request_config:
+        import boto3
+
         secrets = boto3.client("secretsmanager")
         secret = secrets.get_secret_value(SecretId=request_config["api_key_secret_arn"])
         api_key = json.loads(secret["SecretString"])["api_key"]
@@ -47,8 +45,12 @@ def handler(event, context):
     payload = {
         "url": url,
         "headers": fetch_headers,
-        "callback_url": callback_url,
         "correlation_id": correlation_id,
+        "provider": "stepfunctions",
+        "resume_data": {
+            "task_token": task_token,
+            "region": os.environ.get("AWS_REGION"),
+        },
     }
 
     response = http.request(
@@ -66,5 +68,5 @@ def handler(event, context):
         )
 
     # The Lambda returns here, but the state machine stays suspended.
-    # It will resume when the callback relay calls SendTaskSuccess.
+    # It resumes when the fetch service's /resume endpoint calls SendTaskSuccess.
     return {"correlation_id": correlation_id, "status": "submitted"}

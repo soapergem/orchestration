@@ -154,11 +154,11 @@ All DAGs rely on shared infrastructure that runs locally via Docker Compose. One
 
 ```
 shared-services/
-  callback-fetch-service/     # DAG 2: async content fetching with callback
-    app.py                    # FastAPI app (~80-120 lines)
+  callback-fetch-service/     # DAG 2: async fetch + provider resume broker
+    app.py                    # FastAPI app
     Dockerfile
-  approval-service/           # DAG 4: human approval simulation
-    app.py                    # FastAPI app (~100-150 lines)
+  approval-service/           # DAG 4: human approval + provider resume broker
+    app.py                    # FastAPI app
     Dockerfile
   shipping-service/           # DAG 4: flaky shipping API simulation
     app.py                    # FastAPI app
@@ -167,15 +167,34 @@ shared-services/
   init-db.sql                 # All tables for DAGs 1-4
 ```
 
+Both the callback-fetch and approval services are **resume brokers**: the
+orchestrator registers a provider-specific *resume handle* up front, and the
+service performs the resume itself when triggered. `resume_data` is an opaque,
+provider-shaped blob stored verbatim and only interpreted at resume time:
+
+| Provider | `resume_data` | Resume action |
+|---|---|---|
+| `stepfunctions` | `{task_token, region?}` | `SendTaskSuccess` / `SendTaskFailure` (boto3, in-process) |
+| `http_callback` | `{callback_url}` | POST the result to `callback_url` |
+
+`provider` is inferred when omitted: a bare `task_token` ⇒ `stepfunctions`, a
+top-level `callback_url` ⇒ `http_callback` (so older callers still parse).
+There is **no relay Lambda** — the service is the resume-maker.
+
 **Callback Fetch Service** (DAG 2):
-- `POST /fetch-async` — Accepts URL + callback_url + correlation_id. Returns `202 Accepted`. Performs the actual HTTP fetch in a background task after a configurable delay (2-10s), then POSTs the result to the callback_url.
-- `GET /status/<correlation_id>` — Polling fallback for orchestrators without native callback support. Returns `pending`, `completed` (with body), or `failed` (with error).
+- `POST /fetch-async` — Register a fetch. Body: `url`, `headers`, `correlation_id?`, `provider`, `resume_data`. Returns `202`, performs the HTTP fetch in a background task after a configurable delay (2-10s), and **caches** the result. Does not auto-resume.
+- `POST /resume/<correlation_id>` — Fire the provider-specific resume using the cached result. Manually triggered; duplicate and late resumes are allowed (the orchestrator must ignore stragglers), which is how the timeout / duplicate / late-callback edge cases are exercised.
+- Auto-resume mode for hands-off DAG 2: set `AUTO_RESUME=true` (optional `AUTO_RESUME_DELAY_SECONDS`) so the service fires the resume itself when the fetch completes. Off by default. A per-request `auto_resume` field overrides the global default (e.g. submit with `auto_resume: false` to test a callback that never arrives).
+- `GET /requests?status=&resumed=` — List tracked requests (newest first); filter by `status` (e.g. `pending`) and `resumed` to see what is awaiting a resume.
+- `GET /status/<correlation_id>` — Single-request polling fallback. Returns `pending`, `completed` (with body), or `failed` (with error).
 
 **Approval Service** (DAG 4):
-- `POST /approval-requests` — Registers an approval request with callback_url.
-- `POST /approval-requests/<id>/decide` — Simulates manager clicking Approve/Reject. POSTs decision to the callback_url.
-- `GET /approval-requests/<id>` — Polling fallback.
-- Auto-decide mode for automated testing: set `AUTO_DECIDE_DELAY_SECONDS=10` and `AUTO_DECIDE_ACTION=approved|rejected|none` via environment variables.
+- `POST /approval-requests` — Register an approval + resume handle (`provider`, `resume_data`). Returns `201`, status `pending`.
+- `POST /approval-requests/<id>/decide` — Simulate the manager clicking Approve/Reject; records the decision and **resumes** the registered provider in one step.
+- `POST /approval-requests/<id>/resume` — Re-fire the resume for an already-decided approval (duplicate / late-decision edge cases).
+- `GET /approval-requests?status=` — List approvals; filter by status.
+- `GET /approval-requests/<id>` — Single-request polling fallback.
+- Auto-decide mode for automated testing: set `AUTO_DECIDE_DELAY_SECONDS=10` and `AUTO_DECIDE_ACTION=approved|rejected|none`. When enabled, the service decides *and resumes* on its own after the delay, so DAG 4 still runs hands-off.
 
 **Shipping Service** (DAG 4):
 - `POST /shipments` — Simulated flaky shipping API. 70% success (returns tracking number), 15% timeout, 10% 5xx error, 5% `InvalidAddress` (non-retriable). Supports idempotency keys.

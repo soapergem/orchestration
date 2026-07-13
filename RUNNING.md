@@ -56,6 +56,44 @@ applies to them. Host→published-port over `localhost` is fine.
 
 ---
 
+## 2b. The resume-broker model (read once)
+
+The callback-fetch and approval services are **resume brokers**. Instead of
+auto-POSTing a result when work finishes, they store a provider-specific
+*resume handle* at registration and perform the resume only when explicitly
+triggered:
+
+- **Register:** `POST /fetch-async` (or `/approval-requests`) with `provider` +
+  `resume_data`. `stepfunctions` → `{task_token, region?}`; `http_callback` →
+  `{callback_url}`. A bare `task_token` or top-level `callback_url` infers the
+  provider, so existing callers keep working.
+- **Resume:** for the fetch service, `POST /resume/<correlation_id>`; for the
+  approval service, `POST /approval-requests/<id>/decide` (which decides *and*
+  resumes). The `stepfunctions` provider calls `SendTaskSuccess`/`Failure` in
+  process (needs AWS creds + region); `http_callback` POSTs the result to the
+  stored URL — this is the path the container-networking rule above governs.
+- **Inspect:** `GET /requests` / `GET /approval-requests` (add `?status=pending`)
+  to see what's registered and awaiting a resume.
+
+Consequence for hands-off runs:
+
+- **Fetch service (DAG 2)** doesn't auto-fire by default. Either set
+  `AUTO_RESUME=true` on the `callback-fetch-service` (in `docker-compose.yml`)
+  so it resumes itself when the fetch completes — the hands-off option — or
+  call `POST /resume/<correlation_id>` yourself (a harness, or by hand after
+  `GET /requests?status=completed&resumed=false` shows the id). Leaving it
+  manual, or submitting a single request with `auto_resume: false`, is how the
+  timeout / duplicate / late-callback edge cases get exercised.
+- **Approval service (DAG 4)** keeps `AUTO_DECIDE_*` (set in compose), so it
+  decides *and* resumes on its own after the delay — DAG 4 still runs hands-off.
+
+**Step Functions** now registers directly with the broker (task token in
+`resume_data`); the old relay Lambdas are gone. For the SFN path to actually
+resume, the service container needs AWS credentials and `AWS_REGION` in its
+environment (SFN itself remains out of scope for local Podman runs).
+
+---
+
 ## 3. Python-native orchestrators (no engine container)
 
 Install the project deps once: `uv sync`. Then run each from its own directory.

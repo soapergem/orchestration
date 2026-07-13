@@ -47,6 +47,10 @@ services:
       FETCH_DELAY_MIN_SECONDS: "2"
       FETCH_DELAY_MAX_SECONDS: "10"
       FETCH_TIMEOUT_SECONDS: "30"
+      # Flip to "true" for hands-off DAG 2: the service fires the resume itself
+      # when the fetch completes. Left off so resume is a manual /resume call.
+      AUTO_RESUME: "false"
+      AUTO_RESUME_DELAY_SECONDS: "0"
     depends_on:
       postgres:
         condition: service_healthy

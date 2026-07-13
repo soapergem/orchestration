@@ -1,9 +1,11 @@
 """
 Lambda: RequestApproval
-Sends an approval request to the Approval Service and provides a callback URL
-that will call SendTaskSuccess/SendTaskFailure with the task token.
+Registers an approval request with the Approval Service, handing it the
+sub-workflow's task token as the provider-specific resume handle.
 
-The sub-workflow uses .waitForTaskToken, so it suspends until the approval arrives.
+The sub-workflow uses .waitForTaskToken, so it suspends until a decision is
+delivered -- the approval service calls SendTaskSuccess/SendTaskFailure with
+this token itself (via /decide or /resume); there is no relay Lambda.
 """
 
 import json
@@ -13,10 +15,7 @@ import uuid
 import boto3
 import urllib3
 
-sfn = boto3.client("stepfunctions")
 http = urllib3.PoolManager()
-
-APPROVAL_RELAY_URL = os.environ.get("APPROVAL_RELAY_URL")
 
 
 def handler(event, context):
@@ -30,8 +29,6 @@ def handler(event, context):
     approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
     approval_service_url = os.environ.get("APPROVAL_SERVICE_URL", "http://approval-service:8091")
 
-    callback_url = f"{APPROVAL_RELAY_URL}?task_token={task_token}"
-
     items_summary = ", ".join(
         f"{item['quantity']}x {item['sku']}" for item in items
     )
@@ -41,8 +38,12 @@ def handler(event, context):
         "order_id": order_id,
         "total_amount": total_amount,
         "customer_id": customer_id,
-        "callback_url": callback_url,
         "items_summary": items_summary,
+        "provider": "stepfunctions",
+        "resume_data": {
+            "task_token": task_token,
+            "region": os.environ.get("AWS_REGION"),
+        },
     }
 
     response = http.request(
