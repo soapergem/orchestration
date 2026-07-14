@@ -5,8 +5,8 @@ default networking and reach Neon over public TLS. All DB work (DAGs 1/3/4) uses
 Neon; S3 is used only for DAG 1 file I/O (ZIP input, Parquet output). The Neon
 DSN is stored as an SSM Parameter Store SecureString.
 
-Currently scaffolded: **DAG 1 (CSV ETL)**, **DAG 2 (API fan-out)**, and **DAG 3
-(Payment)**. DAG 4 comes next.
+Scaffolded: **all four DAGs** — DAG 1 (CSV ETL), DAG 2 (API fan-out), DAG 3
+(Payment), DAG 4 (order fulfillment + saga compensation).
 
 DAG 2's mock service (callback-fetch) is **not** hosted in AWS — no long-running
 container. Terraform creates the ECR repos + a least-privilege IAM user; you
@@ -86,6 +86,27 @@ aws stepfunctions start-execution --profile soapergem \
 The submit lambda registers a task token with the K3s callback-fetch service;
 with `AUTO_RESUME=true` the service fetches the URL and calls `SendTaskSuccess`
 (using the IAM-user creds), resuming the workflow into the fan-out + combine steps.
+
+## Run DAG 4
+
+Requires the `approval` and `shipping` services on K3s. Use a unique `order_id`
+each run (it's the orders PK). Items need `sku`, `quantity`, `unit_price`. A total
+`>=` `approval_threshold` routes through manager approval (the approval service
+auto-approves after ~10s via `AUTO_DECIDE_ACTION=approved`); below it skips
+straight to shipping.
+
+```bash
+aws stepfunctions start-execution --profile soapergem \
+  --state-machine-arn "$(terraform output -raw dag4_state_machine_arn)" \
+  --name "dag4-$(uuidgen)" \
+  --input '{"order_id":"ORD-'"$(uuidgen | cut -c1-8)"'","customer_id":"CUST-42","items":[{"sku":"GADGET-B","quantity":2,"unit_price":499.99}],"shipping_address":{"street":"123 Main St","city":"Springfield","state":"IL","zip":"01234"},"approval_threshold":500}'
+```
+
+Flow: ValidateOrder → ReserveInventory (sub) → ManagerApproval (sub, suspends on
+task token until the approval service resumes it) → CallShippingAPI (sub) →
+UpdateOrderShipped. Rejection/timeout or shipping failure triggers the saga
+compensation path (ReleaseInventory → UpdateOrderCancelled). `shipping` is flaky
+(70% success), so some runs exercise retries or `InvalidAddress` → compensation.
 
 ## Schema note
 

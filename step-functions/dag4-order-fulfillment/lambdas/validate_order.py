@@ -4,35 +4,16 @@ Validates that all SKUs exist, customer is active, and computes total amount.
 Read-only — no mutations, so no compensation needed on failure.
 """
 
-import json
-
-import boto3
-import psycopg2
-
-
-secrets = boto3.client("secretsmanager")
-
-
-def get_connection(db_config):
-    secret = secrets.get_secret_value(SecretId=db_config["secret_arn"])
-    creds = json.loads(secret["SecretString"])
-    return psycopg2.connect(
-        host=creds["host"],
-        port=creds.get("port", 5432),
-        dbname=creds["dbname"],
-        user=creds["username"],
-        password=creds["password"],
-    )
+from db import get_db_connection
 
 
 def handler(event, context):
     order_id = event["order_id"]
     customer_id = event["customer_id"]
     items = event["items"]
-    db_config = event["db_config"]
     approval_threshold = event.get("approval_threshold", 500.00)
 
-    conn = get_connection(db_config)
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
 

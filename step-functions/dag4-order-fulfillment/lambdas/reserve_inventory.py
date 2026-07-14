@@ -5,37 +5,19 @@ Creates reservation records and decrements available_quantity.
 Uses a single transaction so it's all-or-nothing.
 """
 
-import json
 import uuid
 from datetime import datetime, timezone
 
-import boto3
-import psycopg2
-
-
-secrets = boto3.client("secretsmanager")
-
-
-def get_connection(db_config):
-    secret = secrets.get_secret_value(SecretId=db_config["secret_arn"])
-    creds = json.loads(secret["SecretString"])
-    return psycopg2.connect(
-        host=creds["host"],
-        port=creds.get("port", 5432),
-        dbname=creds["dbname"],
-        user=creds["username"],
-        password=creds["password"],
-    )
+from db import get_db_connection
 
 
 def handler(event, context):
     order_id = event["order_id"]
     items = event["items"]
-    db_config = event["db_config"]
 
     reservation_id = f"RES-{uuid.uuid4().hex[:12].upper()}"
 
-    conn = get_connection(db_config)
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
 
@@ -52,6 +34,19 @@ def handler(event, context):
                 "reserved_at": datetime.now(timezone.utc).isoformat(),
                 "idempotent": True,
             }
+
+        # Create the order record first: inventory_reservations.order_id has a
+        # FK to orders, so the order row must exist before the reservations.
+        # Same transaction, so it's still all-or-nothing.
+        total = sum(i["quantity"] * i["unit_price"] for i in items)
+        cur.execute(
+            """
+            INSERT INTO orders (order_id, customer_id, total_amount, status)
+            VALUES (%s, %s, %s, 'reserved')
+            ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+            """,
+            (order_id, event.get("customer_id", "unknown"), total),
+        )
 
         items_reserved = []
         for item in items:
@@ -80,17 +75,6 @@ def handler(event, context):
                 (f"{reservation_id}-{sku}", order_id, sku, quantity),
             )
             items_reserved.append(sku)
-
-        # Create the order record
-        total = sum(i["quantity"] * i["unit_price"] for i in items)
-        cur.execute(
-            """
-            INSERT INTO orders (order_id, customer_id, total_amount, status)
-            VALUES (%s, %s, %s, 'reserved')
-            ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
-            """,
-            (order_id, event.get("customer_id", "unknown"), total),
-        )
 
         conn.commit()
 

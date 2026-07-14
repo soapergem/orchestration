@@ -12,8 +12,9 @@ import json
 import os
 import uuid
 
-import boto3
 import urllib3
+
+from db import get_db_connection
 
 http = urllib3.PoolManager()
 
@@ -23,7 +24,6 @@ def handler(event, context):
     customer_id = event["customer_id"]
     total_amount = event["total_amount"]
     items = event["items"]
-    db_config = event["db_config"]
     task_token = event["task_token"]
 
     approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
@@ -61,17 +61,7 @@ def handler(event, context):
         )
 
     # Record the approval request in the database
-    secret = boto3.client("secretsmanager").get_secret_value(SecretId=db_config["secret_arn"])
-    creds = json.loads(secret["SecretString"])
-
-    import psycopg2
-    conn = psycopg2.connect(
-        host=creds["host"],
-        port=creds.get("port", 5432),
-        dbname=creds["dbname"],
-        user=creds["username"],
-        password=creds["password"],
-    )
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
