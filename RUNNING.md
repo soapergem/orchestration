@@ -1,38 +1,47 @@
-# Running the Bake-Off Locally (Podman)
+# Running the Bake-Off Locally
 
 How to stand up each orchestrator against the shared services. Scope: the
 **local** orchestrators. Argo and Flyte run on Kubernetes (separate setup); Step
 Functions and Google Workflows are out of scope for now.
 
-> **Container runtime:** this environment uses **Podman** (4.9.x) with
-> `podman-compose`. `podman compose <...>` delegates to it and parses the
-> compose file cleanly. Wherever Docker docs say `docker compose`, use
-> `podman compose`.
+> **Container runtime:** the repo is runtime-agnostic. The `Justfile` auto-detects
+> whichever of **finch**, **podman**, or **docker** you have installed (in that
+> order) and drives its `compose` subcommand, so the `just up` / `just down`
+> recipes below Just Work regardless of runtime. For the handful of raw commands
+> that have no `just` recipe (engine `exec` calls, token minting), set a
+> shorthand once so the examples are copy-pasteable from the repo root:
+>
+> ```bash
+> export COMPOSE="finch compose -f shared-services/docker-compose.yml"
+> #                ^^^^^ or "podman compose ..." / "docker compose ..."
+> ```
+>
+> The one place the runtime genuinely matters is the **host-gateway hostname**
+> for host-targeted callbacks — see §2.
 
 ---
 
 ## 1. The shared backbone (always first)
 
 ```bash
-cd shared-services
-podman compose up -d            # postgres + callback-fetch + approval + shipping
+just up                         # postgres + callback-fetch + approval + shipping
 ```
 
 This starts:
 
 | Service | Host port | Purpose |
 |---|---|---|
-| postgres | 5432 | DB for all DAGs (+ empty `hatchet`/`kestra` DBs) |
+| postgres | 54321 | DB for all DAGs (+ empty `hatchet`/`kestra` DBs); non-standard host port to avoid clashing with a local Postgres |
 | callback-fetch-service | 8090 | DAG 2 async fetch + callback |
 | approval-service | 8091 | DAG 4 human approval |
 | shipping-service | 8092 | DAG 4 flaky shipping API |
 
 Each orchestrator engine is behind a **compose profile** so you run one at a
-time: `podman compose --profile <name> up -d`.
+time: `just up <name>` (e.g. `just up temporal`).
 
 ---
 
-## 2. The Podman callback-networking rule (read once)
+## 2. The callback-networking rule (read once)
 
 DAG 2 and DAG 4 use an **async callback**: the orchestrator hands a
 `callback_url` to a mock service (a container), and the service later POSTs the
@@ -41,14 +50,22 @@ the mock-service container**:
 
 - **Callback target is itself a container** (Hatchet engine, Kestra server) →
   use the **compose service name** (`hatchet-engine`, `kestra`). Same network,
-  just works.
-- **Callback target runs on the HOST** (the Temporal signal server) → use
-  **`host.containers.internal`** (Podman's host gateway), *not* `localhost`.
-  `localhost` inside a container is the container itself, so the callback
-  silently times out.
+  just works. Runtime-independent.
+- **Callback target runs on the HOST** (the Temporal signal server) → use your
+  runtime's **host-gateway hostname**, *not* `localhost`. `localhost` inside a
+  container is the container itself, so the callback silently times out.
 
-There are **no hard-coded `host.docker.internal`** values anywhere — every host
-is an env var or (for Kestra) server config, so this is pure configuration.
+  | Runtime | Host-gateway hostname |
+  |---|---|
+  | Docker Desktop | `host.docker.internal` |
+  | Podman (4.7+) | `host.containers.internal` (also aliases `host.docker.internal`) |
+  | Finch | `host.docker.internal` — **verify on first run**; finch runs containers in a Lima VM, so if this doesn't resolve to your Mac host, inspect the VM's networking before relying on the callback path |
+
+  Because `host.docker.internal` works on Docker and (as an alias) on Podman
+  4.7+, the examples below use it as the default; podman users can equally use
+  `host.containers.internal`. Every host is an env var (or, for Kestra, server
+  config) — **nothing is hard-coded** — so switching runtimes is pure
+  configuration.
 
 The **polling** orchestrators — **Airflow, Dagster, Prefect, Luigi** — don't use
 callbacks at all (they poll `GET /status` on the services), so none of this
@@ -90,7 +107,7 @@ Consequence for hands-off runs:
 **Step Functions** now registers directly with the broker (task token in
 `resume_data`); the old relay Lambdas are gone. For the SFN path to actually
 resume, the service container needs AWS credentials and `AWS_REGION` in its
-environment (SFN itself remains out of scope for local Podman runs).
+environment (SFN itself remains out of scope for local runs).
 
 ---
 
@@ -132,21 +149,25 @@ uv run python dag1_csv_etl.py
 ```
 No callback support by design (DAG 2 polls synchronously).
 
-All four reach Postgres at `localhost:5432` and the mock services at
-`localhost:8090–8092` (published ports). No overrides required.
+All four reach Postgres at `localhost:54321` (the non-standard host port from
+the compose file) and the mock services at `localhost:8090–8092` (published
+ports). The repo's `.envrc` exports `POSTGRES_HOST=localhost` and
+`POSTGRES_PORT=54321`, so with **direnv** loaded no overrides are required;
+without direnv, set those two vars in your shell first (the code otherwise
+defaults to `postgres:5432`, the in-compose address, which won't resolve on the
+host).
 
 ---
 
 ## 4. Temporal (server in compose, worker on host)
 
 ```bash
-cd shared-services
-podman compose --profile temporal up -d     # temporal:7233, UI on :8233
+just up temporal                            # temporal:7233, UI on :8233
 ```
 
 Run the **worker** and **signal-relay server** on the host. The signal server
 is the callback target, and it runs on the host — so the mock-service
-containers must reach it via `host.containers.internal`:
+containers must reach it via your runtime's host-gateway hostname (§2):
 
 ```bash
 cd temporal
@@ -154,10 +175,11 @@ cd temporal
 # Worker
 TEMPORAL_ADDRESS=localhost:7233 \
 POSTGRES_HOST=localhost \
+POSTGRES_PORT=54321 \
 CALLBACK_FETCH_SERVICE_URL=http://localhost:8090 \
 APPROVAL_SERVICE_URL=http://localhost:8091 \
 SHIPPING_SERVICE_URL=http://localhost:8092 \
-SIGNAL_SERVER_URL=http://host.containers.internal:8095 \
+SIGNAL_SERVER_URL=http://host.docker.internal:8095 \
   uv run python worker.py
 
 # Signal relay server (separate shell)
@@ -165,19 +187,19 @@ TEMPORAL_ADDRESS=localhost:7233 \
   uv run uvicorn signal_server:app --host 0.0.0.0 --port 8095
 ```
 
-Why `SIGNAL_SERVER_URL=http://host.containers.internal:8095`: the worker bakes
-this host into the `callback_url` it gives the fetch/approval **containers**,
-which then POST back to your host's signal server. The worker itself reaches
-everything else over `localhost` (published ports), hence the other overrides
-(the code defaults to compose DNS names, which don't resolve on the host).
+Why the host-gateway host in `SIGNAL_SERVER_URL` (here `host.docker.internal`;
+podman users can use `host.containers.internal`): the worker bakes this host
+into the `callback_url` it gives the fetch/approval **containers**, which then
+POST back to your host's signal server. The worker itself reaches everything
+else over `localhost` (published ports), hence the other overrides (the code
+defaults to compose DNS names, which don't resolve on the host).
 
 ---
 
 ## 5. Hatchet (engine in compose, worker on host)
 
 ```bash
-cd shared-services
-podman compose --profile hatchet up -d      # engine API on :8888, gRPC on :7077
+just up hatchet                             # engine API on :8888, gRPC on :7077
 ```
 
 Hatchet needs a **client token** that can only be minted after the engine is
@@ -185,16 +207,17 @@ up, so it can't be baked into compose. Generate one, then run the worker:
 
 ```bash
 # 1. Mint a token (exact subcommand may vary by hatchet-lite version — check
-#    `podman compose exec hatchet-engine /hatchet-admin --help`):
-podman compose exec hatchet-engine \
-  /hatchet-admin token create --config /config --tenant-id <tenant> > hatchet.token
+#    `$COMPOSE exec hatchet-engine /hatchet-admin --help`):
+$COMPOSE exec hatchet-engine \
+  /hatchet-admin token create --config /config --tenant-id <tenant> > shared-services/hatchet.token
 
 # 2. Run the worker on the host:
-cd ../hatchet
+cd hatchet
 HATCHET_CLIENT_TOKEN="$(cat ../shared-services/hatchet.token)" \
 HATCHET_CLIENT_TLS_STRATEGY=none \
 HATCHET_CLIENT_HOST_PORT=localhost:7077 \
 POSTGRES_HOST=localhost \
+POSTGRES_PORT=54321 \
 CALLBACK_FETCH_SERVICE_URL=http://localhost:8090 \
 APPROVAL_SERVICE_URL=http://localhost:8091 \
 SHIPPING_SERVICE_URL=http://localhost:8092 \
@@ -216,17 +239,16 @@ version** — this is the most likely thing to need adjustment.
 Kestra runs the flow YAMLs itself — no separate worker.
 
 ```bash
-cd shared-services
-podman compose --profile kestra up -d       # UI on :8080
+just up kestra                              # UI on :8080
 ```
 
 Load the flows (mounted read-only at `/flows`) — via the UI importer, or:
 
 ```bash
 # DAG flows
-podman compose exec kestra kestra flow namespace update orchestration.api /flows
+$COMPOSE exec kestra kestra flow namespace update orchestration.api /flows
 # Subflows (manager approval, shipping, inventory)
-podman compose exec kestra kestra flow namespace update orchestration.api /flows/subflows
+$COMPOSE exec kestra kestra flow namespace update orchestration.api /flows/subflows
 ```
 
 The callback wiring is already handled by `kestra.url: http://kestra:8080/` in
@@ -242,7 +264,7 @@ and DAG 4 will time out.
 | Orchestrator | Wait mechanism | Callback target | Host to use |
 |---|---|---|---|
 | Airflow / Dagster / Prefect / Luigi | polling | n/a (orchestrator polls) | — |
-| Temporal | signal relay (host process) | signal server | `host.containers.internal:8095` |
+| Temporal | signal relay (host process) | signal server | host-gateway:8095 (§2) |
 | Hatchet | event ingestion | engine container | `hatchet-engine:8888` |
 | Kestra | pause/resume webhook | server container | `kestra:8080` (via `kestra.url`) |
 
@@ -439,18 +461,16 @@ kubectl port-forward -n flyte svc/flyteconsole 8080:80
 
 ## Teardown
 
-### Local (Podman)
+### Local
 
 ```bash
-cd shared-services
+# Stop a specific profile (pass the same one you started with)
+just down temporal
+just down hatchet
+just down kestra
 
-# Stop a specific profile
-podman compose --profile temporal down
-podman compose --profile hatchet down
-podman compose --profile kestra down
-
-# Stop shared services and remove volumes
-podman compose down -v
+# Stop shared services and remove volumes (postgres data, kestra storage)
+just down-clean
 ```
 
 ### Kubernetes

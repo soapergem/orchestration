@@ -7,21 +7,29 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_name TEXT NOT NULL,
     balance NUMERIC(12,2) NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active',
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()  -- DAG 3 debits/credits set this
 );
 
+-- Column names match the DAG 3 implementations across all orchestrators:
+-- a surrogate `id` (the code does `SELECT id ... WHERE idempotency_key`),
+-- `payment_id`, `from_account`/`to_account`, `gateway_transaction_id` (set on
+-- success) and `error_message` (set on failure). `idempotency_key UNIQUE` is
+-- the DB-enforced idempotency guarantee the DAGs rely on. The account columns
+-- are intentionally not FK-constrained so the failure path can record a
+-- transaction even when validation failed on a missing/invalid account.
 CREATE TABLE IF NOT EXISTS transactions (
-    transaction_id TEXT PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
+    payment_id TEXT NOT NULL,
     idempotency_key TEXT UNIQUE,
-    source_account_id TEXT NOT NULL REFERENCES accounts(account_id),
-    destination_account_id TEXT NOT NULL REFERENCES accounts(account_id),
-    amount NUMERIC(12,2) NOT NULL,
+    from_account TEXT,
+    to_account TEXT,
+    amount NUMERIC(12,2),
     currency TEXT NOT NULL DEFAULT 'USD',
     status TEXT NOT NULL DEFAULT 'pending',
     gateway_transaction_id TEXT,
-    failure_reason TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Seed payment accounts

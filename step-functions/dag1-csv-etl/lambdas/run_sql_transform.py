@@ -3,14 +3,7 @@ Lambda: RunSQLTransform
 Connects to Postgres and runs a SQL transformation on the loaded data.
 """
 
-import json
-import os
-
-import boto3
-import psycopg2
-
-
-secrets = boto3.client("secretsmanager")
+from db import get_db_connection
 
 # The SQL transform to run. In practice this might come from S3 or the event input.
 TRANSFORM_SQL = """
@@ -33,23 +26,8 @@ JOIN products p ON o.product_id = p.product_id;
 """
 
 
-def get_db_connection(db_config):
-    secret = secrets.get_secret_value(SecretId=db_config["secret_arn"])
-    creds = json.loads(secret["SecretString"])
-
-    return psycopg2.connect(
-        host=db_config["host"],
-        database=db_config["database"],
-        user=creds["username"],
-        password=creds["password"],
-        port=creds.get("port", 5432),
-    )
-
-
 def handler(event, context):
-    db_config = event["db_config"]
-
-    conn = get_db_connection(db_config)
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             # Drop and recreate the report table
@@ -66,7 +44,6 @@ def handler(event, context):
 
     return {
         "s3_bucket": event["s3_bucket"],
-        "db_config": db_config,
         "transform_result": {
             "table": "combined_report",
             "row_count": row_count,

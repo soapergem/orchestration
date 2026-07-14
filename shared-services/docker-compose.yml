@@ -28,7 +28,7 @@ services:
       POSTGRES_USER: orchestration
       POSTGRES_PASSWORD: orchestration
     ports:
-      - "5432:5432"
+      - "54321:5432"          # non-standard host port to avoid conflicts with local Postgres
     volumes:
       - ./init-db.sql:/docker-entrypoint-initdb.d/00-init-db.sql:ro
       - ./init-engines.sql:/docker-entrypoint-initdb.d/01-init-engines.sql:ro
@@ -147,11 +147,11 @@ services:
       SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
       SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
       SERVER_GRPC_INSECURE: "true"
-      SERVER_GRPC_BROADCAST_ADDRESS: "hatchet-engine:7077"
+      SERVER_GRPC_BROADCAST_ADDRESS: "hatchet-engine:7070"
       SERVER_DEFAULT_ENGINE_VERSION: "V1"
     ports:
       - "8888:8888"               # dashboard + REST API -> http://localhost:8888
-      - "7077:7077"               # gRPC -- host worker connects here
+      - "7077:7070"               # gRPC -- host worker connects here (container listens on 7070)
 
   hatchet-worker:
     build:
@@ -166,7 +166,7 @@ services:
     environment:
       HATCHET_CLIENT_TOKEN: "${HATCHET_CLIENT_TOKEN}"
       HATCHET_CLIENT_TLS_STRATEGY: none
-      HATCHET_CLIENT_HOST_PORT: hatchet-engine:7077
+      HATCHET_CLIENT_HOST_PORT: hatchet-engine:7070
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: orchestration

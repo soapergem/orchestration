@@ -3,26 +3,7 @@ Lambda: ValidatePayment
 Validates a payment request: checks account exists, sufficient balance, fraud rules.
 """
 
-import json
-
-import boto3
-import psycopg2
-
-
-secrets = boto3.client("secretsmanager")
-
-
-def get_db_connection(db_config):
-    secret = secrets.get_secret_value(SecretId=db_config["secret_arn"])
-    creds = json.loads(secret["SecretString"])
-
-    return psycopg2.connect(
-        host=db_config["host"],
-        database=db_config["database"],
-        user=creds["username"],
-        password=creds["password"],
-        port=creds.get("port", 5432),
-    )
+from db import get_db_connection
 
 
 def handler(event, context):
@@ -31,9 +12,8 @@ def handler(event, context):
     currency = event["currency"]
     from_account = event["from_account"]
     to_account = event["to_account"]
-    db_config = event["db_config"]
 
-    conn = get_db_connection(db_config)
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             # Check source account exists and has sufficient balance

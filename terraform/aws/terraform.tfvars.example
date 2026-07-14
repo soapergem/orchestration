@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and adjust. Do NOT put neon_database_url here.
+aws_region  = "us-east-1"
+aws_profile = "soapergem"
+name_prefix = "orch-bakeoff"
+
+# neon_database_url is sensitive. Provide it via the environment instead of a
+# file, e.g. add this to .envrc (already gitignored):
+#   export TF_VAR_neon_database_url="$NEON_DATABASE_URL"

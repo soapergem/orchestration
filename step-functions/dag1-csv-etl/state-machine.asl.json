@@ -39,8 +39,7 @@
       "ItemsPath": "$.csv_keys",
       "ItemSelector": {
         "s3_bucket.$": "$.s3_bucket",
-        "s3_key.$": "$$.Map.Item.Value",
-        "db_config.$": "$.db_config"
+        "s3_key.$": "$$.Map.Item.Value"
       },
       "ItemProcessor": {
         "ProcessorConfig": {
