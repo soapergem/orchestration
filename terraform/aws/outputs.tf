@@ -33,6 +33,11 @@ output "dag2_state_machine_arn" {
   value       = aws_sfn_state_machine.dag2.arn
 }
 
+output "dag4_state_machine_arn" {
+  description = "ARN of the DAG 4 order-fulfillment state machine (start executions here)."
+  value       = aws_sfn_state_machine.dag4.arn
+}
+
 output "callback_fetch_service_url" {
   description = "Public K3s URL the DAG 2 submit lambda calls."
   value       = local.callback_fetch_url

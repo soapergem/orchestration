@@ -23,6 +23,20 @@ lambdas call.
   (K3s default).
 - **helm** and a kubeconfig pointing at the cluster.
 
+## Quick deploy
+
+`./deploy.sh` wraps everything below: it reads the ECR repo URLs and the resume
+credentials from the Terraform outputs, ensures the namespace + `aws-resume-creds`
+secret, and runs `helm upgrade --install`.
+
+```bash
+./deploy.sh                              # deploy to namespace "orchestrators"
+./deploy.sh -- --set ingress.enabled=false   # pass extra flags after --
+```
+
+The steps below are the manual breakdown (and the reference for what the script
+does).
+
 ## 1. AWS resume-credentials secret
 
 Not chart-managed — create it once from the Terraform outputs:

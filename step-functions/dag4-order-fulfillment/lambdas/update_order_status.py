@@ -4,37 +4,19 @@ Updates the order record in the database. Used for both success (shipped) and
 compensation (cancelled/failed) paths.
 """
 
-import json
 from datetime import datetime, timezone
 
-import boto3
-import psycopg2
-
-
-secrets = boto3.client("secretsmanager")
-
-
-def get_connection(db_config):
-    secret = secrets.get_secret_value(SecretId=db_config["secret_arn"])
-    creds = json.loads(secret["SecretString"])
-    return psycopg2.connect(
-        host=creds["host"],
-        port=creds.get("port", 5432),
-        dbname=creds["dbname"],
-        user=creds["username"],
-        password=creds["password"],
-    )
+from db import get_db_connection
 
 
 def handler(event, context):
     order_id = event["order_id"]
     status = event["status"]
-    db_config = event["db_config"]
     shipment_id = event.get("shipment_id")
     tracking_number = event.get("tracking_number")
     failure_reason = event.get("failure_reason")
 
-    conn = get_connection(db_config)
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
         now = datetime.now(timezone.utc)

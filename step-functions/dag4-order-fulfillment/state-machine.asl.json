@@ -59,8 +59,8 @@
         "StateMachineArn": "${ReserveInventoryStateMachineArn}",
         "Input": {
           "order_id.$": "$.order_id",
+          "customer_id.$": "$.customer_id",
           "items.$": "$.items",
-          "db_config.$": "$.db_config",
           "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
         }
       },
@@ -115,7 +115,6 @@
           "customer_id.$": "$.customer_id",
           "total_amount.$": "$.total_amount",
           "items.$": "$.items",
-          "db_config.$": "$.db_config",
           "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
         }
       },
@@ -155,7 +154,6 @@
         "order_id.$": "$.order_id",
         "reservation_id.$": "$.reservation.reservation_id",
         "items.$": "$.items",
-        "db_config.$": "$.db_config",
         "failure_reason": "Order rejected or approval timed out",
         "approval.$": "$.approval"
       },
@@ -198,7 +196,6 @@
         "order_id.$": "$.order_id",
         "reservation_id.$": "$.reservation.reservation_id",
         "items.$": "$.items",
-        "db_config.$": "$.db_config",
         "failure_reason.$": "$.error.Cause"
       },
       "Next": "ReleaseInventory"
@@ -239,11 +236,10 @@
         "Payload": {
           "order_id.$": "$.order_id",
           "status": "cancelled",
-          "failure_reason.$": "$.failure_reason",
-          "db_config.$": "$.db_config"
+          "failure_reason.$": "$.failure_reason"
         }
       },
-      "OutputPath": "$.Payload",
+      "ResultPath": "$.order_update",
       "TimeoutSeconds": 30,
       "Retry": [
         {
@@ -303,11 +299,10 @@
           "order_id.$": "$.order_id",
           "status": "shipped",
           "shipment_id.$": "$.shipment.shipment_id",
-          "tracking_number.$": "$.shipment.tracking_number",
-          "db_config.$": "$.db_config"
+          "tracking_number.$": "$.shipment.tracking_number"
         }
       },
-      "OutputPath": "$.Payload",
+      "ResultPath": "$.order_update",
       "TimeoutSeconds": 30,
       "Retry": [
         {
