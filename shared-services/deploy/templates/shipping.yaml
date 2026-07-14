@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.shipping.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.shipping.name }}
+spec:
+  replicas: {{ .Values.shipping.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.shipping.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.shipping.name }}
+    spec:
+      {{- if .Values.image.pullSecretName }}
+      imagePullSecrets:
+      - name: {{ .Values.image.pullSecretName }}
+      {{- end }}
+      containers:
+      - name: shipping
+        image: {{ .Values.shipping.repository }}:{{ .Values.shipping.tag }}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: {{ .Values.shipping.port }}
+        # Flaky shipping simulator; no AWS access needed (no callback/resume).
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.shipping.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.shipping.name }}
+spec:
+  ports:
+  - name: http
+    port: {{ .Values.shipping.port }}
+    targetPort: {{ .Values.shipping.port }}
+  selector:
+    app: {{ .Values.shipping.name }}

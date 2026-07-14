@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.callbackFetch.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.callbackFetch.name }}
+spec:
+  replicas: {{ .Values.callbackFetch.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.callbackFetch.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.callbackFetch.name }}
+    spec:
+      {{- if .Values.image.pullSecretName }}
+      imagePullSecrets:
+      - name: {{ .Values.image.pullSecretName }}
+      {{- end }}
+      containers:
+      - name: callback-fetch
+        image: {{ .Values.callbackFetch.repository }}:{{ .Values.callbackFetch.tag }}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: {{ .Values.callbackFetch.port }}
+        env:
+        # Resume the suspended Step Functions task as soon as the fetch completes.
+        - name: AUTO_RESUME
+          value: {{ .Values.callbackFetch.autoResume | quote }}
+        - name: AWS_REGION
+          value: {{ .Values.aws.region | quote }}
+        # Credentials for states:SendTaskSuccess (dedicated IAM user; see deploy/README.md).
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.aws.resumeSecretName }}
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.aws.resumeSecretName }}
+              key: AWS_SECRET_ACCESS_KEY
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.callbackFetch.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.callbackFetch.name }}
+spec:
+  ports:
+  - name: http
+    port: {{ .Values.callbackFetch.port }}
+    targetPort: {{ .Values.callbackFetch.port }}
+  selector:
+    app: {{ .Values.callbackFetch.name }}

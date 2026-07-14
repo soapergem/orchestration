@@ -1,0 +1,47 @@
+image:
+  # Pre-existing docker-registry secret for pulling from private ECR. The K3s
+  # cluster refreshes this out-of-band; the chart only references it. Set to ""
+  # to omit imagePullSecrets (public images / node-level pull auth).
+  pullSecretName: k8s-ecr-login-renew-docker-secret
+
+aws:
+  region: us-east-1
+  # Pre-existing Secret holding creds for states:SendTaskSuccess. Used by
+  # callback-fetch and approval to resume suspended Step Functions executions.
+  # Keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+  resumeSecretName: aws-resume-creds
+
+# Per-service repositories come from `terraform output -json ecr_repository_urls`
+# (one repo per service). Fill in the full ECR repo URL for each.
+callbackFetch:
+  name: callback-fetch
+  repository: ""                       # <acct>.dkr.ecr.us-east-1.amazonaws.com/callback-fetch
+  tag: latest
+  replicas: 1
+  port: 8090
+  domain: orch-callback-fetch.gemovationlabs.com
+  autoResume: "true"                   # resume the SFN task as soon as the fetch completes
+
+approval:
+  name: approval
+  repository: ""                       # <acct>.dkr.ecr.us-east-1.amazonaws.com/approval
+  tag: latest
+  replicas: 1
+  port: 8091
+  domain: orch-approval.gemovationlabs.com
+  autoDecideDelaySeconds: "10"         # auto-decide + resume after a delay (hands-off DAG 4)
+  autoDecideAction: approved
+
+shipping:
+  name: shipping
+  repository: ""                       # <acct>.dkr.ecr.us-east-1.amazonaws.com/shipping
+  tag: latest
+  replicas: 1
+  port: 8092
+  domain: orch-shipping.gemovationlabs.com
+
+ingress:
+  enabled: true
+  className: traefik
+  clusterIssuer: letsencrypt-prod
+  middlewareName: mock-force-https

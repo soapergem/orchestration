@@ -2,7 +2,7 @@
 # Mock services for DAG 2 (callback-fetch) and DAG 4 (approval, shipping).
 #
 # Images are built and pushed to ECR (scripts/build-push-mock-services.sh, arm64
-# for K3s), then deployed to the K3s cluster (see shared-services/k8s/) in the
+# for K3s), then deployed to the K3s cluster (see shared-services/deploy/) in the
 # `orchestrators` namespace and exposed at *.gemovationlabs.com.
 #
 # callback-fetch and approval call Step Functions SendTaskSuccess from OUTSIDE
@@ -12,9 +12,10 @@
 
 locals {
   mock_services      = ["callback-fetch", "approval", "shipping"]
-  callback_fetch_url = "https://callback-fetch.${var.mock_service_base_domain}"
-  approval_url       = "https://approval.${var.mock_service_base_domain}"
-  shipping_url       = "https://shipping.${var.mock_service_base_domain}"
+  mock_service_fqdn  = { for s in local.mock_services : s => "${var.mock_service_subdomain_prefix}${s}.${var.mock_service_base_domain}" }
+  callback_fetch_url = "https://${local.mock_service_fqdn["callback-fetch"]}"
+  approval_url       = "https://${local.mock_service_fqdn["approval"]}"
+  shipping_url       = "https://${local.mock_service_fqdn["shipping"]}"
 }
 
 resource "aws_ecr_repository" "mock" {
