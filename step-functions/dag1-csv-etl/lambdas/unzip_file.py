@@ -39,5 +39,4 @@ def handler(event, context):
     return {
         "s3_bucket": bucket,
         "csv_keys": csv_keys,
-        "db_config": event["db_config"],
     }

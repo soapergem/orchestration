@@ -1,4 +1,7 @@
-compose := "podman compose -f shared-services/docker-compose.yml"
+# Auto-detect the container runner: finch > podman > docker. Override with
+# `just --set container_runner <name>` or `CONTAINER_RUNNER=<name> just ...`.
+container_runner := env("CONTAINER_RUNNER", `if command -v finch >/dev/null 2>&1; then echo finch; elif command -v podman >/dev/null 2>&1; then echo podman; else echo docker; fi`)
+compose := container_runner + " compose -f shared-services/docker-compose.yml"
 
 default:
     @just --list | grep -v "^    default$"

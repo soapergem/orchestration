@@ -21,29 +21,16 @@ Environment variables:
     HATCHET_EVENT_API_URL   -- default: http://localhost:8080/api/v1/events
 """
 
-import asyncio
-
 from hatchet_sdk import Hatchet
 
-# Import all workflow classes so they register with the hatchet instance.
-# Each module creates its own `hatchet = Hatchet()` instance at module level,
-# but we need a single shared instance for the worker. We re-import the
-# workflow classes and register them with the worker's Hatchet instance.
-
-from dag1_csv_etl import (
-    CSVETLPipelineWorkflow,
-    LoadCSVToPostgresWorkflow,
-)
-from dag2_api_fanout import (
-    APIFanOutWorkflow,
-    FetchItemDetailWorkflow,
-)
-from dag3_payment import PaymentProcessingWorkflow
+from dag1_csv_etl import csv_etl_wf, load_csv_wf
+from dag2_api_fanout import api_fanout_wf, fetch_item_detail_wf
+from dag3_payment import payment_wf
 from dag4_order_fulfillment import (
-    ManagerApprovalWorkflow,
-    OrderFulfillmentWorkflow,
-    ReserveInventoryWorkflow,
-    ShipOrderWorkflow,
+    manager_approval_wf,
+    order_fulfillment_wf,
+    reserve_inventory_wf,
+    ship_order_wf,
 )
 
 
@@ -52,31 +39,31 @@ def main():
 
     worker = hatchet.worker(
         "orchestration-bakeoff-worker",
-        max_runs=40,
+        slots=40,
     )
 
     # DAG 1: CSV ETL Pipeline
-    worker.register_workflow(CSVETLPipelineWorkflow())
-    worker.register_workflow(LoadCSVToPostgresWorkflow())
+    worker.register_workflow(csv_etl_wf)
+    worker.register_workflow(load_csv_wf)
 
     # DAG 2: API Fan-Out with Async Callback
-    worker.register_workflow(APIFanOutWorkflow())
-    worker.register_workflow(FetchItemDetailWorkflow())
+    worker.register_workflow(api_fanout_wf)
+    worker.register_workflow(fetch_item_detail_wf)
 
     # DAG 3: Payment Processing
-    worker.register_workflow(PaymentProcessingWorkflow())
+    worker.register_workflow(payment_wf)
 
     # DAG 4: Order Fulfillment
-    worker.register_workflow(OrderFulfillmentWorkflow())
-    worker.register_workflow(ReserveInventoryWorkflow())
-    worker.register_workflow(ManagerApprovalWorkflow())
-    worker.register_workflow(ShipOrderWorkflow())
+    worker.register_workflow(order_fulfillment_wf)
+    worker.register_workflow(reserve_inventory_wf)
+    worker.register_workflow(manager_approval_wf)
+    worker.register_workflow(ship_order_wf)
 
     print("Starting Hatchet worker with workflows:")
-    print("  - CSVETLPipelineWorkflow + LoadCSVToPostgresWorkflow")
-    print("  - APIFanOutWorkflow + FetchItemDetailWorkflow")
-    print("  - PaymentProcessingWorkflow")
-    print("  - OrderFulfillmentWorkflow + ReserveInventoryWorkflow + ManagerApprovalWorkflow + ShipOrderWorkflow")
+    print("  - CSVETLPipeline + LoadCSVToPostgres")
+    print("  - APIFanOut + FetchItemDetail")
+    print("  - PaymentProcessing")
+    print("  - OrderFulfillment + ReserveInventory + ManagerApproval + ShipOrder")
 
     worker.start()
 

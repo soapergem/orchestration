@@ -23,8 +23,9 @@ def handler(event, context):
     request_config = event.get("request_config", {})
     task_token = event["task_token"]
 
-    fetch_service_url = request_config.get(
-        "callback_fetch_service_url", "http://callback-fetch-service:8090"
+    fetch_service_url = (
+        request_config.get("callback_fetch_service_url")
+        or os.environ.get("CALLBACK_FETCH_SERVICE_URL", "http://callback-fetch-service:8090")
     )
     # Allow the caller to pin a correlation_id so an external trigger knows which
     # request to /resume; otherwise generate one.
