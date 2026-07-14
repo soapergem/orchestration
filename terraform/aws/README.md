@@ -11,11 +11,11 @@ Currently scaffolded: **DAG 1 (CSV ETL)**, **DAG 2 (API fan-out)**, and **DAG 3
 DAG 2's mock service (callback-fetch) is **not** hosted in AWS — no long-running
 container. Terraform creates the ECR repos + a least-privilege IAM user; you
 build/push arm64 images (`scripts/build-push-mock-services.sh`) and deploy the
-shared services to your **K3s** cluster (`shared-services/k8s/`, namespace
+shared services to your **K3s** cluster (`shared-services/deploy/`, namespace
 `orchestrators`), exposed at `*.gemovationlabs.com`. The service calls
 `SendTaskSuccess` from K3s using the IAM user's key (a K8s Secret), resuming the
 suspended `.waitForTaskToken` state. The SFN lambda reaches it at
-`https://callback-fetch.<mock_service_base_domain>`.
+`https://<mock_service_subdomain_prefix>callback-fetch.<mock_service_base_domain>`.
 
 DAG 1 isolates its dynamic tables (`orders`/`customers`/`products`/
 `combined_report`) in a dedicated `dag1_etl` Postgres schema (set in its
@@ -72,8 +72,8 @@ Result: CSVs loaded into the `dag1_etl` schema in Neon, joined into
 ## Run DAG 2
 
 Requires the callback-fetch service deployed on K3s (see
-`shared-services/k8s/README.md`) and reachable at
-`https://callback-fetch.<mock_service_base_domain>`. Point the DAG at any URL
+`shared-services/deploy/README.md`) and reachable at
+`https://<mock_service_subdomain_prefix>callback-fetch.<mock_service_base_domain>`. Point the DAG at any URL
 returning a JSON list of items with `url` fields (each item's `url` is then
 fetched in the fan-out). Keep the list small to avoid rate-limiting.
 

@@ -39,7 +39,13 @@ variable "lambda_architecture" {
 }
 
 variable "mock_service_base_domain" {
-  description = "Base domain for the mock services on K3s. Subdomains callback-fetch/approval/shipping are used, e.g. callback-fetch.<domain>."
+  description = "Base domain for the mock services on K3s. Hostnames are <prefix><service>.<domain>, e.g. orch-callback-fetch.<domain>."
   type        = string
   default     = "gemovationlabs.com"
+}
+
+variable "mock_service_subdomain_prefix" {
+  description = "Prefix applied to each mock-service subdomain. Must match the domains in shared-services/deploy/values.yaml."
+  type        = string
+  default     = "orch-"
 }
