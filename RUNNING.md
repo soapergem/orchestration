@@ -59,7 +59,7 @@ the mock-service container**:
   |---|---|
   | Docker Desktop | `host.docker.internal` |
   | Podman (4.7+) | `host.containers.internal` (also aliases `host.docker.internal`) |
-  | Finch | `host.docker.internal` — **verify on first run**; finch runs containers in a Lima VM, so if this doesn't resolve to your Mac host, inspect the VM's networking before relying on the callback path |
+  | Finch | `host.docker.internal` → `192.168.5.2` (the Lima gateway; **verified**). Caveat: finch does **not** reliably re-add this to a container on `finch compose up` **recreate**, so pin it explicitly with `extra_hosts: ["host.docker.internal:192.168.5.2"]` on any service that must call back to the host (the callback-fetch / approval services do). |
 
   Because `host.docker.internal` works on Docker and (as an alias) on Podman
   4.7+, the examples below use it as the default; podman users can equally use

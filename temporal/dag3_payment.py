@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -292,7 +293,7 @@ class PaymentWorkflow:
             )
 
         # Raise so the workflow completes as failed
-        raise workflow.ApplicationError(
+        raise ApplicationError(
             f"Payment {payment_id} failed: {error_message}",
             type="PaymentProcessingFailed",
         )
