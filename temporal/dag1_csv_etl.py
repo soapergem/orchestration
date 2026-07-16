@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -93,7 +94,7 @@ class CSVETLWorkflow:
         )
 
         if not unzip_result.csv_paths:
-            raise workflow.ApplicationError(
+            raise ApplicationError(
                 "No CSV files found in the archive",
                 type="NoCSVFiles",
             )

@@ -22,6 +22,7 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -126,7 +127,7 @@ class APIFanOutWorkflow:
                 timeout=timedelta(seconds=60),
             )
         except asyncio.TimeoutError:
-            raise workflow.ApplicationError(
+            raise ApplicationError(
                 "Timed out waiting for fetch callback after 60 seconds",
                 type="FetchCallbackTimeout",
             )
@@ -137,7 +138,7 @@ class APIFanOutWorkflow:
         # Step 3: Process the fetch result (pure workflow logic -- deterministic)
         callback_status = fetch_data.get("status")
         if callback_status != "completed":
-            raise workflow.ApplicationError(
+            raise ApplicationError(
                 f"Fetch service returned status '{callback_status}': "
                 f"{fetch_data.get('error', 'unknown error')}",
                 type="FetchFailed",
@@ -145,7 +146,7 @@ class APIFanOutWorkflow:
 
         body = fetch_data.get("body")
         if body is None:
-            raise workflow.ApplicationError(
+            raise ApplicationError(
                 "Fetch service callback contained no body",
                 type="FetchEmptyBody",
             )

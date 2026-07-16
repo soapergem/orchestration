@@ -54,15 +54,25 @@ SIGNAL_SERVER_URL = os.environ.get(
 )
 
 
-def _get_db_connection() -> psycopg2.extensions.connection:
-    """Return a fresh Postgres connection using shared config."""
-    return psycopg2.connect(
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "temporal")
+
+
+def _get_db_connection(dag: str) -> psycopg2.extensions.connection:
+    """Fresh Postgres connection scoped to this runner+DAG schema
+    (\"<BAKEOFF_NS>_<dag>\"), so runs never collide across runners or DAGs."""
+    conn = psycopg2.connect(
         host=DB_CONFIG["host"],
         port=DB_CONFIG["port"],
         database=DB_CONFIG["database"],
         user=DB_CONFIG["user"],
         password=DB_CONFIG["password"],
     )
+    schema = f"{BAKEOFF_NS}_{dag}"
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ===========================================================================
@@ -128,7 +138,7 @@ async def load_csv_to_postgres(input: LoadCSVInput) -> LoadCSVOutput:
 
     columns = list(rows[0].keys())
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag1")
     try:
         with conn.cursor() as cur:
             col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
@@ -184,7 +194,7 @@ async def run_sql_transform() -> SQLTransformOutput:
     """Run the SQL JOIN transform to produce combined_report."""
     activity.logger.info("Running SQL transform")
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag1")
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS combined_report")
@@ -218,7 +228,7 @@ async def convert_to_parquet(input: ConvertToParquetInput) -> ConvertToParquetOu
     output_file = os.path.join(input.output_path, f"{input.table}.parquet")
     activity.logger.info("Converting table '%s' to Parquet at %s", input.table, output_file)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag1")
     try:
         with conn.cursor() as cur:
             cur.execute(f'SELECT * FROM "{input.table}"')
@@ -411,7 +421,7 @@ async def validate_payment(input: ValidatePaymentInput) -> ValidatePaymentOutput
     idempotency_key = input.idempotency_key or input.payment_id
     activity.logger.info("Validating payment %s", input.payment_id)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag3")
     try:
         with conn.cursor() as cur:
             # Check source account
@@ -627,7 +637,7 @@ async def update_payment_database(input: UpdateDatabaseInput) -> UpdateDatabaseO
     """Record the payment in Postgres: debit/credit accounts, write transaction record."""
     activity.logger.info("Updating database for payment %s", input.payment_id)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag3")
     try:
         with conn.cursor() as cur:
             now = datetime.now(timezone.utc).isoformat()
@@ -749,7 +759,7 @@ async def handle_payment_failure(input: HandlePaymentFailureInput) -> HandlePaym
     idempotency_key = input.idempotency_key or input.payment_id
     activity.logger.info("Recording payment failure for %s: %s", input.payment_id, input.error_message)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag3")
     try:
         with conn.cursor() as cur:
             now = datetime.now(timezone.utc).isoformat()
@@ -830,7 +840,7 @@ async def validate_order(input: ValidateOrderInput) -> ValidateOrderOutput:
     """Validate that all SKUs exist, customer is active, and compute total amount."""
     activity.logger.info("Validating order %s for customer %s", input.order_id, input.customer_id)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag4")
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -943,7 +953,7 @@ async def reserve_inventory(input: ReserveInventoryInput) -> ReserveInventoryOut
 
     reservation_id = f"RES-{uuid.uuid4().hex[:12].upper()}"
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag4")
     try:
         with conn.cursor() as cur:
             # Idempotency check
@@ -959,6 +969,16 @@ async def reserve_inventory(input: ReserveInventoryInput) -> ReserveInventoryOut
                     reserved_at=datetime.now(timezone.utc).isoformat(),
                     idempotent=True,
                 )
+
+            # Create the order row first: inventory_reservations.order_id has a
+            # FK to orders, so the order must exist before the reservations.
+            total = sum(i.quantity * i.unit_price for i in input.items)
+            cur.execute(
+                """INSERT INTO orders (order_id, customer_id, total_amount, status)
+                   VALUES (%s, %s, %s, 'reserved')
+                   ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()""",
+                (input.order_id, input.customer_id, total),
+            )
 
             items_reserved = []
             for item in input.items:
@@ -980,14 +1000,6 @@ async def reserve_inventory(input: ReserveInventoryInput) -> ReserveInventoryOut
                     (f"{reservation_id}-{item.sku}", input.order_id, item.sku, item.quantity),
                 )
                 items_reserved.append(item.sku)
-
-            total = sum(i.quantity * i.unit_price for i in input.items)
-            cur.execute(
-                """INSERT INTO orders (order_id, customer_id, total_amount, status)
-                   VALUES (%s, %s, %s, 'reserved')
-                   ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()""",
-                (input.order_id, input.customer_id, total),
-            )
             conn.commit()
 
         return ReserveInventoryOutput(
@@ -1020,7 +1032,7 @@ async def release_inventory(input: ReleaseInventoryInput) -> ReleaseInventoryOut
     """Saga compensation: release inventory reservations for an order."""
     activity.logger.info("Releasing inventory for order %s (reservation %s)", input.order_id, input.reservation_id)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag4")
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1120,7 +1132,7 @@ async def request_approval(input: RequestApprovalInput) -> str:
         )
 
     # Record in DB
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag4")
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1156,7 +1168,7 @@ async def record_approval_decision(input: RecordApprovalDecisionInput) -> None:
         "Recording approval decision for order %s: %s", input.order_id, input.decision
     )
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag4")
     try:
         with conn.cursor() as cur:
             now = datetime.now(timezone.utc)
@@ -1263,7 +1275,7 @@ async def update_order_status(input: UpdateOrderStatusInput) -> UpdateOrderStatu
     """Update the order record in the database."""
     activity.logger.info("Updating order %s to status '%s'", input.order_id, input.status)
 
-    conn = _get_db_connection()
+    conn = _get_db_connection("dag4")
     try:
         with conn.cursor() as cur:
             now = datetime.now(timezone.utc)

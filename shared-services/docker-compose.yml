@@ -43,13 +43,17 @@ services:
     build: ./callback-fetch-service
     ports:
       - "8090:8090"
+    # Reach the host signal-relay server (finch/Lima gateway). host.docker.internal
+    # isn't reliably auto-added on finch compose recreates, so pin it explicitly.
+    extra_hosts:
+      - "host.docker.internal:192.168.5.2"
     environment:
       FETCH_DELAY_MIN_SECONDS: "2"
       FETCH_DELAY_MAX_SECONDS: "10"
       FETCH_TIMEOUT_SECONDS: "30"
       # Flip to "true" for hands-off DAG 2: the service fires the resume itself
       # when the fetch completes. Left off so resume is a manual /resume call.
-      AUTO_RESUME: "false"
+      AUTO_RESUME: "true"
       AUTO_RESUME_DELAY_SECONDS: "0"
     depends_on:
       postgres:
@@ -59,6 +63,8 @@ services:
     build: ./approval-service
     ports:
       - "8091:8091"
+    extra_hosts:
+      - "host.docker.internal:192.168.5.2"
     environment:
       AUTO_DECIDE_DELAY_SECONDS: "10"
       AUTO_DECIDE_ACTION: "approved"
@@ -118,6 +124,11 @@ services:
       CALLBACK_FETCH_SERVICE_URL: http://callback-fetch-service:8090
       APPROVAL_SERVICE_URL: http://approval-service:8091
       SHIPPING_SERVICE_URL: http://shipping-service:8092
+      # Per-(runner, dag) schema isolation: DB layer uses search_path "<BAKEOFF_NS>_<dag>".
+      BAKEOFF_NS: temporal
+      # DAG 2/4 async callback: workflows hand this URL to the mock services, which
+      # POST back to the signal-relay server on the host (finch host gateway).
+      SIGNAL_SERVER_URL: http://host.docker.internal:8095
 
   temporal-ui:
     image: docker.io/temporalio/ui:2.34.0
@@ -207,6 +218,10 @@ services:
             local:
               base-path: /app/storage
           url: http://kestra:8080/
+          server:
+            basic-auth:
+              username: admin@orchestration.local
+              password: Orchestration_123
     ports:
       - "8080:8080"               # http://localhost:8080
     volumes:

@@ -22,6 +22,7 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -300,7 +301,7 @@ class OrderFulfillmentWorkflow:
         )
 
         if not validation.validation.is_valid:
-            raise workflow.ApplicationError(
+            raise ApplicationError(
                 f"Order validation failed: {validation.validation.reason}",
                 type="OrderValidationFailed",
             )
@@ -460,7 +461,7 @@ class OrderFulfillmentWorkflow:
                     notif_exc,
                 )
 
-            raise workflow.ApplicationError(
+            raise ApplicationError(
                 f"Order {input.order_id} cancelled: {exc}",
                 type="OrderCancelled",
             )
