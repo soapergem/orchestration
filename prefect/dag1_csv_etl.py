@@ -17,7 +17,8 @@ import pandas as pd
 import psycopg2
 import pyarrow as pa
 import pyarrow.parquet as pq
-from prefect import flow, get_run_logger, task
+from prefect import flow, get_run_logger, task, unmapped
+from prefect.task_runners import ThreadPoolTaskRunner
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,10 +32,24 @@ DB_CONFIG = {
     "password": os.environ.get("POSTGRES_PASSWORD", "orchestration"),
 }
 
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "prefect")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag1"
+
+# Spec (../README.md, DAG 1 step 2): ProcessCSVs runs with max concurrency 10.
+# Enforced by bounding the flow's task runner -- .map() otherwise fans out with
+# no cap. This is a per-flow-run bound; a global concurrency limit
+# (prefect.concurrency) would be the choice for a cap shared across runs.
+MAX_CSV_LOAD_CONCURRENCY = int(os.environ.get("MAX_CSV_LOAD_CONCURRENCY", "10"))
+
 # Default local directories (override via flow parameters)
-DEFAULT_ZIP_PATH = "/data/input/data.zip"
-DEFAULT_EXTRACT_DIR = "/data/extracted"
-DEFAULT_OUTPUT_DIR = "/data/output"
+# Env-overridable so a deployment run works without passing parameters. Names
+# match the airflow implementation. The bare /data/... fallbacks are container
+# paths and will not exist on the host -- set these (or pass flow parameters)
+# when running locally.
+DEFAULT_ZIP_PATH = os.environ.get("ETL_ZIP_PATH", "/data/input/data.zip")
+DEFAULT_EXTRACT_DIR = os.environ.get("ETL_EXTRACT_DIR", "/data/extracted")
+DEFAULT_OUTPUT_DIR = os.environ.get("ETL_OUTPUT_DIR", "/data/output")
 
 # ---------------------------------------------------------------------------
 # SQL transform — mirrors the Step Functions implementation
@@ -65,15 +80,26 @@ JOIN products p ON o.product_id = p.product_id;
 # ---------------------------------------------------------------------------
 
 def _get_db_connection(db_config: dict | None = None):
-    """Return a psycopg2 connection using the provided or default config."""
+    """Return a psycopg2 connection scoped to this runner's DAG 1 schema.
+
+    All table names in this module are unqualified; the ``search_path`` keeps
+    them inside ``<BAKEOFF_NS>_dag1`` so DAG 1's CSV-derived ``orders`` and
+    ``customers`` tables never collide with DAG 4's transactional ones.
+    """
     cfg = db_config or DB_CONFIG
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg.get("port", 5432),
         dbname=cfg["database"],
         user=cfg["user"],
         password=cfg["password"],
     )
+    schema = cfg.get("schema", BAKEOFF_SCHEMA)
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +251,11 @@ def convert_to_parquet(
 # Flow
 # ---------------------------------------------------------------------------
 
-@flow(name="csv_etl_pipeline", log_prints=True)
+@flow(
+    name="csv_etl_pipeline",
+    log_prints=True,
+    task_runner=ThreadPoolTaskRunner(max_workers=MAX_CSV_LOAD_CONCURRENCY),
+)
 def csv_etl_pipeline(
     zip_path: str = DEFAULT_ZIP_PATH,
     extract_dir: str = DEFAULT_EXTRACT_DIR,
@@ -245,8 +275,10 @@ def csv_etl_pipeline(
     # Step 1: Extract CSVs
     csv_paths = unzip_file(zip_path, extract_dir)
 
-    # Step 2: Fan-out — load each CSV in parallel
-    load_results = load_csv_to_postgres.map(csv_paths, db_config=cfg)
+    # Step 2: Fan-out — load each CSV in parallel.
+    # db_config must be unmapped(): .map() zips every iterable argument, and a
+    # bare dict would be treated as a 5-element iterable of its keys.
+    load_results = load_csv_to_postgres.map(csv_paths, db_config=unmapped(cfg))
 
     # Wait for all loads to complete before transforming
     load_summaries = [r.result() for r in load_results]

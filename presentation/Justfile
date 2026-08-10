@@ -1,0 +1,8 @@
+default:
+    @just --list | grep -v "^    default$"
+
+build:
+    uv run mkslides build
+
+serve:
+    uv run mkslides serve

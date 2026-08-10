@@ -1,9 +1,9 @@
 id: manager_approval_flow
 namespace: orchestration.fulfillment.subflows
 description: >
-  Sub-flow: Request manager approval for high-value orders and wait for the
-  external decision via Kestra's native Pause/webhook resume. The approval
-  service POSTs its decision to the Kestra resume URL when the manager acts.
+  Sub-flow: Request manager approval for high-value orders and suspend on a
+  native Pause. The approval service resumes THIS execution by id when the
+  manager acts; a 120s timeout drives the parent's saga compensation.
 
 inputs:
   - id: order_id
@@ -20,26 +20,41 @@ inputs:
     description: JSON array of order items
 
 variables:
+  task_network: shared-services_default
   pg_host: postgres
   pg_port: "5432"
   pg_database: orchestration
   pg_user: orchestration
   pg_password: orchestration
+  pg_schema: kestra_dag4
   approval_service_url: "http://approval-service:8091"
+
+pluginDefaults:
+  # Task-runner containers are siblings of the Kestra container, so they must be
+  # placed on the compose network for `postgres` / the mock services to resolve.
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: "{{ vars.task_network }}"
 
 tasks:
   - id: request_approval
     type: io.kestra.plugin.scripts.python.Script
     description: >
-      Submit an approval request to the approval service with the Kestra Pause
-      resume URL as the callback. Also records the approval request in the database.
+      Submit an approval request to the approval service, registering this
+      execution id as the resume handle. Also records the request in the database.
     retry:
       type: exponential
       maxAttempt: 3
       interval: PT2S
       maxInterval: PT15S
     beforeCommands:
-      - pip install requests psycopg2-binary
+      - pip install kestra requests psycopg2-binary
+    # Passed as files, not interpolated: JSON escapes `"` as \" and Python's
+    # triple-quoted literals process backslashes, corrupting the JSON.
+    inputFiles:
+      items.json: "{{ inputs.items }}"
     script: |
       import json
       import uuid
@@ -50,13 +65,17 @@ tasks:
       order_id = "{{ inputs.order_id }}"
       customer_id = "{{ inputs.customer_id }}"
       total_amount = float("{{ inputs.total_amount }}")
-      items = json.loads("""{{ inputs.items }}""")
+      with open("items.json") as f:
+          items = json.load(f)
       approval_service_url = "{{ vars.approval_service_url }}"
 
       approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
 
-      # The resume URL is provided by Kestra for the downstream Pause task.
-      resume_url = "{{ execution.resumeUrl }}"
+      # Kestra has no `execution.resumeUrl`. Hand over the execution id and let
+      # the approval service's `kestra` provider authenticate and post multipart.
+      # This is the SUBFLOW's own execution id -- the Pause that waits lives here,
+      # not in the parent, so resuming the parent would be a no-op.
+      execution_id = "{{ execution.id }}"
 
       items_summary = ", ".join(
           f"{item['quantity']}x {item['sku']}" for item in items
@@ -67,8 +86,13 @@ tasks:
           "order_id": order_id,
           "total_amount": total_amount,
           "customer_id": customer_id,
-          "callback_url": resume_url,
           "items_summary": items_summary,
+          "provider": "kestra",
+          "resume_data": {
+              "execution_id": execution_id,
+              # must match the onResume input declared on wait_for_approval
+              "on_resume_field": "payload",
+          },
       }
 
       response = requests.post(
@@ -91,6 +115,7 @@ tasks:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
       try:
           cur = conn.cursor()
@@ -119,9 +144,14 @@ tasks:
   - id: wait_for_approval
     type: io.kestra.plugin.core.flow.Pause
     description: >
-      Wait for the approval service to POST the manager's decision to the Kestra
-      resume URL. Times out after 120 seconds if no decision arrives.
+      Wait for the approval service to resume this execution with the manager's
+      decision. Times out after 120 seconds if no decision arrives, which drives
+      the saga compensation path in the parent flow.
     timeout: PT120S
+    onResume:
+      - id: payload
+        type: STRING
+        description: JSON decision envelope delivered by the approval service
 
   - id: record_decision
     type: io.kestra.plugin.scripts.python.Script
@@ -133,18 +163,24 @@ tasks:
       maxAttempt: 3
       interval: PT2S
     beforeCommands:
-      - pip install psycopg2-binary
+      - pip install kestra psycopg2-binary
+    # Passed as a file, not interpolated: the decision envelope carries free-text
+    # `reason`, and a `"` in it arrives as \" which Python's triple-quoted literal
+    # would unescape, corrupting the JSON.
+    inputFiles:
+      payload.json: "{{ outputs.wait_for_approval.onResume.payload }}"
     script: |
       import json
       from datetime import datetime, timezone
 
       import psycopg2
 
-      # Parse the resume payload from the Pause task
-      raw_payload = """{{ outputs.wait_for_approval.onResume }}"""
+      # The decision arrives as the declared onResume input, not as the
+      # onResume object itself.
       try:
-          approval_data = json.loads(raw_payload)
-      except (json.JSONDecodeError, TypeError):
+          with open("payload.json") as f:
+              approval_data = json.load(f)
+      except (json.JSONDecodeError, TypeError, OSError):
           approval_data = {}
 
       decision = approval_data.get("decision", "unknown")
@@ -159,6 +195,7 @@ tasks:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
 
       try:
@@ -197,6 +234,8 @@ errors:
   - id: approval_expired
     type: io.kestra.plugin.scripts.python.Script
     description: Handle approval timeout or unexpected error
+    beforeCommands:
+      - pip install kestra
     script: |
       from kestra import Kestra
       Kestra.outputs({
@@ -205,3 +244,20 @@ errors:
           "reason": "Approval request timed out",
           "decided_at": "",
       })
+
+# A parent Subflow task exposes only {state, executionId} unless the subflow
+# declares flow-level outputs. Without this the parent's branch on the decision
+# cannot see it, and the approval silently reads as "not approved".
+outputs:
+  - id: decision
+    type: STRING
+    value: "{{ outputs.record_decision.vars.decision ?? '' }}"
+  - id: approver
+    type: STRING
+    value: "{{ outputs.record_decision.vars.approver ?? '' }}"
+  - id: reason
+    type: STRING
+    value: "{{ outputs.record_decision.vars.reason ?? '' }}"
+  - id: decided_at
+    type: STRING
+    value: "{{ outputs.record_decision.vars.decided_at ?? '' }}"

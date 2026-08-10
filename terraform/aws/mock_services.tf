@@ -3,7 +3,7 @@
 #
 # Images are built and pushed to ECR (scripts/build-push-mock-services.sh, arm64
 # for K3s), then deployed to the K3s cluster (see shared-services/deploy/) in the
-# `orchestrators` namespace and exposed at *.gemovationlabs.com.
+# `orchestrators` namespace and exposed at *.example.com.
 #
 # callback-fetch and approval call Step Functions SendTaskSuccess from OUTSIDE
 # AWS, so they authenticate with a dedicated least-privilege IAM user's access
@@ -46,4 +46,31 @@ resource "aws_iam_user_policy" "callback_resume" {
 
 resource "aws_iam_access_key" "callback_resume" {
   user = aws_iam_user.callback_resume.name
+}
+
+# Dedicated read-only IAM user for the in-cluster fixture-service, which fetches
+# DAG 1's archive from S3 on boot (Kubernetes has no host bind mount, and the
+# bucket blocks all public access). Scoped to the single object it needs -- unlike
+# the callback user above, which cannot be narrowed because task tokens carry no
+# ARN.
+resource "aws_iam_user" "fixture_reader" {
+  name = "${var.name_prefix}-fixture-reader"
+}
+
+data "aws_iam_policy_document" "fixture_reader" {
+  statement {
+    sid       = "ReadDag1Input"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.dag1.arn}/input/*"]
+  }
+}
+
+resource "aws_iam_user_policy" "fixture_reader" {
+  name   = "${var.name_prefix}-fixture-reader"
+  user   = aws_iam_user.fixture_reader.name
+  policy = data.aws_iam_policy_document.fixture_reader.json
+}
+
+resource "aws_iam_access_key" "fixture_reader" {
+  user = aws_iam_user.fixture_reader.name
 }

@@ -11,11 +11,12 @@ automatically when passing values between tasks.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from dataclasses_json import dataclass_json
-
+from flytekit.types.file import FlyteFile
 
 # ---------------------------------------------------------------------------
 # Database configuration (used by all DAGs that talk to Postgres)
@@ -24,12 +25,26 @@ from dataclasses_json import dataclass_json
 @dataclass_json
 @dataclass
 class DBConfig:
-    """Connection parameters for the shared Postgres instance."""
+    """Connection parameters for the shared Postgres instance.
+
+    ``namespace`` drives per-(runner, DAG) schema isolation: each DAG connects
+    with ``search_path = "<namespace>_dag<N>"``. See ``shared-services/init-db.sql``.
+
+    Note this is carried as *data* rather than read from the environment inside
+    the task. Flyte task pods do not inherit the launching shell's environment,
+    so an ``os.environ`` lookup in the pod would always see the default. The
+    default below is resolved on the *client* at launch time, which is why
+    ``BAKEOFF_NS`` still works the way it does for every other runner — and it
+    stays overridable per execution, unlike Argo's literal env values.
+    """
     host: str = "postgres"
     port: int = 5432
     database: str = "orchestration"
     user: str = "orchestration"
     password: str = "orchestration"
+    namespace: str = field(
+        default_factory=lambda: os.environ.get("BAKEOFF_NS", "flyte")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +85,23 @@ class ETLOutput:
     parquet_path: str
     row_count: int
     tables_loaded: List[CSVLoadResult]
+
+
+@dataclass_json
+@dataclass
+class ExtractedCSV:
+    """One extracted CSV, carried between tasks as a blob rather than a path.
+
+    Task pods share no filesystem, so a local path returned by one task is
+    meaningless in the next -- verified: the load tasks died with
+    "No such file or directory: /tmp/csv_extract/customers.csv". FlyteFile makes
+    Flyte upload the file to the blob store and download it into whichever pod
+    consumes it. ``table`` is carried alongside because the target table name is
+    derived from the original filename, which the blob round-trip does not
+    promise to preserve.
+    """
+    table: str
+    file: FlyteFile
 
 
 # ---------------------------------------------------------------------------

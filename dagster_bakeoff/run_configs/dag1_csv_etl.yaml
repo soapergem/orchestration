@@ -1,0 +1,8 @@
+ops:
+  unzip_file:
+    config:
+      zip_path: test-data/sample-data.zip
+      extract_dir: /tmp/dagster_dag1_extract
+  convert_to_parquet:
+    config:
+      output_path: /tmp/dagster_dag1_output/combined_report.parquet

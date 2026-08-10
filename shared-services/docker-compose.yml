@@ -1,16 +1,21 @@
 # Shared services + orchestrator engines for the bake-off.
 #
-# Base services (postgres + the three mock services) have NO profile, so they
+# Base services (postgres + the four mock services) have NO profile, so they
 # always start with `podman compose up`. Each orchestrator engine is gated
-# behind a profile so you bring up ONE at a time:
+# behind a profile, so normally you bring up ONE at a time:
 #
-#   podman compose up                       # just the shared backbone
-#   podman compose --profile temporal up    # backbone + Temporal
-#   podman compose --profile hatchet  up     # backbone + Hatchet
-#   podman compose --profile kestra   up     # backbone + Kestra
+#   just up                  # just the shared backbone
+#   just up temporal         # backbone + Temporal   (also: hatchet, kestra, conductor)
+#   just up-all              # backbone + ALL four engines, no worker sidecars
+#   just down-all            # stop everything -- a bare `just down` does NOT
+#                            # reach profile-gated services (see the Justfile)
 #
-# Why profiles: the bake-off tests one orchestrator at a time, several of the
-# engines want overlapping host ports, and running all three at once is heavy.
+# Why profiles: the bake-off tests one orchestrator at a time, and four engines
+# at once is heavy (Kestra and Conductor are both JVMs). It is no longer a
+# *correctness* constraint -- RUNNING.md §0 gave every engine its own host port,
+# and all four profiles now resolve with zero collisions, which is what makes
+# `just up-all` safe. Earlier revisions of this comment claimed the engines
+# wanted overlapping ports; that has not been true since the port map landed.
 #
 # Podman note: everything here shares one compose network, so services reach
 # each other by service name (postgres, callback-fetch-service, etc.). The
@@ -22,6 +27,7 @@
 services:
   # ------------------------------------------------------------------ backbone
   postgres:
+    restart: unless-stopped
     image: postgres:16
     environment:
       POSTGRES_DB: orchestration
@@ -40,6 +46,7 @@ services:
       retries: 5
 
   callback-fetch-service:
+    restart: unless-stopped
     build: ./callback-fetch-service
     ports:
       - "8090:8090"
@@ -55,24 +62,71 @@ services:
       # when the fetch completes. Left off so resume is a manual /resume call.
       AUTO_RESUME: "true"
       AUTO_RESUME_DELAY_SECONDS: "0"
+      # Credentials for the `kestra` resume provider. Kestra's execution id is an
+      # identifier, not a capability token like a Step Functions task token, so
+      # the resume call must authenticate separately. OSS has no scoped service
+      # accounts, so this is the shared admin account -- evaluation-grade only.
+      KESTRA_URL: "${KESTRA_INTERNAL_URL:-http://kestra:8080}"
+      KESTRA_TENANT: "${KESTRA_TENANT:-main}"
+      KESTRA_USER: "${KESTRA_USER:-admin@orchestration.local}"
+      KESTRA_PASSWORD: "${KESTRA_PASSWORD:-Orchestration_123}"
+      # Base URL for the `conductor` resume provider. Unlike Kestra this needs no
+      # credentials: Conductor OSS ships with no authentication at all.
+      CONDUCTOR_URL: "${CONDUCTOR_INTERNAL_URL:-http://conductor-server:8080}"
     depends_on:
       postgres:
         condition: service_healthy
 
   approval-service:
+    restart: unless-stopped
     build: ./approval-service
     ports:
       - "8091:8091"
     extra_hosts:
       - "host.docker.internal:192.168.5.2"
     environment:
-      AUTO_DECIDE_DELAY_SECONDS: "10"
-      AUTO_DECIDE_ACTION: "approved"
+      # Overridable so the DAG 4 saga paths can be driven without editing this
+      # file, e.g. AUTO_DECIDE_ACTION=rejected just up, or =none to let the
+      # approval WAIT task time out.
+      AUTO_DECIDE_DELAY_SECONDS: "${AUTO_DECIDE_DELAY_SECONDS:-10}"
+      AUTO_DECIDE_ACTION: "${AUTO_DECIDE_ACTION:-approved}"
+      # See callback-fetch-service for why the Kestra resume needs credentials.
+      KESTRA_URL: "${KESTRA_INTERNAL_URL:-http://kestra:8080}"
+      KESTRA_TENANT: "${KESTRA_TENANT:-main}"
+      KESTRA_USER: "${KESTRA_USER:-admin@orchestration.local}"
+      KESTRA_PASSWORD: "${KESTRA_PASSWORD:-Orchestration_123}"
+      CONDUCTOR_URL: "${CONDUCTOR_INTERNAL_URL:-http://conductor-server:8080}"
     depends_on:
       postgres:
         condition: service_healthy
 
+  # Mock Books API backing DAG 2 (GET /books -> summaries with detail URLs, then
+  # GET /books/{id}), plus DAG 1's ZIP. Reachable in-network as
+  # `fixture-service:8099` and from the host as `localhost:8099`; detail URLs are
+  # derived per request, so both work without configuration. Replaces DAG 2's
+  # api.github.com default, which burned a shared 60/hour IP limit.
+  fixture-service:
+    restart: unless-stopped
+    build: ./fixture-service
+    ports:
+      - "8099:8099"
+    volumes:
+      # Both data files are uncommitted build artefacts living in test-data/:
+      #   books.json.gz    <- shared-services/fixture-service/build_dataset.py
+      #   sample-data.zip  <- test-data/make-sample-data.py
+      # Deployed environments have no host mount and fetch them from S3 instead.
+      - ../test-data:/data:ro
+    environment:
+      # DAG 2's fan-out width when a caller doesn't pass ?per_page. The corpus
+      # is thousands of works, so ?per_page=30 overshoots the spec's cap of 20.
+      FIXTURE_DEFAULT_PER_PAGE: "5"
+      # Fallbacks, used only when the file is absent from the mount above.
+      # s3://bucket/key (needs AWS creds) or https://. From `terraform output`.
+      FIXTURE_BOOKS_URL: "${FIXTURE_BOOKS_URL:-}"
+      FIXTURE_SAMPLE_ZIP_URL: "${FIXTURE_SAMPLE_ZIP_URL:-}"
+
   shipping-service:
+    restart: unless-stopped
     build: ./shipping-service
     ports:
       - "8092:8092"
@@ -146,13 +200,18 @@ services:
   # + dashboard). The worker runs on the HOST via `uv run` after you mint a
   # client token (see RUNNING.md -- the token can't be baked in statically).
   hatchet-engine:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:latest  # verify port layout against current docs
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:latest  # port layout verified 2026-08-03
     profiles: ["hatchet"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       DATABASE_URL: "postgres://orchestration:orchestration@postgres:5432/hatchet?sslmode=disable"
+      # Baked into every minted token as the `server_url` claim, which the SDK
+      # trusts for all REST calls. The generated default is http://localhost:8080
+      # -- on this host that is AIRFLOW, and SDK calls silently get Airflow's
+      # error JSON back. Point it at the published API port instead.
+      SERVER_URL: "http://localhost:8888"
       SERVER_AUTH_COOKIE_SECRETS: "changeme-cookie-secret-1 changeme-cookie-secret-2"
       SERVER_AUTH_COOKIE_DOMAIN: "localhost"
       SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
@@ -200,6 +259,32 @@ services:
         condition: service_healthy
     command: server standalone
     user: "root"
+    # Kestra treats a lost Postgres connection as fatal: every queue-consumer
+    # thread logs "Fatal error while polling the '<type>' queue. Initiating
+    # shutdown." and the process exits **status 0**. It does not reconnect, and
+    # there is no setting to make it; upstream has open issues in this area
+    # (kestra-io/kestra#4076, #5147, #10358). Measured behaviour:
+    #
+    #   ~5s blip   -> logs the fatal error on all consumers but SURVIVES
+    #   ~40s outage -> exits 0, and every in-flight execution is lost
+    #                  (flow definitions survive: the repository is Postgres too)
+    #
+    # MUST be unless-stopped, not on-failure: a zero exit reads as a clean
+    # shutdown, so on-failure would never fire.
+    restart: unless-stopped
+    # The healthcheck is not belt-and-braces, it is load-bearing. If the restart
+    # above happens while Postgres is still down, Kestra fails DNS
+    # (UnknownHostException: postgres -- a stopped container loses its alias),
+    # never retries, and sits there with a live JVM: the container reports
+    # "running" while serving nothing. Without this probe that wedge is invisible.
+    # Neither podman nor docker restarts an unhealthy container, so recovery is
+    # still manual: `podman restart shared-services_kestra_1` (~18s, verified).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -o /dev/null http://localhost:8080/ping || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 90s
     environment:
       KESTRA_CONFIGURATION: |
         datasources:
@@ -218,15 +303,69 @@ services:
             local:
               base-path: /app/storage
           url: http://kestra:8080/
+          variables:
+            globals:
+              # Docker-task-runner containers are siblings of this one, not
+              # children: they join the default bridge unless told otherwise,
+              # where compose DNS names like `postgres` do not resolve. Flows
+              # read this back as `{{ globals.task_network }}`.
+              task_network: shared-services_default
           server:
             basic-auth:
               username: admin@orchestration.local
               password: Orchestration_123
     ports:
-      - "8080:8080"               # http://localhost:8080
+      # Host port only; `kestra.url` above stays :8080 because resume URLs are
+      # resolved container-to-container. The host side defaults to 8081 because
+      # 8080 belongs to Airflow in the port map (RUNNING.md §0).
+      - "${KESTRA_PORT:-8081}:8080"
     volumes:
       - kestra-data:/app/storage
       - ../kestra:/flows:ro       # flow YAMLs; load via UI or `kestra flow namespace update`
+      # Script tasks default to Kestra's DOCKER task runner, which needs a
+      # Docker-compatible Engine API socket. Podman:
+      #   systemctl --user enable --now podman.socket
+      #   CONTAINER_SOCK=/run/user/$(id -u)/podman/podman.sock just up kestra
+      # docker: /var/run/docker.sock. finch: see prefect/deploy_docker.py.
+      - "${CONTAINER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock"
+
+  # ----------------------------------------------------------------- conductor
+  # Server + UI in ONE container (nginx serves the UI on :5000, Spring Boot the
+  # API on :8080). No Elasticsearch: config-postgres.properties sets
+  # conductor.indexing.type=postgres and conductor.elasticsearch.version=0, so
+  # metadata, the task queues and the search index all live in the `conductor`
+  # database. That makes it the lightest engine here after hatchet-lite.
+  #
+  # Workers run on the HOST via `uv run python conductor/worker.py` -- the Python
+  # SDK lives in pyproject, and workers POLL the server (no inbound connection),
+  # so no host-gateway wiring is needed for them. The mock services DO need to
+  # reach the server to resume WAIT tasks; they use `conductor-server:8080`.
+  conductor-server:
+    image: docker.io/conductoross/conductor:3.31.0
+    profiles: ["conductor"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Names a file under /app/config -- see the volume mount below. This must
+      # be a FILE: Conductor turns every key in it into a Java system property,
+      # which outranks environment variables, so SPRING_DATASOURCE_URL and
+      # friends are silently ignored whenever CONFIG_PROP is set. The reasoning
+      # is spelt out at the top of conductor/config.properties.
+      CONFIG_PROP: bakeoff.properties
+      JAVA_OPTS: "-Xmx1g"
+    volumes:
+      - ./conductor/config.properties:/app/config/bakeoff.properties:ro
+    ports:
+      - "8000:8080"               # REST API  -> http://localhost:8000/api
+      - "8127:5000"               # UI        -> http://localhost:8127
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -o /dev/null http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
 
 volumes:
   pgdata:

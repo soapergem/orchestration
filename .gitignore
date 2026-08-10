@@ -1,5 +1,36 @@
 __pycache__/
 *.py[cod]
 *$py.class
+# Machine-specific config: cluster contexts, your domain, cloud account ids,
+# the Hatchet client JWT. `.envrc.example` is the committed template -- it must
+# be negated explicitly, because `*.env*` matches it too.
 *.env*
+!.envrc.example
 private/
+# Cluster credentials. Never commit these; every script takes --context "$KCTX".
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+.venv/
+.ruff_cache/
+# Local Prefect server state (PREFECT_HOME) -- sqlite DB of flow runs.
+.prefect/
+# Local Airflow state (AIRFLOW_HOME) -- sqlite metadata DB, logs, ETL scratch.
+airflow/.airflow-home/
+# Dagster instance: run storage, pickled IO manager output, sensor cursors.
+dagster_bakeoff/.dagster_home/
+# Scratch input/output for host-run DAG 1 (ETL_* paths).
+.local-data/
+# mkslides build output.
+presentation/site/
+
+# Hatchet client token minted at runtime (RUNNING.md §5)
+shared-services/hatchet.token
+hatchet.token
+
+# Both fixture data files are build artefacts, not source. Generate them with
+# test-data/make-sample-data.py and shared-services/fixture-service/build_dataset.py;
+# terraform/aws/s3.tf uploads them to S3 for the Kubernetes and Lambda paths, which
+# have no host bind mount.
+test-data/sample-data.zip
+test-data/books.json.gz

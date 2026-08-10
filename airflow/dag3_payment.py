@@ -17,6 +17,7 @@ Airflow idioms used:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,14 @@ DB_CONN_PARAMS = {
     "password": os.environ.get("POSTGRES_PASSWORD", "orchestration"),
 }
 
+# Airflow 3's RuntimeTaskInstance carries no .log attribute, so task code
+# logs through the standard logging module; Airflow captures it either way.
+log = logging.getLogger(__name__)
+
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "airflow")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag3"
+
 
 # ---------------------------------------------------------------------------
 # Typed exceptions
@@ -60,8 +69,38 @@ class PaymentDeclined(AirflowException):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _conf(context: dict) -> dict:
+    """Run configuration: the DAG's params overlaid with this run's ``--conf``.
+
+    ``dag_run.conf or params`` looks equivalent but is not: a partial trigger
+    config (just ``order_id``, say) then shadows every param default and the
+    next read raises KeyError.
+    """
+    return {**(context.get("params") or {}), **(context["dag_run"].conf or {})}
+
+
 def _get_connection() -> psycopg2.extensions.connection:
-    return psycopg2.connect(**DB_CONN_PARAMS)
+    """Connection scoped to this runner's DAG 3 schema (``<BAKEOFF_NS>_dag3``),
+    which holds the seeded accounts this DAG debits.
+
+    Not self-creating: SET search_path to a missing schema succeeds silently and
+    every later query then fails with a confusing "relation does not exist", so
+    check up front and say what to run.
+    """
+    conn = psycopg2.connect(**DB_CONN_PARAMS)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (BAKEOFF_SCHEMA,),
+        )
+        if cur.fetchone() is None:
+            raise RuntimeError(
+                f'schema "{BAKEOFF_SCHEMA}" does not exist -- seed it with: '
+                f"just seed {BAKEOFF_NS}"
+            )
+        cur.execute(f'SET search_path TO "{BAKEOFF_SCHEMA}"')
+    conn.commit()
+    return conn
 
 
 def _on_payment_failure(context: dict) -> None:
@@ -70,9 +109,7 @@ def _on_payment_failure(context: dict) -> None:
     Records the failed transaction in the database so the failure path
     has a record even if handle_payment_failure never runs.
     """
-    ti = context["task_instance"]
-    dag_run = context["dag_run"]
-    conf = dag_run.conf or {}
+    conf = _conf(context)
 
     payment_id = conf.get("payment_id", "unknown")
     idempotency_key = conf.get("idempotency_key", payment_id)
@@ -108,7 +145,7 @@ def _on_payment_failure(context: dict) -> None:
             conn.commit()
         conn.close()
     except Exception as exc:
-        ti.log.error("on_failure_callback could not record failure: %s", exc)
+        log.error("on_failure_callback could not record failure: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +154,7 @@ def _on_payment_failure(context: dict) -> None:
 
 def validate_payment_fn(**context) -> dict:
     """Check account existence, status, balance, and duplicate payment."""
-    conf = context["dag_run"].conf or context["params"]
+    conf = _conf(context)
     payment_id = conf["payment_id"]
     amount = float(conf["amount"])
     from_account = conf["from_account"]
@@ -175,7 +212,7 @@ def check_validation_fn(**context) -> str:
 
 def process_payment_fn(**context) -> dict:
     """Call simulated payment gateway. Raises typed exceptions."""
-    conf = context["dag_run"].conf or context["params"]
+    conf = _conf(context)
     payment_id = conf["payment_id"]
     amount = float(conf["amount"])
     currency = conf["currency"]
@@ -205,7 +242,7 @@ def process_payment_fn(**context) -> dict:
 
 def update_database_fn(**context) -> dict:
     """Debit source, credit destination, record transaction."""
-    conf = context["dag_run"].conf or context["params"]
+    conf = _conf(context)
     ti = context["task_instance"]
     payment_result = ti.xcom_pull(task_ids="process_payment")
 
@@ -257,7 +294,7 @@ def update_database_fn(**context) -> dict:
 
 def send_notification_fn(**context) -> dict:
     """Best-effort success notification."""
-    conf = context["dag_run"].conf or context["params"]
+    conf = _conf(context)
     payment_id = conf["payment_id"]
     amount = conf["amount"]
     currency = conf["currency"]
@@ -275,7 +312,7 @@ def send_notification_fn(**context) -> dict:
 
 def handle_payment_failure_fn(**context) -> dict:
     """Record the failed transaction in the database."""
-    conf = context["dag_run"].conf or context["params"]
+    conf = _conf(context)
     payment_id = conf["payment_id"]
     idempotency_key = conf.get("idempotency_key", payment_id)
 
@@ -317,7 +354,7 @@ def send_failure_notification_fn(**context) -> dict:
     """Send a failure notification (best-effort)."""
     ti = context["task_instance"]
     failure_result = ti.xcom_pull(task_ids="handle_payment_failure")
-    conf = context["dag_run"].conf or context["params"]
+    conf = _conf(context)
     payment_id = failure_result["payment_id"]
 
     subject = f"Payment Failed: {payment_id}"

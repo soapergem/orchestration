@@ -1,0 +1,11 @@
+ops:
+  validate_payment:
+    config:
+      payment_id: PAY-DAGSTER-001
+      amount: 125.5
+      currency: USD
+      from_account: ACC-001
+      to_account: ACC-003
+      # Idempotency key must be unique per run, or validation correctly
+      # rejects the re-run as a duplicate.
+      idempotency_key: IDEM-DAGSTER-001

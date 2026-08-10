@@ -28,14 +28,21 @@ MAJOR DIVERGENCES FROM STEP FUNCTIONS:
 - Luigi provides no framework-level error handling, retry policies, or
   compensation mechanisms.
 
-Run with:
+Run with (ids must exist in <BAKEOFF_NS>_dag4, seeded by
+shared-services/init-db.sql: customers CUST-42 / CUST-43 / CUST-99 (inactive),
+inventory WIDGET-A 29.99 / GADGET-B 499.99 / THING-C 9.99 / RARE-D 1500.00):
+
     luigi --module dag4_order_fulfillment SendOrderNotification \
-        --order-id ORD-001 \
-        --customer-id CUST-001 \
-        --items-json '[{"sku":"SKU-A","quantity":2,"unit_price":100.00}]' \
-        --shipping-address-json '{"street":"123 Main St","city":"NYC","zip":"10001"}' \
+        --order-id ORD-LUIGI-001 \
+        --customer-id CUST-42 \
+        --items-json '[{"sku":"WIDGET-A","quantity":2,"unit_price":29.99},
+                       {"sku":"GADGET-B","quantity":1,"unit_price":499.99}]' \
+        --shipping-address-json '{"street":"1 Main St","city":"Springfield","state":"IL","zip":"62701","country":"US"}' \
         --run-id my-run-001 \
         --workers 1
+
+That order totals 559.97, which clears the 500 approval threshold and so
+exercises the approval path. Drop GADGET-B to take the skip-approval branch.
 """
 
 import json
@@ -45,10 +52,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-import luigi
 import psycopg2
 import urllib3
 
+import luigi
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -74,14 +81,38 @@ MARKER_DIR = os.environ.get("LUIGI_MARKER_DIR", "/tmp/luigi-markers/dag4")
 http = urllib3.PoolManager()
 
 
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "luigi")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag4"
+
+
 def get_db_connection():
-    return psycopg2.connect(
+    """Connection scoped to this runner's DAG 4 schema.
+
+    This schema holds seeded customers and inventory, so it is not self-creating. The check is
+    deliberate: SET search_path to a nonexistent schema succeeds silently, and
+    every later query then fails with a confusing "relation does not exist".
+    """
+    conn = psycopg2.connect(
         host=DB_CONFIG["host"],
         port=DB_CONFIG["port"],
         database=DB_CONFIG["database"],
         user=DB_CONFIG["user"],
         password=DB_CONFIG["password"],
     )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (BAKEOFF_SCHEMA,),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{BAKEOFF_SCHEMA}" does not exist -- seed it with: '
+                f"just seed {BAKEOFF_NS}"
+            )
+        cur.execute(f'SET search_path TO "{BAKEOFF_SCHEMA}"')
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +311,21 @@ class ReserveInventory(luigi.Task):
                 self._write_output(result)
                 return
 
+            # The orders row MUST exist before any inventory_reservations row:
+            # inventory_reservations.order_id carries a non-deferrable FK to
+            # orders(order_id), so reserving first fails with a foreign-key
+            # violation for any order_id that does not already exist. The same
+            # bug was present in the Prefect, Argo and Flyte implementations.
+            total = sum(i["quantity"] * i["unit_price"] for i in items)
+            cur.execute(
+                """
+                INSERT INTO orders (order_id, customer_id, total_amount, status)
+                VALUES (%s, %s, %s, 'reserved')
+                ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+                """,
+                (self.order_id, self.customer_id, total),
+            )
+
             items_reserved = []
             for item in items:
                 sku = item["sku"]
@@ -310,17 +356,6 @@ class ReserveInventory(luigi.Task):
                     (f"{reservation_id}-{sku}", self.order_id, sku, quantity),
                 )
                 items_reserved.append(sku)
-
-            # Create the order record
-            total = sum(i["quantity"] * i["unit_price"] for i in items)
-            cur.execute(
-                """
-                INSERT INTO orders (order_id, customer_id, total_amount, status)
-                VALUES (%s, %s, %s, 'reserved')
-                ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
-                """,
-                (self.order_id, self.customer_id, total),
-            )
 
             conn.commit()
 
@@ -421,12 +456,22 @@ class ManagerApproval(luigi.Task):
             f"{item['quantity']}x {item['sku']}" for item in items
         )
 
+        # The approval service is a resume BROKER (RUNNING.md 2b): it requires a
+        # provider plus a resume handle and its validator rejects a registration
+        # it cannot classify, returning 422 "cannot infer provider". There is no
+        # `luigi` provider (the enum offers stepfunctions / http_callback /
+        # kestra / conductor) and Luigi cannot receive a callback at all, so
+        # register http_callback with a deliberately dead URL. The decision is
+        # recorded before the resume is attempted and the auto-decider swallows
+        # dispatch failures, so the poll below still observes it.
         payload = {
             "approval_request_id": approval_request_id,
             "order_id": self.order_id,
             "total_amount": total_amount,
             "customer_id": self.customer_id,
             "items_summary": items_summary,
+            "provider": "http_callback",
+            "resume_data": {"callback_url": "http://unused.invalid/luigi-polls-instead"},
         }
 
         response = http.request(

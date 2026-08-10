@@ -16,7 +16,17 @@ inputs:
     description: JSON object with the shipping address
 
 variables:
+  task_network: shared-services_default
   shipping_service_url: "http://shipping-service:8092"
+
+pluginDefaults:
+  # Task-runner containers are siblings of the Kestra container, so they must be
+  # placed on the compose network for `postgres` / the mock services to resolve.
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: "{{ vars.task_network }}"
 
 tasks:
   - id: ship
@@ -31,15 +41,22 @@ tasks:
       interval: PT3S
       maxInterval: PT15S
     beforeCommands:
-      - pip install requests
+      - pip install kestra requests
+    # Passed as files, not interpolated: JSON escapes `"` as \" and Python's
+    # triple-quoted literals process backslashes, corrupting the JSON.
+    inputFiles:
+      items.json: "{{ inputs.items }}"
+      shipping_address.json: "{{ inputs.shipping_address }}"
     script: |
       import json
 
       import requests
 
       order_id = "{{ inputs.order_id }}"
-      items = json.loads("""{{ inputs.items }}""")
-      shipping_address = json.loads("""{{ inputs.shipping_address }}""")
+      with open("items.json") as f:
+          items = json.load(f)
+      with open("shipping_address.json") as f:
+          shipping_address = json.load(f)
       shipping_service_url = "{{ vars.shipping_service_url }}"
 
       idempotency_key = f"{order_id}-ship"
@@ -91,9 +108,26 @@ errors:
   - id: shipping_failed
     type: io.kestra.plugin.scripts.python.Script
     description: Log shipping failure details
+    beforeCommands:
+      - pip install kestra
     script: |
       from kestra import Kestra
       Kestra.outputs({
           "status": "failed",
           "message": "Shipping could not be completed after all retries.",
       })
+
+# Flow-level outputs: a parent Subflow task cannot reach inner task outputs.
+outputs:
+  - id: shipment_id
+    type: STRING
+    value: "{{ outputs.ship.vars.shipment_id ?? '' }}"
+  - id: tracking_number
+    type: STRING
+    value: "{{ outputs.ship.vars.tracking_number ?? '' }}"
+  - id: carrier
+    type: STRING
+    value: "{{ outputs.ship.vars.carrier ?? '' }}"
+  - id: estimated_delivery
+    type: STRING
+    value: "{{ outputs.ship.vars.estimated_delivery ?? '' }}"

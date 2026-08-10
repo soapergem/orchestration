@@ -12,6 +12,7 @@ code, typed exceptions, and graceful notification degradation.
 import json
 import os
 import random
+import uuid
 from datetime import datetime, timezone
 
 import psycopg2
@@ -28,6 +29,10 @@ DB_CONFIG = {
     "user": os.environ.get("POSTGRES_USER", "orchestration"),
     "password": os.environ.get("POSTGRES_PASSWORD", "orchestration"),
 }
+
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "prefect")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag3"
 
 
 # ---------------------------------------------------------------------------
@@ -46,19 +51,52 @@ class PaymentDeclined(Exception):
     """NOT retriable — the issuing bank declined the card."""
 
 
+def _is_retriable_gateway_error(task, task_run, state) -> bool:
+    """Prefect ``retry_condition_fn``: retry transient gateway faults only.
+
+    ``retries=`` alone applies to every exception, so without this a decline
+    would be retried five times with backoff -- a card the bank refused will
+    never clear, and the spec classifies PaymentDeclined as non-retriable.
+    """
+    try:
+        state.result(raise_on_failure=True)
+    except PaymentDeclined:
+        return False
+    except Exception:
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 
 def _get_db_connection(db_config: dict | None = None):
+    """Connection scoped to this runner's DAG 3 schema (``<BAKEOFF_NS>_dag3``),
+    so payment runs never collide across runners."""
     cfg = db_config or DB_CONFIG
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg.get("port", 5432),
         dbname=cfg["database"],
         user=cfg["user"],
         password=cfg["password"],
     )
+    schema = cfg.get("schema", BAKEOFF_SCHEMA)
+    with conn.cursor() as cur:
+        # Unlike DAG 1, this schema is not self-creating: it holds seeded
+        # accounts. SET search_path to a missing schema succeeds silently and
+        # then every query fails with a confusing "relation does not exist",
+        # so check up front and say what to actually run.
+        cur.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (schema,))
+        if cur.fetchone() is None:
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- seed it with: '
+                f"psql -c \"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');\""
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +174,7 @@ def validate_payment(
     retries=5,
     retry_delay_seconds=[3, 6, 12, 24, 48],
     retry_jitter_factor=1.0,
+    retry_condition_fn=_is_retriable_gateway_error,
     name="process_payment",
 )
 def process_payment(
@@ -360,11 +399,11 @@ def handle_payment_failure(
 
 @flow(name="payment_processing", log_prints=True)
 def payment_processing(
-    payment_id: str,
-    amount: float,
-    currency: str,
-    from_account: str,
-    to_account: str,
+    payment_id: str | None = None,
+    amount: float = 100.00,
+    currency: str = "USD",
+    from_account: str = "ACC-001",
+    to_account: str = "ACC-003",
     idempotency_key: str | None = None,
     db_config: dict | None = None,
 ) -> dict:
@@ -376,9 +415,16 @@ def payment_processing(
       4. Update database (idempotent)
       5. Send notification (graceful degradation on failure)
       6. On any failure: record failure + send failure notification
+
+    ``payment_id`` doubles as the idempotency key, so it defaults to a fresh
+    generated id rather than a fixed literal: a deployment has static parameters,
+    and a constant id would make every run after the first an idempotent no-op.
+    Pass one explicitly to test the duplicate-payment branch. Account defaults
+    come from the bootstrap_bakeoff() seed (ACC-001 $5000 active -> ACC-003).
     """
     logger = get_run_logger()
     cfg = db_config or DB_CONFIG
+    payment_id = payment_id or f"PAY-{uuid.uuid4().hex[:12].upper()}"
     idem_key = idempotency_key or payment_id
 
     # Step 1: Validate
@@ -529,11 +575,13 @@ def payment_processing(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    result = payment_processing(
-        payment_id="PAY-001",
-        amount=100.00,
-        currency="USD",
-        from_account="ACC-SRC-001",
-        to_account="ACC-DST-001",
-    )
+    # All parameters fall back to flow defaults: a generated payment_id (so this
+    # is re-runnable) moving $100 ACC-001 -> ACC-003, both from the
+    # bootstrap_bakeoff() seed.
+    #
+    # To exercise the failure branches, pass explicit values:
+    #   payment_id="PAY-001"      -> duplicate, if PAY-001 already completed
+    #   from_account="ACC-004"    -> suspended account
+    #   amount=99999              -> insufficient balance (ACC-001 holds $5000)
+    result = payment_processing()
     print(json.dumps(result, indent=2, default=str))

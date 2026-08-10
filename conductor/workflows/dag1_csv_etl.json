@@ -1,0 +1,72 @@
+{
+  "name": "dag1_csv_etl",
+  "version": 1,
+  "description": "DAG 1: unzip -> dynamic per-CSV load -> SQL transform -> Parquet",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "workflowStatusListenerEnabled": false,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 1800,
+  "inputParameters": [
+    "zip_path",
+    "extract_dir",
+    "output_dir"
+  ],
+  "tasks": [
+    {
+      "name": "unzip_file",
+      "taskReferenceName": "unzip",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "zip_path": "${workflow.input.zip_path}",
+        "extract_dir": "${workflow.input.extract_dir}"
+      }
+    },
+    {
+      "name": "prepare_csv_fanout",
+      "taskReferenceName": "prepare_fanout",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "csv_files": "${unzip.output.csv_files}"
+      }
+    },
+    {
+      "name": "process_csvs",
+      "taskReferenceName": "process_csvs",
+      "type": "FORK_JOIN_DYNAMIC",
+      "dynamicForkTasksParam": "dynamicTasks",
+      "dynamicForkTasksInputParamName": "dynamicTasksInput",
+      "inputParameters": {
+        "dynamicTasks": "${prepare_fanout.output.dynamic_tasks}",
+        "dynamicTasksInput": "${prepare_fanout.output.dynamic_inputs}"
+      }
+    },
+    {
+      "name": "join_csv_loads",
+      "taskReferenceName": "join_csv_loads",
+      "type": "JOIN"
+    },
+    {
+      "name": "run_sql_transform",
+      "taskReferenceName": "sql_transform",
+      "type": "SIMPLE",
+      "inputParameters": {}
+    },
+    {
+      "name": "convert_to_parquet",
+      "taskReferenceName": "to_parquet",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "output_dir": "${workflow.input.output_dir}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "csv_count": "${unzip.output.csv_count}",
+    "fanout_width": "${prepare_fanout.output.fanout_width}",
+    "load_results": "${join_csv_loads.output}",
+    "report_rows": "${sql_transform.output.row_count}",
+    "parquet_path": "${to_parquet.output.output_path}"
+  }
+}

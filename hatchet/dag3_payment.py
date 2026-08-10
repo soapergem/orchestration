@@ -19,7 +19,6 @@ import random
 from datetime import datetime, timezone
 
 import psycopg2
-
 from hatchet_sdk import Context, Hatchet, NonRetryableException
 
 hatchet = Hatchet()
@@ -37,15 +36,33 @@ DB_CONFIG = {
 }
 
 
+# Per-(runner, DAG) schema isolation -- see CLAUDE.md. DAG 3 does NOT create its
+# schema: it needs the seeded accounts/transactions fixtures, so a missing schema
+# is a setup error to surface, not something to paper over with empty tables.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "hatchet")
+SCHEMA = f"{BAKEOFF_NS}_dag3"
+
+
 def get_db_connection(db_config: dict | None = None) -> psycopg2.extensions.connection:
     cfg = db_config or DB_CONFIG
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg.get("port", 5432),
         dbname=cfg.get("dbname", cfg.get("database", "orchestration")),
         user=cfg["user"],
         password=cfg["password"],
     )
+    schema = cfg.get("schema", SCHEMA)
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (schema,))
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- run `just seed {BAKEOFF_NS}` first'
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +108,6 @@ async def validate_payment(input: dict, context: Context) -> dict:
     input = input.model_dump()
     payment_id = input["payment_id"]
     amount = input["amount"]
-    currency = input["currency"]
     from_account = input["from_account"]
     to_account = input["to_account"]
     db_config = input.get("db_config") or DB_CONFIG
@@ -204,7 +220,6 @@ async def process_payment(input: dict, context: Context) -> dict:
     payment_id = input["payment_id"]
     amount = input["amount"]
     currency = input["currency"]
-    idempotency_key = input.get("idempotency_key", payment_id)
 
     # --- Simulated payment gateway ---
     # 60% success, 20% timeout (retriable), 15% 5xx (retriable), 5% declined (non-retriable)

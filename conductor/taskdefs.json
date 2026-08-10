@@ -1,0 +1,311 @@
+[
+  {
+    "name": "unzip_file",
+    "description": "DAG 1: extract CSVs from a ZIP onto the worker filesystem",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 300,
+    "responseTimeoutSeconds": 120,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "prepare_csv_fanout",
+    "description": "DAG 1: build the dynamicTasks / dynamicTasksInput pair for FORK_JOIN_DYNAMIC",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "load_csv_to_postgres",
+    "description": "DAG 1: COPY one CSV into its own table",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 300,
+    "responseTimeoutSeconds": 120,
+    "timeoutPolicy": "TIME_OUT_WF",
+    "concurrentExecLimit": 10
+  },
+  {
+    "name": "run_sql_transform",
+    "description": "DAG 1: JOIN the loaded tables into combined_report",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 5,
+    "timeoutSeconds": 600,
+    "responseTimeoutSeconds": 300,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "convert_to_parquet",
+    "description": "DAG 1: export combined_report to Parquet",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 300,
+    "responseTimeoutSeconds": 120,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+
+  {
+    "name": "submit_async_fetch",
+    "description": "DAG 2: register the async fetch + the conductor resume handle",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "wait_for_fetch_callback",
+    "description": "DAG 2: the WAIT task the callback service completes. 60s per the spec; on timeout the workflow is failed, which is the honest outcome for 'the callback never arrived'.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 0,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "process_fetch_result",
+    "description": "DAG 2: normalise the callback payload into {items:[...]}",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "prepare_detail_fanout",
+    "description": "DAG 2: build the dynamic fork payload for the per-item detail fetches",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "fetch_item_detail",
+    "description": "DAG 2: fetch one item's detail URL. concurrentExecLimit is the spec's max-concurrency-20 cap, enforced engine-side across ALL running workflows -- not per run.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 120,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF",
+    "concurrentExecLimit": 20
+  },
+  {
+    "name": "combine_results",
+    "description": "DAG 2: merge detail responses into a summary with success/failure counts",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+
+  {
+    "name": "validate_payment",
+    "description": "DAG 3: account/balance/fraud/idempotency checks",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "process_payment",
+    "description": "DAG 3: flaky gateway call. EXPONENTIAL_BACKOFF from 2s over 4 attempts; PaymentDeclined bypasses all of it by raising NonRetryableException, which the SDK maps to FAILED_WITH_TERMINAL_ERROR.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 4,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "backoffScaleFactor": 2,
+    "timeoutSeconds": 300,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "update_payment_database",
+    "description": "DAG 3: idempotent debit/credit + transaction record",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 120,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "send_payment_notification",
+    "description": "DAG 3: best-effort receipt. Marked optional in the workflow so failure degrades gracefully.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "handle_payment_failure",
+    "description": "DAG 3: record the failed transaction and notify",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 120,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+
+  {
+    "name": "validate_order",
+    "description": "DAG 4: SKU existence, customer status, total_amount. No mutation, so no compensation.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "reserve_inventory",
+    "description": "DAG 4: atomically decrement available_quantity + create reservation rows",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 120,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "request_manager_approval",
+    "description": "DAG 4: record the approval row and register the resume handle with the approval service",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "wait_for_approval",
+    "description": "DAG 4: the WAIT task the approval service completes. 120s for automated testing (72h conceptually); TIME_OUT_WF makes the timeout fail the sub-workflow, which is what routes it into the saga.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 0,
+    "timeoutSeconds": 120,
+    "responseTimeoutSeconds": 120,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "record_approval_decision",
+    "description": "DAG 4: persist the manager's decision to approval_requests",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "call_shipping_api",
+    "description": "DAG 4: flaky shipping API, 3 retries + exponential backoff. InvalidAddress is non-retriable via NonRetryableException.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "backoffScaleFactor": 2,
+    "timeoutSeconds": 300,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "update_order_status",
+    "description": "DAG 4: mark the order shipped with tracking info",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "send_order_notification",
+    "description": "DAG 4: best-effort customer notification; optional in the workflow",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "release_inventory",
+    "description": "DAG 4 saga: reverse the reservation. Idempotent -- a second call is a no-op.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 120,
+    "responseTimeoutSeconds": 60,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "update_order_cancelled",
+    "description": "DAG 4 saga: set the order to cancelled/failed with a reason",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 3,
+    "retryLogic": "EXPONENTIAL_BACKOFF",
+    "retryDelaySeconds": 2,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "send_cancellation_notification",
+    "description": "DAG 4 saga: best-effort cancellation notice; optional in the workflow",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 2,
+    "retryLogic": "FIXED",
+    "retryDelaySeconds": 1,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  },
+  {
+    "name": "compensation_failed_dead_letter",
+    "description": "DAG 4 saga: terminal dead-letter when compensation itself fails after retries. Never retried -- it exists to be seen by a human.",
+    "ownerEmail": "bakeoff@orchestration.local",
+    "retryCount": 0,
+    "timeoutSeconds": 60,
+    "responseTimeoutSeconds": 30,
+    "timeoutPolicy": "TIME_OUT_WF"
+  }
+]

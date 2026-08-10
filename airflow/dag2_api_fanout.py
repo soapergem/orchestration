@@ -25,7 +25,6 @@ import requests
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
 from airflow.models.baseoperator import BaseOperator
-from airflow.utils.trigger_rule import TriggerRule
 
 from triggers.fetch_callback_trigger import FetchCallbackTrigger
 
@@ -69,16 +68,17 @@ class AsyncFetchOperator(BaseOperator):
         """Submit the async fetch request, then defer to the trigger."""
         correlation_id = str(uuid.uuid4())
 
-        # The callback_url is informational -- the trigger polls /status instead
-        callback_url = (
-            f"{self.fetch_service_url}/callback/{correlation_id}"
-        )
-
         payload = {
             "url": self.url,
             "headers": {},
-            "callback_url": callback_url,
             "correlation_id": correlation_id,
+            # The service is a resume broker: registration must declare how the
+            # result gets delivered (RUNNING.md 2b) and 422s without it. A
+            # deferred Airflow task has no inbound resume handle -- the triggerer
+            # polls GET /status/<correlation_id> instead -- so this registers the
+            # documented dead URL and ignores the resume leg.
+            "provider": "http_callback",
+            "resume_data": {"callback_url": "http://localhost:0/noop"},
         }
 
         self.log.info(
@@ -124,7 +124,9 @@ class AsyncFetchOperator(BaseOperator):
                 "Fetch completed for correlation_id=%s",
                 event.get("correlation_id"),
             )
-            return event
+            # GET /status/<id> does not echo the requested URL, so stamp it here
+            # from the (re-rendered) template field for downstream reporting.
+            return {**event, "url": event.get("url") or self.url}
 
         if status == "failed":
             raise AirflowException(
@@ -156,7 +158,7 @@ class AsyncFetchOperator(BaseOperator):
         "max_retry_delay": timedelta(minutes=1),
     },
     params={
-        "url": "https://api.github.com/orgs/apache/repos",
+        "url": "http://fixture-service:8099/books?base=http://localhost:8099",
     },
     tags=["api", "fanout", "deferrable", "async"],
 )
@@ -198,7 +200,7 @@ def api_fanout_pipeline():
                 items.append(
                     {
                         "id": item.get("id"),
-                        "name": item.get("name", item.get("id")),
+                        "name": item.get("title") or item.get("name") or item.get("id"),
                         "detail_url": item.get("url"),
                     }
                 )
@@ -216,13 +218,27 @@ def api_fanout_pipeline():
     def check_items_exist(processed: dict) -> str:
         """Branch: fan out if items exist, otherwise skip."""
         if processed.get("items"):
-            return "fan_out_api_requests"
+            return "extract_items"
         return "no_items_to_process"
+
+    # ------------------------------------------------------------------
+    # Step 4b: Expose the item list as its own XCom return value
+    # ------------------------------------------------------------------
+    @task()
+    def extract_items(processed: dict) -> list[dict]:
+        """
+        Airflow can only map over a task's *return value*, not over a
+        subscripted key of one (`processed["items"]` raises "cannot map over
+        XCom with custom key"). A one-line task that returns the list is the
+        idiomatic way to feed .expand().
+        """
+        return processed["items"]
 
     # ------------------------------------------------------------------
     # Step 5: Fan-out -- fetch detail for each item in parallel
     # ------------------------------------------------------------------
-    @task()
+    # Spec cap: at most 20 detail fetches at once (README.md DAG 2 step 5).
+    @task(max_active_tis_per_dag=20)
     def fan_out_api_requests(item: dict) -> dict:
         """Fetch detail for a single item."""
         detail_url = item.get("detail_url")
@@ -254,7 +270,7 @@ def api_fanout_pipeline():
     # ------------------------------------------------------------------
     # Step 6: Combine all fan-out results
     # ------------------------------------------------------------------
-    @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+    @task()
     def combine_results(api_results: list[dict], processed: dict) -> dict:
         """Merge all fan-out results into a summary."""
         combined = []
@@ -298,14 +314,14 @@ def api_fanout_pipeline():
     branch = check_items_exist(processed)
 
     # Fan-out path
-    items_list = processed["items"]
+    items_list = extract_items(processed)
     detail_results = fan_out_api_requests.expand(item=items_list)
-    final = combine_results(api_results=detail_results, processed=processed)
+    combine_results(api_results=detail_results, processed=processed)
 
     # No-items path
     empty = no_items_to_process()
 
-    branch >> [detail_results, empty]
+    branch >> [items_list, empty]
 
 
 api_fanout_pipeline()

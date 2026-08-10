@@ -1,6 +1,6 @@
 # Copy to terraform.tfvars and adjust. Do NOT put neon_database_url here.
 aws_region  = "us-east-1"
-aws_profile = "soapergem"
+aws_profile = "my-aws-profile"   # your named profile from ~/.aws/credentials
 name_prefix = "orch-bakeoff"
 
 # neon_database_url is sensitive. Provide it via the environment instead of a

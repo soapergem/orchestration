@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 import os
 import zipfile
 from datetime import datetime, timedelta
@@ -41,6 +40,10 @@ DB_CONN_PARAMS = {
     "user": os.environ.get("POSTGRES_USER", "orchestration"),
     "password": os.environ.get("POSTGRES_PASSWORD", "orchestration"),
 }
+
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "airflow")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag1"
 
 DEFAULT_ZIP_PATH = os.environ.get("ETL_ZIP_PATH", "/opt/airflow/data/input.zip")
 DEFAULT_EXTRACT_DIR = os.environ.get("ETL_EXTRACT_DIR", "/opt/airflow/data/extracted")
@@ -71,7 +74,19 @@ JOIN products p ON o.product_id = p.product_id;
 # ---------------------------------------------------------------------------
 
 def _get_connection() -> psycopg2.extensions.connection:
-    return psycopg2.connect(**DB_CONN_PARAMS)
+    """Connection scoped to this runner's DAG 1 schema (``<BAKEOFF_NS>_dag1``).
+
+    All table names in this module are unqualified; the ``search_path`` keeps
+    them inside the schema so DAG 1's CSV-derived ``orders``/``customers`` never
+    collide with DAG 4's seeded tables of the same name. Self-creating, because
+    the tables here come from whatever CSVs the ZIP happens to contain.
+    """
+    conn = psycopg2.connect(**DB_CONN_PARAMS)
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{BAKEOFF_SCHEMA}"')
+        cur.execute(f'SET search_path TO "{BAKEOFF_SCHEMA}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +238,8 @@ unzip_file = PythonOperator(
 load_csv_to_postgres = PythonOperator.partial(
     task_id="load_csv_to_postgres",
     python_callable=load_csv_to_postgres_fn,
+    # Spec cap: at most 10 CSVs loading at once (README.md DAG 1 step 2).
+    max_active_tis_per_dag=10,
     dag=dag,
 ).expand(
     op_kwargs=unzip_file.output.map(lambda path: {"csv_path": path}),

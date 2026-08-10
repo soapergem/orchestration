@@ -25,8 +25,44 @@ spec:
         value: "5"
       - name: poll-max-attempts
         value: "24"
+      # Only used for standalone submission: via templateRef this resolves
+      # against the calling workflow, which defines its own bakeoff-ns.
+      - name: bakeoff-ns
+        value: "argo"
   templates:
+    # Everything this template needs arrives as an INPUT, not as
+    # {{workflow.parameters.*}}. That distinction is load-bearing: when a
+    # WorkflowTemplate is invoked through templateRef, `workflow.parameters`
+    # resolves against the CALLING workflow, and this template's own
+    # spec.arguments defaults are ignored entirely. Referencing a workflow
+    # parameter the caller happens not to define fails the whole run at
+    # submission with a "failed to resolve" error naming the parameter -- Argo
+    # validates the entire call tree up front, so it never even starts.
+    # Inputs with defaults keep the template self-contained either way.
     - name: manager-approval
+      inputs:
+        parameters:
+          - name: order-id
+          - name: customer-id
+          - name: total-amount
+          - name: items
+          - name: approval-service-url
+            value: "http://approval-service:8091"
+          - name: poll-interval-seconds
+            value: "5"
+          - name: poll-max-attempts
+            value: "24"
+      # A dag/steps template does NOT expose its children's outputs
+      # automatically -- it has to re-export them. Without this, the caller's
+      # {{steps.run-approval.outputs.parameters.final-decision}} fails to
+      # resolve and the whole workflow is rejected at submission. Note the
+      # `parameter:` form (not `path:`): the value is lifted from a child task,
+      # not read from a file in this template's own container.
+      outputs:
+        parameters:
+          - name: final-decision
+            valueFrom:
+              parameter: "{{tasks.record-decision.outputs.parameters.final-decision}}"
       dag:
         tasks:
           - name: request-approval
@@ -34,13 +70,15 @@ spec:
             arguments:
               parameters:
                 - name: order-id
-                  value: "{{workflow.parameters.order-id}}"
+                  value: "{{inputs.parameters.order-id}}"
                 - name: customer-id
-                  value: "{{workflow.parameters.customer-id}}"
+                  value: "{{inputs.parameters.customer-id}}"
                 - name: total-amount
-                  value: "{{workflow.parameters.total-amount}}"
+                  value: "{{inputs.parameters.total-amount}}"
                 - name: items
-                  value: "{{workflow.parameters.items}}"
+                  value: "{{inputs.parameters.items}}"
+                - name: approval-service-url
+                  value: "{{inputs.parameters.approval-service-url}}"
 
           - name: poll-approval-status
             template: poll-approval-status
@@ -51,7 +89,13 @@ spec:
                 - name: approval-request-id
                   value: "{{tasks.request-approval.outputs.parameters.approval-request-id}}"
                 - name: order-id
-                  value: "{{workflow.parameters.order-id}}"
+                  value: "{{inputs.parameters.order-id}}"
+                - name: approval-service-url
+                  value: "{{inputs.parameters.approval-service-url}}"
+                - name: poll-interval-seconds
+                  value: "{{inputs.parameters.poll-interval-seconds}}"
+                - name: poll-max-attempts
+                  value: "{{inputs.parameters.poll-max-attempts}}"
 
           - name: record-decision
             template: record-decision
@@ -62,7 +106,11 @@ spec:
                 - name: decision-result
                   value: "{{tasks.poll-approval-status.outputs.parameters.decision-result}}"
                 - name: order-id
-                  value: "{{workflow.parameters.order-id}}"
+                  value: "{{inputs.parameters.order-id}}"
+                - name: approval-request-id
+                  value: "{{tasks.request-approval.outputs.parameters.approval-request-id}}"
+                - name: total-amount
+                  value: "{{inputs.parameters.total-amount}}"
 
     # ---------- Step 1: Submit Approval Request ----------
     - name: request-approval
@@ -72,6 +120,7 @@ spec:
           - name: customer-id
           - name: total-amount
           - name: items
+          - name: approval-service-url
       outputs:
         parameters:
           - name: approval-request-id
@@ -91,7 +140,7 @@ spec:
           customer_id = "{{inputs.parameters.customer-id}}"
           total_amount = float("{{inputs.parameters.total-amount}}")
           items = json.loads('''{{inputs.parameters.items}}''')
-          approval_service_url = "{{workflow.parameters.approval-service-url}}"
+          approval_service_url = "{{inputs.parameters.approval-service-url}}"
 
           approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
 
@@ -99,15 +148,29 @@ spec:
               f"{item['quantity']}x {item['sku']}" for item in items
           )
 
-          # In production, the callback_url would point to the Argo API:
-          #   https://<argo-server>/api/v1/workflows/<namespace>/<workflow-name>/resume
-          # For the bake-off, we omit callback_url and use polling instead.
+          # The approval service is a resume BROKER (RUNNING.md 2b): it requires a
+          # provider plus a resume handle, and its model validator rejects a
+          # registration it cannot classify with "cannot infer provider" -- a 422
+          # that fails this step. Omitting callback_url is therefore not an option
+          # any more, even though this implementation polls.
+          #
+          # So register http_callback with a deliberately dead URL. Polling is
+          # what actually advances the workflow: _apply_decision() records the
+          # decision BEFORE dispatching the resume, and the auto-decider swallows
+          # dispatch failures, so `status` still flips to approved/rejected and the
+          # next poll sees it. Consequence to expect: a manual POST /decide returns
+          # 500 because the resume leg fails. That is cosmetic -- the decision is
+          # still recorded. In production this URL would be the real Argo resume
+          # endpoint (PUT /api/v1/workflows/<ns>/<name>/resume) paired with a
+          # suspend node instead of the poll loop.
           payload = json.dumps({
               "approval_request_id": approval_request_id,
               "order_id": order_id,
               "total_amount": total_amount,
               "customer_id": customer_id,
               "items_summary": items_summary,
+              "provider": "http_callback",
+              "resume_data": {"callback_url": "http://unused.invalid/argo-polls-instead"},
           }).encode("utf-8")
 
           req = urllib.request.Request(
@@ -143,6 +206,9 @@ spec:
         parameters:
           - name: approval-request-id
           - name: order-id
+          - name: approval-service-url
+          - name: poll-interval-seconds
+          - name: poll-max-attempts
       outputs:
         parameters:
           - name: decision-result
@@ -159,9 +225,9 @@ spec:
 
           approval_request_id = "{{inputs.parameters.approval-request-id}}"
           order_id = "{{inputs.parameters.order-id}}"
-          approval_service_url = "{{workflow.parameters.approval-service-url}}"
-          poll_interval = int("{{workflow.parameters.poll-interval-seconds}}")
-          max_attempts = int("{{workflow.parameters.poll-max-attempts}}")
+          approval_service_url = "{{inputs.parameters.approval-service-url}}"
+          poll_interval = int("{{inputs.parameters.poll-interval-seconds}}")
+          max_attempts = int("{{inputs.parameters.poll-max-attempts}}")
 
           print(f"Polling approval status for {approval_request_id}")
 
@@ -230,7 +296,11 @@ spec:
           }
           with open("/tmp/decision-result.json", "w") as f:
               json.dump(result, f)
-        activeDeadlineSeconds: 180
+      # Template-level field, NOT a `script:` field -- nesting it under `script`
+      # is rejected outright by the API server with a strict-decoding error
+      # ("unknown field spec.templates[2].script.activeDeadlineSeconds"), so the
+      # whole WorkflowTemplate fails to register.
+      activeDeadlineSeconds: 180
 
     # ---------- Step 3: Record Decision in Database ----------
     - name: record-decision
@@ -238,6 +308,8 @@ spec:
         parameters:
           - name: decision-result
           - name: order-id
+          - name: approval-request-id
+          - name: total-amount
       outputs:
         parameters:
           - name: final-decision
@@ -263,6 +335,8 @@ spec:
 
           decision_data = json.loads('''{{inputs.parameters.decision-result}}''')
           order_id = "{{inputs.parameters.order-id}}"
+          approval_request_id = "{{inputs.parameters.approval-request-id}}"
+          total_amount = float("{{inputs.parameters.total-amount}}")
 
           decision = decision_data.get("decision", "unknown")
           approver = decision_data.get("approver")
@@ -276,9 +350,52 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded customers/inventory, so it is NOT
+          # self-creating. Check it up front: SET search_path to a missing schema
+          # succeeds silently and every later query then fails with
+          # "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag4"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
               now = datetime.now(timezone.utc)
+
+              # Persist the approval itself, not just its effect on the order.
+              # Every other implementation in this bake-off writes this table, and
+              # keeping them behaviourally equivalent is the point of the exercise.
+              # Upsert rather than plain INSERT: unlike the polling-free tools,
+              # this step is the FIRST place Argo touches the DB for an approval,
+              # so no 'pending' row exists yet. (Divergence worth noting: Prefect
+              # et al. write a pending row at submit time, so a mid-flight observer
+              # can see an undecided approval in the DB; Argo cannot.)
+              cur.execute(
+                  """
+                  INSERT INTO approval_requests
+                      (approval_request_id, order_id, total_amount, status,
+                       approver, reason, decided_at)
+                  VALUES (%s, %s, %s, %s, %s, %s, %s)
+                  ON CONFLICT (approval_request_id) DO UPDATE
+                     SET status = EXCLUDED.status,
+                         approver = EXCLUDED.approver,
+                         reason = EXCLUDED.reason,
+                         decided_at = EXCLUDED.decided_at
+                  """,
+                  (approval_request_id, order_id, total_amount, decision,
+                   approver, reason, now),
+              )
 
               if order_id:
                   new_status = "approved" if decision == "approved" else "rejected"
@@ -302,6 +419,8 @@ spec:
               conn.close()
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT

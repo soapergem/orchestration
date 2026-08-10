@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.fixture.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.fixture.name }}
+spec:
+  replicas: {{ .Values.fixture.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.fixture.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.fixture.name }}
+    spec:
+      {{- if .Values.image.pullSecretName }}
+      imagePullSecrets:
+      - name: {{ .Values.image.pullSecretName }}
+      {{- end }}
+      containers:
+      - name: fixture
+        image: {{ .Values.fixture.repository }}:{{ .Values.fixture.tag }}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: {{ .Values.fixture.port }}
+        env:
+        # DAG 2's fan-out width when a caller doesn't pass ?per_page.
+        - name: FIXTURE_DEFAULT_PER_PAGE
+          value: {{ .Values.fixture.defaultPerPage | quote }}
+        {{- if .Values.fixture.booksUrl }}
+        # The Open Library corpus, fetched once on boot into an in-pod cache.
+        # Without it /health returns 503 and readiness never passes.
+        - name: FIXTURE_BOOKS_URL
+          value: {{ .Values.fixture.booksUrl | quote }}
+        {{- end }}
+        {{- if .Values.fixture.sampleZipUrl }}
+        # DAG 1's archive. Best-effort: a failure is logged and surfaced by
+        # /health, and never blocks DAG 2.
+        - name: FIXTURE_SAMPLE_ZIP_URL
+          value: {{ .Values.fixture.sampleZipUrl | quote }}
+        {{- end }}
+        {{- $urls := printf "%s%s" .Values.fixture.booksUrl .Values.fixture.sampleZipUrl }}
+        {{- if $urls }}
+        - name: AWS_REGION
+          value: {{ .Values.aws.region | quote }}
+        {{- if and .Values.fixture.s3SecretName (contains "s3://" $urls) }}
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.fixture.s3SecretName }}
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.fixture.s3SecretName }}
+              key: AWS_SECRET_ACCESS_KEY
+        {{- end }}
+        {{- end }}
+        {{- if .Values.fixture.baseUrl }}
+        # Only needed when the caller that fetches /books and the caller that
+        # fetches the per-item details are on different networks. In-cluster both
+        # legs resolve `fixture-service`, so this is normally left empty and the
+        # detail URLs are derived from each request.
+        - name: FIXTURE_BASE_URL
+          value: {{ .Values.fixture.baseUrl | quote }}
+        {{- end }}
+        # Read-only data service: no database, no resume duties. Its only AWS use
+        # is a one-shot S3 GET on boot for DAG 1's archive.
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.fixture.port }}
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 512Mi
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.fixture.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.fixture.name }}
+spec:
+  ports:
+  - name: http
+    port: {{ .Values.fixture.port }}
+    targetPort: {{ .Values.fixture.port }}
+  selector:
+    app: {{ .Values.fixture.name }}

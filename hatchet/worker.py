@@ -18,10 +18,9 @@ Environment variables:
     CALLBACK_FETCH_SERVICE_URL -- default: http://callback-fetch-service:8090
     APPROVAL_SERVICE_URL    -- default: http://approval-service:8091
     SHIPPING_SERVICE_URL    -- default: http://shipping-service:8092
-    HATCHET_EVENT_API_URL   -- default: http://localhost:8080/api/v1/events
+    HATCHET_EVENT_RELAY_URL -- default: http://host.containers.internal:8096
+                               (event_relay.py, as a mock-service container sees it)
 """
-
-from hatchet_sdk import Hatchet
 
 from dag1_csv_etl import csv_etl_wf, load_csv_wf
 from dag2_api_fanout import api_fanout_wf, fetch_item_detail_wf
@@ -32,32 +31,39 @@ from dag4_order_fulfillment import (
     reserve_inventory_wf,
     ship_order_wf,
 )
+from hatchet_sdk import Hatchet
+
+WORKFLOWS = [
+    # DAG 1: CSV ETL Pipeline
+    csv_etl_wf,
+    load_csv_wf,
+    # DAG 2: API Fan-Out with Async Callback
+    api_fanout_wf,
+    fetch_item_detail_wf,
+    # DAG 3: Payment Processing
+    payment_wf,
+    # DAG 4: Order Fulfillment
+    order_fulfillment_wf,
+    reserve_inventory_wf,
+    manager_approval_wf,
+    ship_order_wf,
+]
 
 
 def main():
     hatchet = Hatchet()
 
+    # The workflows MUST be passed to `worker()` rather than registered after
+    # the fact: the SDK derives required slot types from this list, and a
+    # durable task with no DURABLE slot is simply never dispatched -- DAG 2 and
+    # DAG 4 hang at their event wait with no error anywhere. `durable_slots` is
+    # also set explicitly so the requirement survives a refactor of the list.
     worker = hatchet.worker(
         "orchestration-bakeoff-worker",
         slots=40,
+        durable_slots=100,
+        workflows=WORKFLOWS,
     )
-
-    # DAG 1: CSV ETL Pipeline
-    worker.register_workflow(csv_etl_wf)
-    worker.register_workflow(load_csv_wf)
-
-    # DAG 2: API Fan-Out with Async Callback
-    worker.register_workflow(api_fanout_wf)
-    worker.register_workflow(fetch_item_detail_wf)
-
-    # DAG 3: Payment Processing
-    worker.register_workflow(payment_wf)
-
-    # DAG 4: Order Fulfillment
-    worker.register_workflow(order_fulfillment_wf)
-    worker.register_workflow(reserve_inventory_wf)
-    worker.register_workflow(manager_approval_wf)
-    worker.register_workflow(ship_order_wf)
 
     print("Starting Hatchet worker with workflows:")
     print("  - CSVETLPipeline + LoadCSVToPostgres")

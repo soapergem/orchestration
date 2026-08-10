@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 from enum import Enum
 
 import boto3
+import google.auth
+import google.auth.transport.requests
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 app = FastAPI(title="Callback Fetch Service")
@@ -16,8 +18,6 @@ app = FastAPI(title="Callback Fetch Service")
 
 class Settings(BaseSettings):
     """Service configuration, sourced from environment variables."""
-
-    model_config = SettingsConfigDict(case_sensitive=False)
 
     fetch_delay_min_seconds: int = 2
     fetch_delay_max_seconds: int = 10
@@ -30,6 +30,21 @@ class Settings(BaseSettings):
     aws_region: str | None = Field(
         default=None, validation_alias=AliasChoices("AWS_REGION", "AWS_DEFAULT_REGION")
     )
+    # Kestra resume credentials. Unlike Step Functions -- where the task token is
+    # itself the handle -- Kestra's execution id is only an identifier, so the
+    # resume call needs separate credentials. Kestra OSS has no service accounts
+    # or API tokens (Enterprise only) and basic auth is mandatory since 0.24.0,
+    # so this is necessarily the single shared admin account.
+    kestra_url: str = "http://kestra:8080"
+    kestra_tenant: str = "main"
+    kestra_user: str | None = None
+    kestra_password: SecretStr | None = None
+    # Conductor needs no credentials at all: OSS ships with authentication
+    # entirely absent, so any caller that can reach the API can complete any
+    # task. Convenient here, disqualifying in production.
+    conductor_url: str = "http://conductor-server:8080"
+
+    model_config = SettingsConfigDict(case_sensitive=False)
 
 
 settings = Settings()
@@ -46,6 +61,9 @@ class Provider(str, Enum):
 
     stepfunctions = "stepfunctions"  # resume_data: {task_token, region?}
     http_callback = "http_callback"  # resume_data: {callback_url}
+    kestra = "kestra"  # resume_data: {execution_id, tenant?}
+    conductor = "conductor"  # resume_data: {workflow_id, task_ref_name, base_url?}
+    google_workflows = "google_workflows"  # resume_data: {callback_url}, needs a GCP token
 
 
 class FetchRequest(BaseModel):
@@ -71,12 +89,16 @@ class FetchRequest(BaseModel):
         if self.provider is None:
             if self.resume_data.get("task_token"):
                 self.provider = Provider.stepfunctions
+            elif self.resume_data.get("execution_id"):
+                self.provider = Provider.kestra
+            elif self.resume_data.get("workflow_id"):
+                self.provider = Provider.conductor
             elif self.resume_data.get("callback_url"):
                 self.provider = Provider.http_callback
             else:
                 raise ValueError(
                     "cannot infer provider: supply `provider` or a resume_data "
-                    "with task_token / callback_url"
+                    "with task_token / execution_id / workflow_id / callback_url"
                 )
         return self
 
@@ -161,6 +183,120 @@ async def _fetch_then_maybe_resume(
         pass
 
 
+async def _resume_kestra(resume_data: dict, payload: dict) -> dict:
+    """Resume a paused Kestra execution.
+
+    Kestra's resume endpoint is fussy in two ways that no generic webhook sender
+    satisfies: it requires authentication (401 otherwise) and accepts only
+    multipart/form-data (415 on JSON). The form field name must match an input
+    declared in the flow's Pause task ``onResume`` block.
+    """
+    execution_id = resume_data.get("execution_id")
+    if not execution_id:
+        raise HTTPException(400, "resume_data missing execution_id")
+    if not settings.kestra_user or not settings.kestra_password:
+        raise HTTPException(500, "KESTRA_USER / KESTRA_PASSWORD are not configured")
+
+    tenant = resume_data.get("tenant") or settings.kestra_tenant
+    field = resume_data.get("on_resume_field", "payload")
+    url = (
+        f"{settings.kestra_url.rstrip('/')}/api/v1/{tenant}"
+        f"/executions/{execution_id}/resume"
+    )
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            url,
+            # files=, not data=: httpx sends data= as urlencoded, which Kestra
+            # rejects with 415. A (None, value) tuple is a plain multipart field.
+            files={field: (None, json.dumps(payload))},
+            auth=(settings.kestra_user, settings.kestra_password.get_secret_value()),
+        )
+    return {"action": "kestra_resume", "callback_status": resp.status_code}
+
+
+async def _resume_conductor(resume_data: dict, payload: dict, ok: bool) -> dict:
+    """Complete a blocked Conductor WAIT task by workflow id + task reference name.
+
+    ``POST /api/tasks/{workflowId}/{taskRefName}/{status}`` with the task output
+    as the JSON body. Verified against TaskResource.java in 3.31.0 -- note this
+    is NOT the ``/api/queue/update/...`` path that older Conductor docs and
+    blog posts still give, which 404s on current servers.
+
+    Unlike Kestra this needs no credentials, because Conductor OSS has no
+    authentication to satisfy. The endpoint ``produces=text/plain``, so the
+    response body is a bare task id string rather than JSON.
+    """
+    workflow_id = resume_data.get("workflow_id")
+    task_ref_name = resume_data.get("task_ref_name")
+    if not workflow_id or not task_ref_name:
+        raise HTTPException(400, "resume_data missing workflow_id / task_ref_name")
+
+    base = (resume_data.get("base_url") or settings.conductor_url).rstrip("/")
+    status = "COMPLETED" if ok else "FAILED"
+    url = f"{base}/api/tasks/{workflow_id}/{task_ref_name}/{status}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(url, json=payload)
+    return {
+        "action": "conductor_task_update",
+        "task_status": status,
+        "callback_status": resp.status_code,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Google Workflows resume support
+# ---------------------------------------------------------------------------
+
+_google_creds = None
+
+
+def _google_access_token() -> str:
+    """Mint an OAuth2 access token for resuming a Google Workflows execution.
+
+    A callback endpoint minted by ``events.create_callback_endpoint`` lives on
+    workflowexecutions.googleapis.com, so the POST must carry a Google *access*
+    token (scope cloud-platform) -- not an OIDC ID token, which is what callers
+    of a private Cloud Run service use. Sending the wrong kind yields an opaque
+    401.
+
+    Credentials come from GOOGLE_APPLICATION_CREDENTIALS / ADC, so on GKE or
+    Cloud Run this needs no key file; off-GCP (this repo's K3s/OCI clusters) it
+    is the mounted service-account key.
+    """
+    global _google_creds
+    if _google_creds is None:
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        _google_creds = creds
+    if not _google_creds.valid:
+        _google_creds.refresh(google.auth.transport.requests.Request())
+    return _google_creds.token
+
+
+async def _resume_google_workflows(resume_data: dict, payload: dict) -> dict:
+    callback_url = resume_data.get("callback_url")
+    if not callback_url:
+        raise HTTPException(400, "resume_data missing callback_url")
+    try:
+        token = _google_access_token()
+    except Exception as exc:
+        # No credentials on this deployment. Say so plainly -- the workflow will
+        # otherwise just sit suspended until its own timeout fires.
+        raise HTTPException(
+            500,
+            "google_workflows resume needs application default credentials "
+            f"(mount a service-account key): {exc}",
+        ) from exc
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            callback_url,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    return {"action": "google_workflows", "callback_status": resp.status_code}
+
+
 async def _dispatch_resume(record: FetchRecord) -> dict:
     """Perform the provider-specific resume using the cached result."""
     payload = _result_payload(record)
@@ -186,6 +322,17 @@ async def _dispatch_resume(record: FetchRecord) -> dict:
         # boto3 is synchronous -- keep it off the event loop.
         action = await asyncio.to_thread(_resume)
         return {"action": action}
+
+    if record.provider == Provider.kestra:
+        return await _resume_kestra(record.resume_data, payload)
+
+    if record.provider == Provider.conductor:
+        return await _resume_conductor(
+            record.resume_data, payload, record.status == RequestStatus.completed
+        )
+
+    if record.provider == Provider.google_workflows:
+        return await _resume_google_workflows(record.resume_data, payload)
 
     if record.provider == Provider.http_callback:
         callback_url = record.resume_data.get("callback_url")

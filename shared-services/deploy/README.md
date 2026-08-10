@@ -6,7 +6,7 @@ the `orchestrators` namespace on K3s, pulling per-service arm64 images from ECR.
 using a dedicated IAM user's credentials; `shipping` needs no AWS access.
 
 Ingress + TLS are included (Traefik + cert-manager), so the services are
-reachable over HTTPS at `orch-*.gemovationlabs.com` — the hostnames the SFN
+reachable over HTTPS at `orch-*.example.com` — the hostnames the SFN
 lambdas call.
 
 ## Prerequisites
@@ -75,9 +75,9 @@ exact hosts:
 
 | Service | Host | Service port |
 |---|---|---|
-| callback-fetch | `orch-callback-fetch.gemovationlabs.com` | 8090 |
-| approval | `orch-approval.gemovationlabs.com` | 8091 |
-| shipping | `orch-shipping.gemovationlabs.com` | 8092 |
+| callback-fetch | `orch-callback-fetch.example.com` | 8090 |
+| approval | `orch-approval.example.com` | 8091 |
+| shipping | `orch-shipping.example.com` | 8092 |
 
 cert-manager issues a per-host TLS cert (`<service>-tls`) once DNS resolves.
 

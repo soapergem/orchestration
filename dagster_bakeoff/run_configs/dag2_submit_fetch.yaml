@@ -1,0 +1,9 @@
+ops:
+  submit_async_fetch:
+    config:
+      # fixture-service's Books API (RUNNING.md 0b). The collection is fetched
+      # by callback-fetch-service (a container), so the host is the compose DNS
+      # name; ?base= rewrites the per-item detail URLs for Dagster's host-run
+      # fan-out, which cannot resolve `fixture-service`.
+      url: http://fixture-service:8099/books?base=http://localhost:8099
+      api_key: ""

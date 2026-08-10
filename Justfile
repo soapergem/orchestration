@@ -3,23 +3,119 @@
 container_runner := env("CONTAINER_RUNNER", `if command -v finch >/dev/null 2>&1; then echo finch; elif command -v podman >/dev/null 2>&1; then echo podman; else echo docker; fi`)
 compose := container_runner + " compose -f shared-services/docker-compose.yml"
 
+# Docker-compatible Engine API socket, for Kestra's DOCKER task runner.
+#
+# Load-bearing, not a nicety: kestra mounts `${CONTAINER_SOCK:-/var/run/docker.sock}`,
+# and under Podman that default path does not exist, so the container cannot be
+# created at all. podman-compose reports this as the thoroughly unhelpful
+# `no container with name or ID "shared-services_kestra_1" found`. Auto-detecting
+# it means `just up kestra` and `just up-all` work without remembering to export
+# anything. Needs `systemctl --user enable --now podman.socket` once.
+container_sock := env("CONTAINER_SOCK", `if [ -S /var/run/docker.sock ]; then echo /var/run/docker.sock; elif [ -S "/run/user/$(id -u)/podman/podman.sock" ]; then echo "/run/user/$(id -u)/podman/podman.sock"; else echo /var/run/docker.sock; fi`)
+
+# Every engine profile in docker-compose.yml, for the teardown recipes.
+#
+# Compose only acts on services whose profile is ACTIVE, and all four engines sit
+# behind a `profiles:` key. A bare `down` therefore removes the backbone and
+# silently leaves temporal/hatchet/kestra/conductor running, still holding their
+# host ports -- and because those containers stay attached to the pod and
+# network, the NEXT `up` fails with "network is being used" and "container name
+# is already in use". Neither `--profile '*'` nor COMPOSE_PROFILES works under
+# podman-compose (both verified 2026-08-09), so the list has to be explicit.
+#
+# ADD NEW ENGINES HERE when you add a profile to docker-compose.yml.
+all_profiles := "--profile temporal --profile hatchet --profile kestra --profile conductor"
+
+# The engine SERVERS that `up-all` starts, named explicitly.
+#
+# Deliberately an allowlist rather than "everything in these profiles", because
+# the temporal and hatchet profiles each also contain a containerised *worker*
+# sidecar, and starting those is actively harmful: a container worker and a host
+# worker poll the SAME task queue, so runs get silently split between two
+# processes running different code (CLAUDE.md flags this for Temporal).
+# hatchet-worker additionally needs HATCHET_CLIENT_TOKEN, which has no default
+# and is minted at runtime, and both are `build:` services.
+#
+# `--scale temporal-worker=0` was tried first and does NOT reliably suppress a
+# service here (podman-compose started it anyway, 2026-08-09) -- naming the
+# services is the only form that held. ADD NEW ENGINE SERVERS HERE.
+all_engines := "temporal temporal-ui hatchet-engine kestra conductor-server"
+
+# The profile-less backbone, spelled out so `up-all` can be ONE compose command.
+# Doing it as two (`up -d` then `up -d <engines>`) makes the second invocation
+# try to recreate postgres -- which is already running from the first -- and it
+# fails with "container name is already in use" / "has dependent containers",
+# plus a "no such container" line per engine. Harmless but alarming; one
+# invocation is silent.
+backbone := "postgres callback-fetch-service approval-service shipping-service fixture-service"
+
 default:
     @just --list | grep -v "^    default$"
 
-# Start the shared backbone (postgres + mock services). Pass an engine profile
-# to also start it, e.g. `just up temporal` / `just up hatchet` / `just up kestra`.
-up profile="":
-    {{ compose }} {{ if profile == "" { "" } else { "--profile " + profile } }} up -d
+# Only ONE profile can be passed, and it must be one defined in
+# docker-compose.yml (temporal|hatchet|kestra|conductor). Use `up-all` for every
+# engine at once -- they no longer contend for host ports (RUNNING.md §0).
 
-# Stop the shared services. Pass the same profile you started with to stop it too.
+# Start the backbone (postgres + mocks); pass a profile to add one engine.
+up profile="":
+    CONTAINER_SOCK="{{ container_sock }}" {{ compose }} {{ if profile == "" { "" } else { "--profile " + profile } }} up -d
+
+# Every engine at once. Viable because the §0 port map gives each one its own
+# host port -- verified no collisions across all four profiles. Costs ~2 JVMs
+# (Kestra, Conductor) plus Temporal and Hatchet, so it is heavier than the
+# one-at-a-time default; use `just up <profile>` if you only need one.
+#
+# Does NOT start the two worker sidecars -- see `all_engines` above. Run each
+# tool's worker on the host as RUNNING.md describes.
+
+# Start the backbone + ALL engines (no worker sidecars).
+up-all:
+    CONTAINER_SOCK="{{ container_sock }}" {{ compose }} {{ all_profiles }} up -d {{ backbone }} {{ all_engines }}
+
+# Pass the same profile you started with, or the engine survives this. `just
+# down-all` is the version that does not require remembering.
+
+# Stop the backbone; pass a profile to stop that engine too.
 down profile="":
     {{ compose }} {{ if profile == "" { "" } else { "--profile " + profile } }} down
 
+# Stop everything including all engines -- no need to recall the profile.
+down-all:
+    {{ compose }} {{ all_profiles }} down
+
+# Deletes the pgdata and kestra-data volumes. Uses all_profiles for the same
+# reason down-all does: otherwise it removes the volumes out from under engines
+# that are still running, which is how you get a wedged Kestra.
+
 # Stop everything and delete volumes (postgres data, kestra storage).
 down-clean:
-    {{ compose }} down -v
+    {{ compose }} {{ all_profiles }} down -v
+
+# `just up` does NOT rebuild, so run this after editing anything under
+# shared-services/*/app.py -- otherwise you are testing against a stale image.
+
+# Rebuild the mock-service images and restart them.
+rebuild:
+    {{ compose }} build
+    {{ compose }} up -d --force-recreate \
+      callback-fetch-service approval-service shipping-service
 
 # Follow logs for the running services.
 logs:
     {{ compose }} logs -f
 
+# init-db.sql only runs on a FRESH pgdata volume, so this (re)loads it from the
+# path it's mounted at before onboarding the runner. Idempotent.
+
+# Create a runner's per-DAG schemas + seed fixtures, e.g. `just seed prefect`.
+seed runner:
+    {{ compose }} exec -T postgres \
+      psql -q -U orchestration -d orchestration \
+      -f /docker-entrypoint-initdb.d/00-init-db.sql
+    {{ compose }} exec -T postgres \
+      psql -U orchestration -d orchestration \
+      -c "SELECT bootstrap_bakeoff('{{ runner }}');"
+
+# Open a psql shell against the bake-off database.
+psql:
+    {{ compose }} exec postgres psql -U orchestration -d orchestration

@@ -18,11 +18,22 @@ inputs:
     description: JSON array of items with sku, quantity, and unit_price
 
 variables:
+  task_network: shared-services_default
   pg_host: postgres
   pg_port: "5432"
   pg_database: orchestration
   pg_user: orchestration
   pg_password: orchestration
+  pg_schema: kestra_dag4
+
+pluginDefaults:
+  # Task-runner containers are siblings of the Kestra container, so they must be
+  # placed on the compose network for `postgres` / the mock services to resolve.
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: "{{ vars.task_network }}"
 
 tasks:
   - id: reserve_items
@@ -37,7 +48,11 @@ tasks:
       interval: PT2S
       maxInterval: PT30S
     beforeCommands:
-      - pip install psycopg2-binary
+      - pip install kestra psycopg2-binary
+    # Passed as files, not interpolated: JSON escapes `"` as \" and Python's
+    # triple-quoted literals process backslashes, corrupting the JSON.
+    inputFiles:
+      items.json: "{{ inputs.items }}"
     script: |
       import json
       import uuid
@@ -47,7 +62,8 @@ tasks:
 
       order_id = "{{ inputs.order_id }}"
       customer_id = "{{ inputs.customer_id }}"
-      items = json.loads("""{{ inputs.items }}""")
+      with open("items.json") as f:
+          items = json.load(f)
 
       reservation_id = f"RES-{uuid.uuid4().hex[:12].upper()}"
 
@@ -57,6 +73,7 @@ tasks:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
 
       from kestra import Kestra
@@ -78,6 +95,20 @@ tasks:
                   "idempotent": True,
               })
           else:
+              # The order row must exist FIRST: inventory_reservations.order_id
+              # is a FK to orders(order_id), so inserting reservations before the
+              # parent row is a ForeignKeyViolation. (Latent until DAG 4 moved off
+              # the legacy public tables, which lacked this constraint.)
+              total = sum(i["quantity"] * i["unit_price"] for i in items)
+              cur.execute(
+                  """
+                  INSERT INTO orders (order_id, customer_id, total_amount, status)
+                  VALUES (%s, %s, %s, 'reserved')
+                  ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+                  """,
+                  (order_id, customer_id, total),
+              )
+
               items_reserved = []
               for item in items:
                   sku = item["sku"]
@@ -106,17 +137,6 @@ tasks:
                   )
                   items_reserved.append(sku)
 
-              # Create the order record
-              total = sum(i["quantity"] * i["unit_price"] for i in items)
-              cur.execute(
-                  """
-                  INSERT INTO orders (order_id, customer_id, total_amount, status)
-                  VALUES (%s, %s, %s, 'reserved')
-                  ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
-                  """,
-                  (order_id, customer_id, total),
-              )
-
               conn.commit()
 
               Kestra.outputs({
@@ -130,3 +150,15 @@ tasks:
           raise
       finally:
           conn.close()
+
+# Flow-level outputs: a parent Subflow task cannot reach inner task outputs.
+outputs:
+  - id: reservation_id
+    type: STRING
+    value: "{{ outputs.reserve_items.vars.reservation_id ?? '' }}"
+  - id: items_reserved
+    type: STRING
+    value: "{{ outputs.reserve_items.vars.items_reserved ?? '' }}"
+  - id: reserved_at
+    type: STRING
+    value: "{{ outputs.reserve_items.vars.reserved_at ?? '' }}"

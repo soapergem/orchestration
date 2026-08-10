@@ -34,11 +34,11 @@ import os
 import zipfile
 from pathlib import Path
 
-import luigi
 import psycopg2
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+import luigi
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -75,15 +75,29 @@ JOIN products p ON o.product_id = p.product_id;
 """
 
 
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "luigi")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag1"
+
+
 def get_db_connection():
-    """Get a Postgres connection using the shared DB_CONFIG."""
-    return psycopg2.connect(
+    """Connection scoped to this runner's DAG 1 schema.
+
+    DAG 1's tables are derived from the CSVs, so the schema is self-creating --
+    unlike DAG 3/4, whose schemas hold seeded fixtures and therefore fail fast.
+    """
+    conn = psycopg2.connect(
         host=DB_CONFIG["host"],
         port=DB_CONFIG["port"],
         database=DB_CONFIG["database"],
         user=DB_CONFIG["user"],
         password=DB_CONFIG["password"],
     )
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{BAKEOFF_SCHEMA}"')
+        cur.execute(f'SET search_path TO "{BAKEOFF_SCHEMA}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------

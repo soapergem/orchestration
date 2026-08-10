@@ -40,6 +40,16 @@ spec:
             name: {{ .Values.shipping.name }}
             port:
               number: {{ .Values.shipping.port }}
+  - host: {{ .Values.fixture.domain }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Values.fixture.name }}
+            port:
+              number: {{ .Values.fixture.port }}
   tls:
   - hosts:
     - {{ .Values.callbackFetch.domain }}
@@ -50,4 +60,7 @@ spec:
   - hosts:
     - {{ .Values.shipping.domain }}
     secretName: {{ .Values.shipping.name }}-tls
+  - hosts:
+    - {{ .Values.fixture.domain }}
+    secretName: {{ .Values.fixture.name }}-tls
 {{- end }}

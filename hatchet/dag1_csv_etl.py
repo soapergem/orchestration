@@ -18,7 +18,6 @@ import zipfile
 from pathlib import Path
 
 import psycopg2
-
 from hatchet_sdk import Context, Hatchet
 
 hatchet = Hatchet()
@@ -35,16 +34,27 @@ DB_CONFIG = {
     "password": os.environ.get("POSTGRES_PASSWORD", "orchestration"),
 }
 
+# Per-(runner, DAG) schema isolation -- see CLAUDE.md. DAG 1 self-creates its
+# schema because every table here comes from the CSVs themselves.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "hatchet")
+SCHEMA = f"{BAKEOFF_NS}_dag1"
+
 
 def get_db_connection(db_config: dict | None = None) -> psycopg2.extensions.connection:
     cfg = db_config or DB_CONFIG
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg.get("port", 5432),
         dbname=cfg.get("dbname", cfg.get("database", "orchestration")),
         user=cfg["user"],
         password=cfg["password"],
     )
+    schema = cfg.get("schema", SCHEMA)
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------

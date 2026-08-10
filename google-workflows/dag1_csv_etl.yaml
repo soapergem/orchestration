@@ -1,12 +1,19 @@
 # CSV ETL Pipeline: Unzip, parallel load to Postgres, SQL transform, convert to Parquet
-# Deploy: gcloud workflows deploy csv-etl-pipeline --source=dag1_csv_etl.yaml
 #
-# Expected input:
+# Deploy: terraform/gcp  (which also uploads test-data/sample-data.zip to the
+# bucket and passes ZIP_URL / GCS_BUCKET as workflow env vars, so an execution
+# needs no manual setup).
+#
+# The `parallel` block over csv_keys is Workflows' fan-out primitive: the branch
+# count comes from a runtime value, which is genuine dynamic parallelism, but note
+# there is no concurrency cap to set -- see the README on the spec's max-10.
+#
+# Expected input (every field optional; env vars supply the defaults):
 # {
-#   "zip_url": "https://storage.googleapis.com/bucket/data.zip",
+#   "zip_url": "gs://<bucket>/input/sample-data.zip",
 #   "extract_prefix": "extracted/",
-#   "db_config": { "host": "postgres", "port": 5432, "database": "orchestration", "user": "orchestration", "password": "orchestration" },
-#   "gcs_bucket": "my-bucket"
+#   "gcs_bucket": "<bucket>",
+#   "db_config": { "host": "...", "port": 5432, "database": "orchestration", "user": "...", "password": "..." }
 # }
 
 main:
@@ -15,18 +22,22 @@ main:
     - init:
         assign:
           - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-          - processing_service_url: "http://processing-service:8080"
-          - db_proxy_url: "http://db-proxy-service:8080"
-          - zip_url: ${input.zip_url}
+          # One Cloud Run service serves both route groups; two names kept so the
+          # parallel with the Step Functions lambdas stays legible.
+          - processing_service_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - db_proxy_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - zip_url: ${default(map.get(input, "zip_url"), sys.get_env("ZIP_URL"))}
           - extract_prefix: ${default(map.get(input, "extract_prefix"), "extracted/")}
           - db_config: ${input.db_config}
-          - gcs_bucket: ${input.gcs_bucket}
+          - gcs_bucket: ${default(map.get(input, "gcs_bucket"), sys.get_env("GCS_BUCKET"))}
 
     - unzip_file:
         try:
           call: http.post
           args:
             url: ${processing_service_url + "/unzip"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -54,10 +65,17 @@ main:
         assign:
           - csv_keys: ${unzip_response.body.csv_keys}
           - s3_bucket: ${unzip_response.body.gcs_bucket}
+          # A `shared:` variable must already exist -- declaring one that was
+          # never assigned fails at deploy time with "symbol is not a variable
+          # name". Nothing wrote to it either, so every branch's row count was
+          # being thrown away.
+          - load_results: []
 
     - process_csvs:
         try:
           parallel:
+            # Spec cap (README.md).
+            concurrency_limit: 10
             shared: [load_results]
             for:
               value: csv_key
@@ -68,6 +86,8 @@ main:
                       call: http.post
                       args:
                         url: ${db_proxy_url + "/load-csv"}
+                        auth:
+                          type: OIDC
                         headers:
                           Content-Type: "application/json"
                         body:
@@ -87,6 +107,9 @@ main:
                         initial_delay: 2
                         max_delay: 64
                         multiplier: 2
+                - collect_load_result:
+                    assign:
+                      - load_results: ${list.concat(load_results, load_result.body)}
         except:
           as: e
           steps:
@@ -100,6 +123,8 @@ main:
           call: http.post
           args:
             url: ${db_proxy_url + "/execute-sql"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -132,6 +157,8 @@ main:
           call: http.post
           args:
             url: ${processing_service_url + "/convert-to-parquet"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -163,6 +190,7 @@ main:
         return:
           status: "completed"
           csv_count: ${len(csv_keys)}
+          loads: ${load_results}
           transform: ${transform_response.body}
           parquet: ${parquet_response.body}
 
@@ -171,13 +199,13 @@ retry_on_server_error:
   steps:
     - check_error:
         switch:
-          - condition: ${e.code == 429}
+          - condition: ${default(map.get(e, "code"), 0) == 429}
             return: true
-          - condition: ${e.code >= 500 and e.code < 600}
+          - condition: ${default(map.get(e, "code"), 0) >= 500 and default(map.get(e, "code"), 0) < 600}
             return: true
-          - condition: ${"ConnectionError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "ConnectionError")}
             return: true
-          - condition: ${"TimeoutError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
             return: true
         next: return_false
     - return_false:

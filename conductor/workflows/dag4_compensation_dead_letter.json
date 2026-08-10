@@ -1,0 +1,32 @@
+{
+  "name": "dag4_compensation_dead_letter",
+  "version": 1,
+  "description": "DAG 4 saga: the compensation itself failed after its retries. Terminal state requiring manual intervention.",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 300,
+  "inputParameters": [
+    "order_id",
+    "reason",
+    "workflowId"
+  ],
+  "tasks": [
+    {
+      "name": "compensation_failed_dead_letter",
+      "taskReferenceName": "dead_letter",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "reason": "compensation failed: ${workflow.input.reason}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "outcome": "compensation_failed",
+    "order_id": "${workflow.input.order_id}",
+    "requires_manual_intervention": true,
+    "failed_compensation_workflow_id": "${workflow.input.workflowId}"
+  }
+}

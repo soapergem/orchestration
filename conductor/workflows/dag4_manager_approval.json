@@ -1,0 +1,54 @@
+{
+  "name": "dag4_manager_approval",
+  "version": 1,
+  "description": "DAG 4 sub-workflow: ManagerApprovalWorkflow. Registers the request, SUSPENDS on a WAIT task, records the decision.",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 600,
+  "inputParameters": [
+    "order_id",
+    "customer_id",
+    "total_amount"
+  ],
+  "tasks": [
+    {
+      "name": "request_manager_approval",
+      "taskReferenceName": "request_approval",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "customer_id": "${workflow.input.customer_id}",
+        "total_amount": "${workflow.input.total_amount}",
+        "workflow_id": "${workflow.workflowId}"
+      }
+    },
+    {
+      "name": "wait_for_approval",
+      "taskReferenceName": "wait_for_approval",
+      "type": "WAIT",
+      "inputParameters": {}
+    },
+    {
+      "name": "record_approval_decision",
+      "taskReferenceName": "record_decision",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "approval_request_id": "${request_approval.output.approval_request_id}",
+        "order_id": "${workflow.input.order_id}",
+        "decision": "${wait_for_approval.output.decision}",
+        "approver": "${wait_for_approval.output.approver}",
+        "reason": "${wait_for_approval.output.reason}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "order_id": "${workflow.input.order_id}",
+    "approval_request_id": "${request_approval.output.approval_request_id}",
+    "decision": "${wait_for_approval.output.decision}",
+    "approver": "${wait_for_approval.output.approver}",
+    "reason": "${wait_for_approval.output.reason}",
+    "duplicate": "${record_decision.output.duplicate}"
+  }
+}

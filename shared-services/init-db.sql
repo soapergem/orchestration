@@ -118,4 +118,8 @@ $fn$ LANGUAGE plpgsql;
 
 -- Runners onboarded at init time (others added as they're tested:
 -- SELECT bootstrap_bakeoff('<runner>');).
+--
+-- NOTE: this file runs ONLY on a fresh pgdata volume. To onboard a runner on an
+-- existing volume, use `just seed <runner>` (or call the function by hand).
 SELECT bootstrap_bakeoff('temporal');
+SELECT bootstrap_bakeoff('prefect');

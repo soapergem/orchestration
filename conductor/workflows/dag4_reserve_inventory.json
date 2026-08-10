@@ -1,0 +1,30 @@
+{
+  "name": "dag4_reserve_inventory",
+  "version": 1,
+  "description": "DAG 4 sub-workflow: InventoryReservationWorkflow. Reserves stock; its compensation is dag4_compensation's release_inventory.",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 300,
+  "inputParameters": [
+    "order_id",
+    "items"
+  ],
+  "tasks": [
+    {
+      "name": "reserve_inventory",
+      "taskReferenceName": "reserve",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "items": "${workflow.input.items}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "order_id": "${workflow.input.order_id}",
+    "reservations": "${reserve.output.reservations}",
+    "reserved_count": "${reserve.output.reserved_count}"
+  }
+}

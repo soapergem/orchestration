@@ -14,7 +14,7 @@ spec:
   arguments:
     parameters:
       - name: url
-        value: "https://api.github.com/orgs/argoproj/repos"
+        value: "http://fixture-service:8099/books"
       - name: api-key
         value: ""
       - name: callback-fetch-service-url
@@ -267,7 +267,7 @@ spec:
               for item in body:
                   items.append({
                       "id": item.get("id"),
-                      "name": item.get("name", item.get("id")),
+                      "name": item.get("title") or item.get("name") or item.get("id"),
                       "detail_url": item.get("url"),
                   })
 

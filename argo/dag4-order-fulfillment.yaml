@@ -17,14 +17,21 @@ spec:
   activeDeadlineSeconds: 600
   arguments:
     parameters:
+      # customer_id and every sku must exist in <bakeoff-ns>_dag4, seeded by
+      # shared-services/init-db.sql: customers CUST-42 / CUST-43 / CUST-99
+      # (inactive), inventory WIDGET-A (100 @ 29.99), GADGET-B (50 @ 499.99),
+      # THING-C (200 @ 9.99), RARE-D (2 @ 1500.00 -- use it for contention).
+      # This default totals 559.97, which clears approval_threshold and so
+      # exercises the manager-approval suspend path. Drop GADGET-B to take the
+      # skip-approval branch instead.
       - name: input
         value: |
           {
             "order_id": "ORD-001",
-            "customer_id": "CUST-001",
+            "customer_id": "CUST-42",
             "items": [
-              {"sku": "SKU-A", "quantity": 2, "unit_price": 29.99},
-              {"sku": "SKU-B", "quantity": 1, "unit_price": 49.99}
+              {"sku": "WIDGET-A", "quantity": 2, "unit_price": 29.99},
+              {"sku": "GADGET-B", "quantity": 1, "unit_price": 499.99}
             ],
             "shipping_address": {
               "street": "123 Main St",
@@ -35,8 +42,31 @@ spec:
             },
             "approval_threshold": 500.00
           }
+      # Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+      # Every step sets search_path to "<bakeoff-ns>_dag4". The sub-workflow
+      # WorkflowTemplates read this same parameter via {{workflow.parameters.*}},
+      # which resolves against the CALLING workflow -- so they must be invoked
+      # from here, not submitted standalone.
+      - name: bakeoff-ns
+        value: "argo"
   templates:
     # ---------- Main DAG ----------
+    #
+    # Every task gates on `depends: X.Succeeded`, never the older
+    # `dependencies:` list. Two reasons, both learned the hard way:
+    #
+    #  1. With `dependencies:`, a SKIPPED dependency still leaves the task
+    #     eligible, so Argo evaluates its `when:` -- and if that expression
+    #     dereferences the skipped task's outputs, the run dies with "unable to
+    #     substitute {{tasks.X.outputs.parameters.Y}}". `depends: X.Succeeded`
+    #     omits the task outright, so the expression is never substituted. Both
+    #     DAG 4 paths hit this in mirror image: the under-threshold path skips
+    #     check-approval-and-approve, and each path skips one ship-* branch.
+    #  2. Argo rejects a DAG template that uses BOTH forms -- "cannot use both
+    #     'depends' and 'dependencies' in the same DAG template" -- so converting
+    #     one task forces converting all of them.
+    #
+    # `when:` survives only where it reads validate-order, which always runs.
     - name: order-fulfillment
       dag:
         tasks:
@@ -45,9 +75,8 @@ spec:
 
           - name: reserve-inventory
             template: reserve-inventory
-            dependencies:
-              - validate-order
             when: "'{{tasks.validate-order.outputs.parameters.is-valid}}' == 'true'"
+            depends: "validate-order.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -59,9 +88,8 @@ spec:
 
           - name: validation-failed
             template: fail-with-message
-            dependencies:
-              - validate-order
             when: "'{{tasks.validate-order.outputs.parameters.is-valid}}' != 'true'"
+            depends: "validate-order.Succeeded"
             arguments:
               parameters:
                 - name: message
@@ -69,10 +97,9 @@ spec:
 
           - name: check-approval-and-approve
             template: manager-approval
-            dependencies:
-              - reserve-inventory
             # Only request approval if total_amount >= approval_threshold
             when: "'{{tasks.validate-order.outputs.parameters.needs-approval}}' == 'true'"
+            depends: "reserve-inventory.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -86,9 +113,8 @@ spec:
 
           - name: ship-order-after-approval
             template: call-shipping-api
-            dependencies:
-              - check-approval-and-approve
             when: "'{{tasks.check-approval-and-approve.outputs.parameters.decision}}' == 'approved'"
+            depends: "check-approval-and-approve.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -100,9 +126,8 @@ spec:
 
           - name: ship-order-no-approval
             template: call-shipping-api
-            dependencies:
-              - reserve-inventory
             when: "'{{tasks.validate-order.outputs.parameters.needs-approval}}' != 'true'"
+            depends: "reserve-inventory.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -114,9 +139,8 @@ spec:
 
           - name: approval-rejected
             template: fail-with-message
-            dependencies:
-              - check-approval-and-approve
             when: "'{{tasks.check-approval-and-approve.outputs.parameters.decision}}' != 'approved'"
+            depends: "check-approval-and-approve.Succeeded"
             arguments:
               parameters:
                 - name: message
@@ -124,8 +148,7 @@ spec:
 
           - name: update-order-shipped-after-approval
             template: update-order-status
-            dependencies:
-              - ship-order-after-approval
+            depends: "ship-order-after-approval.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -137,8 +160,7 @@ spec:
 
           - name: update-order-shipped-no-approval
             template: update-order-status
-            dependencies:
-              - ship-order-no-approval
+            depends: "ship-order-no-approval.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -150,8 +172,7 @@ spec:
 
           - name: send-shipped-notification-a
             template: send-notification
-            dependencies:
-              - update-order-shipped-after-approval
+            depends: "update-order-shipped-after-approval.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -163,8 +184,7 @@ spec:
 
           - name: send-shipped-notification-b
             template: send-notification
-            dependencies:
-              - update-order-shipped-no-approval
+            depends: "update-order-shipped-no-approval.Succeeded"
             arguments:
               parameters:
                 - name: order-id
@@ -245,6 +265,25 @@ spec:
               user=os.environ.get("PGUSER", "orchestration"),
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
+
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded customers/inventory, so it is NOT
+          # self-creating. Check it up front: SET search_path to a missing schema
+          # succeeds silently and every later query then fails with
+          # "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag4"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
 
           try:
               cur = conn.cursor()
@@ -337,6 +376,8 @@ spec:
         env:
           - name: INPUT
             value: "{{workflow.parameters.input}}"
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -382,11 +423,15 @@ spec:
           - name: customer-id
           - name: total-amount
           - name: items
+      # `path:` is only valid on a template that HAS a container. This is a
+      # steps template, so the value must be lifted from a child step with
+      # `parameter:` -- otherwise submission is rejected with "parameter or
+      # expression must be specified for Steps templates".
       outputs:
         parameters:
           - name: decision
             valueFrom:
-              path: /tmp/decision
+              parameter: "{{steps.extract-decision.outputs.parameters.decision}}"
       steps:
         - - name: run-approval
             templateRef:
@@ -501,6 +546,25 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded customers/inventory, so it is NOT
+          # self-creating. Check it up front: SET search_path to a missing schema
+          # succeeds silently and every later query then fails with
+          # "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag4"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
               now = datetime.now(timezone.utc)
@@ -528,6 +592,8 @@ spec:
               conn.close()
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -750,6 +816,25 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded customers/inventory, so it is NOT
+          # self-creating. Check it up front: SET search_path to a missing schema
+          # succeeds silently and every later query then fails with
+          # "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag4"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
 
@@ -796,6 +881,8 @@ spec:
               conn.close()
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -841,6 +928,25 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded customers/inventory, so it is NOT
+          # self-creating. Check it up front: SET search_path to a missing schema
+          # succeeds silently and every later query then fails with
+          # "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag4"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
               now = datetime.now(timezone.utc)
@@ -867,6 +973,8 @@ spec:
               conn.close()
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT

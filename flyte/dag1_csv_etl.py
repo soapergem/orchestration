@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import urllib.request
 import zipfile
 from typing import List
 
@@ -37,6 +38,7 @@ from .types import (
     DBConfig,
     ETLInput,
     ETLOutput,
+    ExtractedCSV,
     TransformResult,
 )
 
@@ -44,7 +46,15 @@ from .types import (
 # Container image spec — declares all Python deps needed at runtime.
 # Flyte will build/cache this image automatically.
 # ---------------------------------------------------------------------------
-etl_image = ImageSpec(
+# A prebuilt image can be substituted for the ImageSpec entirely. ImageSpec
+# assumes a working local container builder AND that the build host can produce
+# the cluster's architecture -- neither holds when building arm64 from an x86
+# workstation without qemu binfmt handlers (rootless podman cannot register
+# them). FLYTE_TASK_IMAGE points at an image built natively on the cluster
+# instead, and registration then pushes nothing. See flyte/README.md.
+_PREBUILT = os.environ.get("FLYTE_TASK_IMAGE")
+
+etl_image = _PREBUILT or ImageSpec(
     name="csv-etl",
     packages=[
         "psycopg2-binary",
@@ -53,6 +63,12 @@ etl_image = ImageSpec(
         "flytekit",
     ],
     python_version="3.11",
+    # Target platform must match the cluster's node architecture. flytekit
+    # defaults this to linux/amd64 (it only picks arm64 when pushing to a LOCAL
+    # registry from an arm64 build host), so an arm64 cluster needs it set
+    # explicitly -- otherwise the image pulls and schedules fine and then the
+    # container dies with "exec format error". See RUNNING.md 7b.
+    platform=os.environ.get("FLYTE_IMAGE_PLATFORM", "linux/amd64"),
 )
 
 # ---------------------------------------------------------------------------
@@ -82,13 +98,24 @@ JOIN products p ON o.product_id = p.product_id;
 # Helper: Postgres connection from DBConfig
 # ---------------------------------------------------------------------------
 def _get_connection(cfg: DBConfig) -> psycopg2.extensions.connection:
-    return psycopg2.connect(
+    """Connect with ``search_path`` scoped to this runner's DAG 1 schema.
+
+    DAG 1's tables are derived from the CSVs, so the schema is self-creating —
+    unlike DAG 3/4, whose schemas hold seeded fixtures and therefore fail fast.
+    """
+    conn = psycopg2.connect(
         host=cfg.host,
         port=cfg.port,
         dbname=cfg.database,
         user=cfg.user,
         password=cfg.password,
     )
+    schema = f"{cfg.namespace}_dag1"
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -98,22 +125,37 @@ def _get_connection(cfg: DBConfig) -> psycopg2.extensions.connection:
     retries=3,
     container_image=etl_image,
 )
-def unzip_file(zip_file_path: str, extract_dir: str) -> List[str]:
+def unzip_file(zip_file_path: str, extract_dir: str) -> List[ExtractedCSV]:
     """Extract all CSV files from a ZIP archive.
+
+    Accepts either a local path or an http(s) URL. The URL form is what makes
+    this runnable on Kubernetes: a task pod is ephemeral and shares no
+    filesystem with the launcher, so a local path only works for a local run.
+    Point it at the fixture-service (`http://fixture-service:8099/sample-data.zip`)
+    aliased into the task namespace. Matches how the Argo implementation sources
+    the same archive via its `zip-url` parameter.
 
     Returns a list of absolute paths to the extracted CSVs.
     """
     os.makedirs(extract_dir, exist_ok=True)
 
-    csv_paths: List[str] = []
-    with zipfile.ZipFile(zip_file_path, "r") as zf:
+    local_zip = zip_file_path
+    if zip_file_path.startswith(("http://", "https://")):
+        local_zip = os.path.join(extract_dir, "_input.zip")
+        with urllib.request.urlopen(zip_file_path, timeout=120) as response:
+            with open(local_zip, "wb") as fh:
+                fh.write(response.read())
+
+    csv_paths: List[ExtractedCSV] = []
+    with zipfile.ZipFile(local_zip, "r") as zf:
         for member in zf.namelist():
             if not member.endswith(".csv"):
                 continue
             dest_path = os.path.join(extract_dir, os.path.basename(member))
             with zf.open(member) as src, open(dest_path, "wb") as dst:
                 dst.write(src.read())
-            csv_paths.append(dest_path)
+            table = os.path.basename(member).replace(".csv", "").lower()
+            csv_paths.append(ExtractedCSV(table=table, file=FlyteFile(dest_path)))
 
     if not csv_paths:
         raise ValueError(f"No CSV files found in {zip_file_path}")
@@ -128,17 +170,18 @@ def unzip_file(zip_file_path: str, extract_dir: str) -> List[str]:
     retries=3,
     container_image=etl_image,
 )
-def load_csv_to_postgres(csv_path: str, db_config: DBConfig) -> CSVLoadResult:
+def load_csv_to_postgres(csv_path: ExtractedCSV, db_config: DBConfig) -> CSVLoadResult:
     """Read a single CSV from *csv_path* and load it into a Postgres table.
 
     The table name is derived from the filename (e.g. ``users.csv`` -> ``users``).
     All columns are created as TEXT.  The table is truncated and reloaded on
     each invocation so the operation is idempotent.
     """
-    filename = os.path.basename(csv_path)
-    table_name = filename.replace(".csv", "").lower()
+    table_name = csv_path.table
+    # Accessing .path on a FlyteFile input downloads the blob into this pod.
+    local_csv = csv_path.file.download()
 
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(local_csv, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
 
@@ -179,7 +222,7 @@ def load_csv_to_postgres(csv_path: str, db_config: DBConfig) -> CSVLoadResult:
 # Dynamic workflow: fan-out CSV loads in parallel
 # ---------------------------------------------------------------------------
 @dynamic(container_image=etl_image)
-def load_all_csvs(csv_paths: List[str], db_config: DBConfig) -> List[CSVLoadResult]:
+def load_all_csvs(csv_paths: List[ExtractedCSV], db_config: DBConfig) -> List[CSVLoadResult]:
     """Dynamically map ``load_csv_to_postgres`` over every extracted CSV.
 
     Flyte's @dynamic creates one task node per CSV path at runtime, enabling
@@ -258,6 +301,36 @@ def convert_to_parquet(
 # ---------------------------------------------------------------------------
 # Top-level workflow
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Output assembler
+# ---------------------------------------------------------------------------
+# A @workflow body builds a graph; it does not run eagerly, so every task result
+# there is a Promise. Constructing a dataclass from Promises fails at
+# REGISTRATION with "can not serialize 'Promise' object". Assemble in a @task,
+# which receives real values.
+@task(container_image=etl_image)
+def build_etl_output(
+    parquet_file: FlyteFile,
+    row_count: int,
+    tables_loaded: List[CSVLoadResult],
+) -> ETLOutput:
+    """Assemble the workflow output.
+
+    Takes the FlyteFile itself, not `parquet_file.path`: inside a @workflow that
+    attribute is not a string but part of a blob-typed Promise, and registration
+    rejects the binding with "output variable 'convert_to_parquet.o0' has type
+    [blob:{}], but it's assigned to ... type [simple:STRING]". Here the value is
+    real, and `remote_source` is the durable blob URI -- more useful to record
+    than the ephemeral in-pod path.
+    """
+    return ETLOutput(
+        status="success",
+        parquet_path=parquet_file.remote_source or parquet_file.path,
+        row_count=row_count,
+        tables_loaded=tables_loaded,
+    )
+
+
 @workflow
 def csv_etl_pipeline(etl_input: ETLInput) -> ETLOutput:
     """CSV ETL Pipeline.
@@ -278,6 +351,13 @@ def csv_etl_pipeline(etl_input: ETLInput) -> ETLOutput:
     )
 
     transform_result = run_sql_transform(db_config=etl_input.db_config)
+    # `>>` is REQUIRED here, not stylistic. A @workflow body's statement order
+    # implies nothing: Flyte derives the graph purely from data dependencies, and
+    # this task consumes none of the preceding task's outputs, so without an
+    # explicit edge Flyte schedules them in PARALLEL. Verified on the cluster --
+    # run_sql_transform started alongside unzip_file and died with
+    # 'relation "orders" does not exist'.
+    load_results >> transform_result
 
     parquet_file = convert_to_parquet(
         db_config=etl_input.db_config,
@@ -285,9 +365,8 @@ def csv_etl_pipeline(etl_input: ETLInput) -> ETLOutput:
         output_dir=etl_input.output_dir,
     )
 
-    return ETLOutput(
-        status="success",
-        parquet_path=parquet_file.path,
+    return build_etl_output(
+        parquet_file=parquet_file,
         row_count=transform_result.row_count,
         tables_loaded=load_results,
     )
