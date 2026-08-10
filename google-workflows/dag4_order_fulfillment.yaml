@@ -1,30 +1,44 @@
 # Order Fulfillment: Validate, reserve inventory (subworkflow), optional manager approval
 # (callback), ship (subworkflow), with full saga compensation via try/except.
-# Deploy: gcloud workflows deploy order-fulfillment --source=dag4_order_fulfillment.yaml
+#
+# Deploy: terraform/gcp
 #
 # Google Workflows supports waits up to 1 year via events.await_callback, making it
 # ideal for human-in-the-loop approval patterns. During the wait, the workflow consumes
 # zero compute resources -- it is fully suspended and only resumes on callback.
 #
-# Expected input:
+# Saga compensation here is hand-rolled from try/except plus a compensating step,
+# exactly as in Airflow and Step Functions; no orchestrator in this bake-off has a
+# saga primitive. What Workflows does give you is that the compensation path is
+# visible in the source as ordinary control flow.
+#
+# Expected input (fixtures come from bootstrap_bakeoff):
 # {
 #   "order_id": "ORD-001",
-#   "customer_id": "CUST-001",
-#   "items": [{"sku": "SKU-A", "quantity": 2}, {"sku": "SKU-B", "quantity": 1}],
-#   "shipping_address": {"street": "123 Main St", "city": "Seattle", "state": "WA", "zip": "98101"},
-#   "approval_threshold": 500.00,
-#   "db_config": { "host": "postgres", "port": 5432, "database": "orchestration", "user": "orchestration", "password": "orchestration" }
+#   "customer_id": "CUST-42",              # CUST-99 is inactive, for the failure path
+#   "items": [{"sku": "GADGET-B", "quantity": 1, "unit_price": 499.99},
+#             {"sku": "WIDGET-A", "quantity": 1, "unit_price": 29.99}],
+#   "shipping_address": {"street": "123 Main St", "city": "Springfield", "state": "IL", "zip": "62701"},
+#   "approval_threshold": 500.00,          # the items above total 529.98, so approval IS required
+#   "db_config": { "host": "...", "port": 5432, "database": "orchestration", "user": "...", "password": "..." }
 # }
+#
+# The approval-service on K3s runs with AUTO_DECIDE_ACTION=approved after 10s, so
+# the happy path is hands-off. To exercise the saga, POST a rejection to
+# /approval-requests/<id>/decide inside that window.
 
 main:
   params: [input]
   steps:
     - init:
         assign:
-          - db_proxy_url: "http://db-proxy-service:8080"
-          - approval_service_url: "http://approval-service:8091"
-          - shipping_service_url: "http://shipping-service:8092"
-          - notification_service_url: "http://notification-service:8080"
+          # DB and notification work goes to the private Cloud Run task service;
+          # approval and shipping are the public K3s mocks. Only the former get
+          # an OIDC token -- see the auth blocks below.
+          - db_proxy_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - notification_service_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - approval_service_url: ${sys.get_env("APPROVAL_SERVICE_URL")}
+          - shipping_service_url: ${sys.get_env("SHIPPING_SERVICE_URL")}
           - order_id: ${input.order_id}
           - customer_id: ${input.customer_id}
           - items: ${input.items}
@@ -40,6 +54,8 @@ main:
           call: http.post
           args:
             url: ${db_proxy_url + "/validate-order"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -91,6 +107,7 @@ main:
           call: reserve_inventory_subworkflow
           args:
             order_id: ${order_id}
+            customer_id: ${customer_id}
             items: ${items}
             db_proxy_url: ${db_proxy_url}
             db_config: ${db_config}
@@ -104,13 +121,12 @@ main:
                   message: ${"Inventory reservation failed - " + json.encode_to_string(e)}
 
     # Step 4: Check if manager approval is required (total >= threshold)
-    - check_approval_required:
-        switch:
-          - condition: ${total_amount >= approval_threshold}
-            next: manager_approval
-        next: call_shipping
-
-    # Build items summary string for the approval request
+    # Built BEFORE the branch below, not after. A `switch` with `next:` jumps
+    # straight to its target, so steps sitting between the switch and that target
+    # are unreachable on every path -- these two were, leaving items_summary
+    # unset. An unset variable is not an error here: Workflows sends it as null,
+    # so the only symptom was a 422 from the approval service, a long way from
+    # the cause.
     - build_items_summary:
         assign:
           - items_summary: ""
@@ -124,6 +140,12 @@ main:
                   - separator: ${if(items_summary == "", "", ", ")}
                   - items_summary: ${items_summary + separator + string(item.quantity) + "x " + item.sku}
 
+    - check_approval_required:
+        switch:
+          - condition: ${total_amount >= approval_threshold}
+            next: manager_approval
+        next: call_shipping
+
     # Step 5: Manager Approval via callback.
     # Google Workflows supports waits up to 1 year. The workflow is fully suspended
     # during the wait with zero resource cost. This is a flagship feature that makes
@@ -131,6 +153,13 @@ main:
     - manager_approval:
         try:
           steps:
+            - build_approval_id:
+                assign:
+                  # Bound to a variable, not inlined into the request body: the
+                  # decision step below needs the same id, and int() keeps it out
+                  # of scientific notation.
+                  - approval_request_id: ${"APR-" + string(int(sys.now()))}
+
             - create_approval_callback:
                 call: events.create_callback_endpoint
                 args:
@@ -144,11 +173,14 @@ main:
                   headers:
                     Content-Type: "application/json"
                   body:
-                    approval_request_id: ${"APR-" + string(sys.now())}
+                    approval_request_id: ${approval_request_id}
                     order_id: ${order_id}
                     total_amount: ${total_amount}
                     customer_id: ${customer_id}
-                    callback_url: ${approval_callback.url}
+                    # Authenticated resume -- see the note in dag2.
+                    provider: "google_workflows"
+                    resume_data:
+                      callback_url: ${approval_callback.url}
                     items_summary: ${items_summary}
                   timeout: 10
                 result: approval_submit_response
@@ -164,6 +196,8 @@ main:
                 call: http.post
                 args:
                   url: ${db_proxy_url + "/update-order-status"}
+                  auth:
+                    type: OIDC
                   headers:
                     Content-Type: "application/json"
                   body:
@@ -194,10 +228,16 @@ main:
                 call: http.post
                 args:
                   url: ${db_proxy_url + "/record-approval-decision"}
+                  auth:
+                    type: OIDC
                   headers:
                     Content-Type: "application/json"
                   body:
                     order_id: ${order_id}
+                    # Both required for the audit row: without the id the handler
+                    # cannot upsert approval_requests at all.
+                    approval_request_id: ${approval_request_id}
+                    total_amount: ${total_amount}
                     decision: ${approval_decision.decision}
                     approver: ${default(map.get(approval_decision, "approver"), "unknown")}
                     reason: ${default(map.get(approval_decision, "reason"), "")}
@@ -271,6 +311,8 @@ main:
           call: http.post
           args:
             url: ${db_proxy_url + "/update-order-status"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -314,6 +356,8 @@ main:
           call: http.post
           args:
             url: ${notification_service_url + "/notify"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -358,17 +402,22 @@ main:
 # Subworkflow: Reserve inventory atomically
 # ---------------------------------------------------------------------------
 reserve_inventory_subworkflow:
-  params: [order_id, items, db_proxy_url, db_config]
+  params: [order_id, customer_id, items, db_proxy_url, db_config]
   steps:
     - reserve_items:
         try:
           call: http.post
           args:
             url: ${db_proxy_url + "/reserve-inventory"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
               order_id: ${order_id}
+              # Required: the order row is created here, and orders.customer_id
+              # is a foreign key onto customers.
+              customer_id: ${customer_id}
               items: ${items}
               db_host: ${db_config.host}
               db_port: ${db_config.port}
@@ -445,6 +494,8 @@ saga_compensation:
           call: http.post
           args:
             url: ${db_proxy_url + "/release-inventory"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -478,6 +529,8 @@ saga_compensation:
           call: http.post
           args:
             url: ${db_proxy_url + "/update-order-status"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -511,6 +564,8 @@ saga_compensation:
           call: http.post
           args:
             url: ${notification_service_url + "/notify"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -551,13 +606,13 @@ retry_on_server_error:
   steps:
     - check_error:
         switch:
-          - condition: ${e.code == 429}
+          - condition: ${default(map.get(e, "code"), 0) == 429}
             return: true
-          - condition: ${e.code >= 500 and e.code < 600}
+          - condition: ${default(map.get(e, "code"), 0) >= 500 and default(map.get(e, "code"), 0) < 600}
             return: true
-          - condition: ${"ConnectionError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "ConnectionError")}
             return: true
-          - condition: ${"TimeoutError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
             return: true
         next: return_false
     - return_false:
@@ -569,21 +624,21 @@ retry_on_shipping_error:
   steps:
     - check_error:
         switch:
-          - condition: ${e.code == 400}
+          - condition: ${default(map.get(e, "code"), 0) == 400}
             return: false
-          - condition: ${e.code == 504}
+          - condition: ${default(map.get(e, "code"), 0) == 504}
             return: true
-          - condition: ${e.code == 503}
+          - condition: ${default(map.get(e, "code"), 0) == 503}
             return: true
-          - condition: ${e.code == 502}
+          - condition: ${default(map.get(e, "code"), 0) == 502}
             return: true
-          - condition: ${e.code == 500}
+          - condition: ${default(map.get(e, "code"), 0) == 500}
             return: true
-          - condition: ${e.code == 429}
+          - condition: ${default(map.get(e, "code"), 0) == 429}
             return: true
-          - condition: ${"TimeoutError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
             return: true
-          - condition: ${"ConnectionError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "ConnectionError")}
             return: true
         next: return_false
     - return_false:

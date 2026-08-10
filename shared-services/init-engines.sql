@@ -6,9 +6,13 @@
 -- If `pgdata` already exists, create these manually:
 --   podman compose exec postgres psql -U orchestration -c 'CREATE DATABASE hatchet;'
 --   podman compose exec postgres psql -U orchestration -c 'CREATE DATABASE kestra;'
+--   podman compose exec postgres psql -U orchestration -c 'CREATE DATABASE conductor;'
 --
 -- Temporal's auto-setup image creates its own `temporal` and
 -- `temporal_visibility` databases, so they are intentionally absent here.
 
 CREATE DATABASE hatchet;
 CREATE DATABASE kestra;
+-- Conductor stores metadata, the task queues AND the search index here: setting
+-- conductor.indexing.type=postgres means it needs no Elasticsearch at all.
+CREATE DATABASE conductor;

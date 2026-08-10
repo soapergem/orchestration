@@ -14,13 +14,34 @@ import psycopg2
 
 
 def get_connection():
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=os.environ.get("PGHOST", "postgres"),
         port=int(os.environ.get("PGPORT", "5432")),
         dbname=os.environ.get("PGDATABASE", "orchestration"),
         user=os.environ.get("PGUSER", "orchestration"),
         password=os.environ.get("PGPASSWORD", "orchestration"),
     )
+
+    # ---- Per-(runner, DAG) schema isolation ----
+    # Mirrors the inline copy in ../dag4-*.yaml. This schema holds seeded
+    # fixtures, so it is not self-creating: SET search_path to a missing schema
+    # succeeds silently and every later query then fails with a confusing
+    # "relation does not exist".
+    bakeoff_ns = os.environ.get("BAKEOFF_NS", "argo")
+    schema = f"{bakeoff_ns}_dag4"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (schema,),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- seed it with: '
+                f"SELECT bootstrap_bakeoff('{bakeoff_ns}');"
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    return conn
 
 
 def main():
@@ -51,6 +72,20 @@ def main():
             }
             json.dump(result, sys.stdout)
             return
+
+        # The orders row MUST be inserted before any inventory_reservations row:
+        # inventory_reservations.order_id carries a non-deferrable FK to
+        # orders(order_id), so reserving first fails with a foreign-key violation
+        # for any order_id that does not already exist.
+        total = sum(i["quantity"] * i.get("unit_price", 0) for i in items)
+        cur.execute(
+            """
+            INSERT INTO orders (order_id, customer_id, total_amount, status)
+            VALUES (%s, %s, %s, 'reserved')
+            ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+            """,
+            (order_id, customer_id, total),
+        )
 
         items_reserved = []
         for item in items:
@@ -83,17 +118,6 @@ def main():
                 (f"{reservation_id}-{sku}", order_id, sku, quantity),
             )
             items_reserved.append(sku)
-
-        # Create the order record
-        total = sum(i["quantity"] * i.get("unit_price", 0) for i in items)
-        cur.execute(
-            """
-            INSERT INTO orders (order_id, customer_id, total_amount, status)
-            VALUES (%s, %s, %s, 'reserved')
-            ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
-            """,
-            (order_id, customer_id, total),
-        )
 
         conn.commit()
 

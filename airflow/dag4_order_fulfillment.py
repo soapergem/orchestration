@@ -18,7 +18,9 @@ Airflow idioms used:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -43,6 +45,14 @@ DB_CONN_PARAMS = {
     "user": os.environ.get("POSTGRES_USER", "orchestration"),
     "password": os.environ.get("POSTGRES_PASSWORD", "orchestration"),
 }
+
+# Airflow 3's RuntimeTaskInstance carries no .log attribute, so task code
+# logs through the standard logging module; Airflow captures it either way.
+log = logging.getLogger(__name__)
+
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "airflow")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag4"
 
 APPROVAL_SERVICE_URL = os.environ.get(
     "APPROVAL_SERVICE_URL", "http://approval-service:8091"
@@ -76,12 +86,64 @@ class ApprovalExpired(AirflowException):
     """Non-retriable: approval request timed out."""
 
 
+class OrderValidationFailed(AirflowException):
+    """Non-retriable: unknown/inactive customer, unknown SKU, or short stock.
+
+    Raised rather than returned as ``{"is_valid": False}``: nothing branches on
+    that flag, so a returned failure would sail on into reserve/ship.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _conf(context: dict) -> dict:
+    """Run configuration: the DAG's params overlaid with this run's ``--conf``.
+
+    ``dag_run.conf or params`` looks equivalent but is not: a partial trigger
+    config (just ``order_id``, say) then shadows every param default and the
+    next read raises KeyError.
+    """
+    return {**(context.get("params") or {}), **(context["dag_run"].conf or {})}
+
+
+def _order_id(conf: dict, context: dict) -> str:
+    """The order id for this run, defaulting to one derived from the run id.
+
+    Every task resolves it the same way, so they agree without threading it
+    through XCom. See the ``order_id`` param docstring for why the default is
+    generated rather than literal.
+    """
+    explicit = conf.get("order_id")
+    if explicit:
+        return str(explicit)
+    run_id = context["dag_run"].run_id
+    return "ORD-" + re.sub(r"[^A-Za-z0-9]", "", run_id)[-16:]
+
+
 def _get_connection() -> psycopg2.extensions.connection:
-    return psycopg2.connect(**DB_CONN_PARAMS)
+    """Connection scoped to this runner's DAG 4 schema (``<BAKEOFF_NS>_dag4``),
+    which holds the seeded customers/inventory this DAG validates against.
+
+    Not self-creating: SET search_path to a missing schema succeeds silently and
+    every later query then fails with a confusing "relation does not exist", so
+    check up front and say what to run.
+    """
+    conn = psycopg2.connect(**DB_CONN_PARAMS)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (BAKEOFF_SCHEMA,),
+        )
+        if cur.fetchone() is None:
+            raise RuntimeError(
+                f'schema "{BAKEOFF_SCHEMA}" does not exist -- seed it with: '
+                f"just seed {BAKEOFF_NS}"
+            )
+        cur.execute(f'SET search_path TO "{BAKEOFF_SCHEMA}"')
+    conn.commit()
+    return conn
 
 
 def _release_inventory(order_id: str, log: Any = None) -> dict:
@@ -140,10 +202,8 @@ def _release_inventory(order_id: str, log: Any = None) -> dict:
 
 def _on_shipping_failure(context: dict) -> None:
     """on_failure_callback: release inventory when shipping fails."""
-    dag_run = context["dag_run"]
-    conf = dag_run.conf or {}
-    order_id = conf.get("order_id", "unknown")
-    log = context["task_instance"].log
+    conf = _conf(context)
+    order_id = _order_id(conf, context)
     log.warning("Shipping failed for order %s -- triggering inventory release", order_id)
     try:
         _release_inventory(order_id, log=log)
@@ -183,14 +243,27 @@ class ManagerApprovalOperator(BaseOperator):
         self.poll_interval = poll_interval
         self.approval_timeout = approval_timeout
 
+    def _resolve_order_id(self, context: Any) -> str:
+        """Templated order_id, falling back to the run-derived default.
+
+        execute() and execute_complete() run in *different* task-instance
+        processes either side of the deferral, so nothing can be stashed on
+        ``self`` between them -- both resolve through here instead.
+        """
+        if self.order_id:
+            return self.order_id
+        conf = _conf(context)
+        return _order_id(conf, context)
+
     def execute(self, context: Any) -> None:
         """Submit approval request, then defer to trigger."""
         # Read runtime values from XCom / conf
         ti = context["task_instance"]
         validation = ti.xcom_pull(task_ids="validate_order") or {}
         total_amount = validation.get("total_amount", 0)
+        order_id = self._resolve_order_id(context)
 
-        conf = context["dag_run"].conf or context["params"]
+        conf = _conf(context)
         items = conf.get("items", [])
         items_summary = ", ".join(
             f"{item['quantity']}x {item['sku']}" for item in items
@@ -200,16 +273,24 @@ class ManagerApprovalOperator(BaseOperator):
 
         payload = {
             "approval_request_id": approval_request_id,
-            "order_id": self.order_id,
+            "order_id": order_id,
             "total_amount": total_amount,
             "customer_id": self.customer_id,
             "items_summary": items_summary,
+            # The service is a resume broker: registration must declare how the
+            # decision gets delivered (RUNNING.md 2b), and 422s without it. A
+            # deferred Airflow task has no inbound resume handle -- the triggerer
+            # polls GET /approval-requests/<id> instead -- so this registers the
+            # documented dead URL. The service records the decision before it
+            # dispatches the resume, so the failing resume leg is cosmetic.
+            "provider": "http_callback",
+            "resume_data": {"callback_url": "http://localhost:0/noop"},
         }
 
         self.log.info(
             "Submitting approval request %s for order %s ($%.2f)",
             approval_request_id,
-            self.order_id,
+            order_id,
             total_amount,
         )
 
@@ -236,12 +317,12 @@ class ManagerApprovalOperator(BaseOperator):
                     VALUES (%s, %s, %s, 'pending')
                     ON CONFLICT (approval_request_id) DO NOTHING
                     """,
-                    (approval_request_id, self.order_id, total_amount),
+                    (approval_request_id, order_id, total_amount),
                 )
                 cur.execute(
                     "UPDATE orders SET status = 'pending_approval', updated_at = NOW() "
                     "WHERE order_id = %s",
-                    (self.order_id,),
+                    (order_id,),
                 )
             conn.commit()
         finally:
@@ -263,6 +344,7 @@ class ManagerApprovalOperator(BaseOperator):
         """Process the approval trigger event."""
         status = event.get("status")
         decision = event.get("decision")
+        order_id = self._resolve_order_id(context)
 
         # Record the decision in the DB
         approval_request_id = event.get("approval_request_id")
@@ -288,29 +370,29 @@ class ManagerApprovalOperator(BaseOperator):
                 new_order_status = "approved" if decision == "approved" else "rejected"
                 cur.execute(
                     "UPDATE orders SET status = %s, updated_at = %s WHERE order_id = %s",
-                    (new_order_status, now, self.order_id),
+                    (new_order_status, now, order_id),
                 )
             conn.commit()
         finally:
             conn.close()
 
         if decision == "approved":
-            self.log.info("Order %s approved by %s", self.order_id, event.get("approver"))
+            self.log.info("Order %s approved by %s", order_id, event.get("approver"))
             return event
 
         if decision == "rejected":
-            self.log.warning("Order %s rejected -- releasing inventory", self.order_id)
-            _release_inventory(self.order_id, log=self.log)
+            self.log.warning("Order %s rejected -- releasing inventory", order_id)
+            _release_inventory(order_id, log=self.log)
             raise ApprovalRejected(
-                f"Order {self.order_id} rejected by {event.get('approver')}: "
+                f"Order {order_id} rejected by {event.get('approver')}: "
                 f"{event.get('reason', 'no reason given')}"
             )
 
         if status == "timeout" or decision == "expired":
-            self.log.warning("Approval for order %s expired -- releasing inventory", self.order_id)
-            _release_inventory(self.order_id, log=self.log)
+            self.log.warning("Approval for order %s expired -- releasing inventory", order_id)
+            _release_inventory(order_id, log=self.log)
             raise ApprovalExpired(
-                f"Approval for order {self.order_id} timed out"
+                f"Approval for order {order_id} timed out"
             )
 
         raise AirflowException(f"Unexpected approval event: {event}")
@@ -332,11 +414,18 @@ class ManagerApprovalOperator(BaseOperator):
         "retry_delay": timedelta(seconds=5),
     },
     params={
-        "order_id": "ORD-001",
-        "customer_id": "CUST-001",
+        # order_id doubles as the reservation/shipping idempotency key. Params
+        # are static, so a literal default would make every re-trigger reuse the
+        # same order and replay the idempotent no-op path; left null it derives
+        # from the run id instead. Pass an explicit one to target a known order.
+        "order_id": None,
+        # Fixtures come from bootstrap_bakeoff() -- see shared-services/init-db.sql.
+        # GADGET-B + WIDGET-A = $529.98, over the $500 threshold, so the default
+        # run exercises the manager-approval wait.
+        "customer_id": "CUST-42",
         "items": [
-            {"sku": "SKU-A", "quantity": 2, "unit_price": 50.00},
-            {"sku": "SKU-B", "quantity": 1, "unit_price": 75.00},
+            {"sku": "GADGET-B", "quantity": 1, "unit_price": 499.99},
+            {"sku": "WIDGET-A", "quantity": 1, "unit_price": 29.99},
         ],
         "shipping_address": {
             "street": "123 Main St",
@@ -357,8 +446,8 @@ def order_fulfillment():
     @task()
     def validate_order(**context) -> dict:
         """Validate SKUs exist, customer is active, compute total."""
-        conf = context["dag_run"].conf or context["params"]
-        order_id = conf["order_id"]
+        conf = _conf(context)
+        order_id = _order_id(conf, context)
         customer_id = conf["customer_id"]
         items = conf["items"]
         approval_threshold = conf.get("approval_threshold", 500.00)
@@ -373,9 +462,9 @@ def order_fulfillment():
             )
             row = cur.fetchone()
             if not row:
-                return {"is_valid": False, "reason": f"Customer {customer_id} not found"}
+                raise OrderValidationFailed(f"Customer {customer_id} not found")
             if row[0] != "active":
-                return {"is_valid": False, "reason": f"Customer {customer_id} is {row[0]}"}
+                raise OrderValidationFailed(f"Customer {customer_id} is {row[0]}")
 
             total_amount = 0.0
             for item in items:
@@ -388,22 +477,21 @@ def order_fulfillment():
                 )
                 row = cur.fetchone()
                 if not row:
-                    return {"is_valid": False, "reason": f"SKU {sku} not found"}
+                    raise OrderValidationFailed(f"SKU {sku} not found")
 
                 available, unit_price = row
                 if available < quantity:
-                    return {
-                        "is_valid": False,
-                        "reason": (
-                            f"Insufficient stock for {sku}: "
-                            f"requested {quantity}, available {available}"
-                        ),
-                    }
+                    raise OrderValidationFailed(
+                        f"Insufficient stock for {sku}: "
+                        f"requested {quantity}, available {available}"
+                    )
                 total_amount += float(unit_price) * quantity
 
             return {
                 "is_valid": True,
                 "reason": None,
+                "order_id": order_id,
+                "customer_id": customer_id,
                 "total_amount": total_amount,
                 "approval_threshold": approval_threshold,
             }
@@ -419,8 +507,8 @@ def order_fulfillment():
         @task()
         def reserve_items(**context) -> dict:
             """Atomically reserve all items. Idempotent."""
-            conf = context["dag_run"].conf or context["params"]
-            order_id = conf["order_id"]
+            conf = _conf(context)
+            order_id = _order_id(conf, context)
             customer_id = conf["customer_id"]
             items = conf["items"]
 
@@ -444,6 +532,20 @@ def order_fulfillment():
                         "reserved_at": datetime.now(timezone.utc).isoformat(),
                         "idempotent": True,
                     }
+
+                # Create/update the order record FIRST: inventory_reservations
+                # has a foreign key onto orders(order_id), so reserving before
+                # the order exists is a ForeignKeyViolation.
+                total = sum(i["quantity"] * i["unit_price"] for i in items)
+                cur.execute(
+                    """
+                    INSERT INTO orders (order_id, customer_id, total_amount, status)
+                    VALUES (%s, %s, %s, 'reserved')
+                    ON CONFLICT (order_id) DO UPDATE
+                        SET status = 'reserved', updated_at = NOW()
+                    """,
+                    (order_id, customer_id, total),
+                )
 
                 items_reserved = []
                 for item in items:
@@ -475,18 +577,6 @@ def order_fulfillment():
                         (f"{reservation_id}-{sku}", order_id, sku, quantity),
                     )
                     items_reserved.append(sku)
-
-                # Create/update order record
-                total = sum(i["quantity"] * i["unit_price"] for i in items)
-                cur.execute(
-                    """
-                    INSERT INTO orders (order_id, customer_id, total_amount, status)
-                    VALUES (%s, %s, %s, 'reserved')
-                    ON CONFLICT (order_id) DO UPDATE
-                        SET status = 'reserved', updated_at = NOW()
-                    """,
-                    (order_id, customer_id, total),
-                )
 
                 conn.commit()
 
@@ -521,8 +611,11 @@ def order_fulfillment():
     # ------------------------------------------------------------------
     manager_approval_op = ManagerApprovalOperator(
         task_id="manager_approval",
-        order_id="{{ (dag_run.conf or params).order_id }}",
-        customer_id="{{ (dag_run.conf or params).customer_id }}",
+        # `or ''` so an unset order_id renders empty rather than the string
+        # "None", letting _resolve_order_id() fall back to the run-derived id.
+        order_id="{{ dag_run.conf.get('order_id') or params.order_id or '' }}",
+        # dag_run.conf wins per-key; see _conf() for why `conf or params` is wrong.
+        customer_id="{{ dag_run.conf.get('customer_id') or params.customer_id }}",
         approval_service_url=APPROVAL_SERVICE_URL,
         poll_interval=5.0,
         approval_timeout=180.0,
@@ -542,8 +635,8 @@ def order_fulfillment():
     )
     def call_shipping_api(**context) -> dict:
         """Call the shipping service. Typed exceptions for retry routing."""
-        conf = context["dag_run"].conf or context["params"]
-        order_id = conf["order_id"]
+        conf = _conf(context)
+        order_id = _order_id(conf, context)
         items = conf["items"]
         shipping_address = conf["shipping_address"]
 
@@ -595,8 +688,8 @@ def order_fulfillment():
     )
     def update_order_status(shipment: dict, **context) -> dict:
         """Mark the order as shipped in the database."""
-        conf = context["dag_run"].conf or context["params"]
-        order_id = conf["order_id"]
+        conf = _conf(context)
+        order_id = _order_id(conf, context)
 
         conn = _get_connection()
         try:
@@ -642,10 +735,32 @@ def order_fulfillment():
     # Step 7: Send notification (best-effort)
     # ------------------------------------------------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def send_notification(order_result: dict, **context) -> dict:
-        """Best-effort order notification. Runs even if upstream had issues."""
-        conf = context["dag_run"].conf or context["params"]
-        order_id = conf["order_id"]
+    def send_notification(order_result: dict | None, **context) -> dict:
+        """Best-effort order notification. Runs even if upstream had issues.
+
+        ALL_DONE is what makes this best-effort, and it is also why the argument
+        is Optional: when update_order_status fails or is skipped it pushes no
+        XCom, so Airflow resolves the argument to None rather than not running
+        this task. Read the order's real status from the DB in that case.
+        """
+        conf = _conf(context)
+        order_id = _order_id(conf, context)
+
+        if order_result is None:
+            conn = _get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT status, failure_reason FROM orders WHERE order_id = %s",
+                        (order_id,),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+            order_result = (
+                {"status": row[0], "failure_reason": row[1]} if row else {"status": "unknown"}
+            )
+
         status = order_result.get("status", "unknown")
 
         notification = {
@@ -690,10 +805,10 @@ def order_fulfillment():
         provides immediate compensation; this task is a safety net that
         also marks the order as cancelled.
         """
-        conf = context["dag_run"].conf or context["params"]
-        order_id = conf["order_id"]
+        conf = _conf(context)
+        order_id = _order_id(conf, context)
 
-        result = _release_inventory(order_id, log=context["task_instance"].log)
+        result = _release_inventory(order_id, log=log)
 
         # Also update order status to cancelled
         conn = _get_connection()
@@ -728,21 +843,23 @@ def order_fulfillment():
 
     validation >> reservation >> branch
 
-    # Branch targets: either approval or straight to shipping
-    branch >> manager_approval_op
-    branch >> call_shipping_api
-
-    # After approval, go to shipping
-    manager_approval_op >> call_shipping_api
-
-    # Shipping -> update order -> notification (success path)
+    # Shipping -> update order -> notification (success path). The task must be
+    # instantiated (called) before it can appear in a >> chain -- the bare
+    # decorated function is a _TaskDecorator, not a node in the graph.
     shipment = call_shipping_api()
     order_result = update_order_status(shipment)
-    notification = send_notification(order_result)
+    send_notification(order_result)
+
+    # Branch targets: either approval or straight to shipping
+    branch >> manager_approval_op
+    branch >> shipment
+
+    # After approval, go to shipping
+    manager_approval_op >> shipment
 
     # Saga compensation: triggered if shipping or approval fails
     compensation = release_inventory_compensation()
-    [manager_approval_op, call_shipping_api] >> compensation
+    [manager_approval_op, shipment] >> compensation
 
 
 order_fulfillment()

@@ -14,11 +14,22 @@ inputs:
     description: Local directory for extracted CSV files
 
 variables:
+  task_network: shared-services_default
   pg_host: postgres
   pg_port: "5432"
   pg_database: orchestration
   pg_user: orchestration
   pg_password: orchestration
+  pg_schema: kestra_dag1
+
+pluginDefaults:
+  # Task-runner containers are siblings of the Kestra container, so they must be
+  # placed on the compose network for `postgres` / the mock services to resolve.
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: "{{ vars.task_network }}"
 
 tasks:
   - id: unzip_file
@@ -30,7 +41,7 @@ tasks:
       interval: PT2S
       maxInterval: PT30S
     beforeCommands:
-      - pip install requests
+      - pip install kestra requests
     outputFiles:
       - "extracted/**"
     script: |
@@ -67,9 +78,12 @@ tasks:
       Kestra.outputs({"csv_files": csv_files, "csv_count": len(csv_files)})
 
   - id: process_csvs
-    type: io.kestra.plugin.core.flow.EachParallel
+    # ForEach supersedes the deprecated EachParallel and is where
+    # concurrencyLimit lives -- the spec caps DAG 1 CSV loads at 10.
+    type: io.kestra.plugin.core.flow.ForEach
     description: Load each extracted CSV into Postgres in parallel
-    value: "{{ outputs.unzip_file.vars.csv_files }}"
+    values: "{{ outputs.unzip_file.vars.csv_files }}"
+    concurrencyLimit: 10
     tasks:
       - id: load_csv_to_postgres
         type: io.kestra.plugin.scripts.python.Script
@@ -80,9 +94,12 @@ tasks:
           interval: PT5S
           maxInterval: PT60S
         beforeCommands:
-          - pip install psycopg2-binary
+          - pip install kestra psycopg2-binary
+        # inputFiles maps a destination filename to ONE kestra:// URI. Pointing a
+        # directory-ish key at the whole outputFiles map writes a single file
+        # named `extracted` containing the stringified map.
         inputFiles:
-          extracted/: "{{ outputs.unzip_file.outputFiles }}"
+          "{{ taskrun.value }}": "{{ outputs.unzip_file.outputFiles['extracted/' ~ taskrun.value] }}"
         script: |
           import csv
           import io
@@ -92,7 +109,7 @@ tasks:
 
           csv_filename = "{{ taskrun.value }}"
           table_name = csv_filename.replace(".csv", "").lower()
-          csv_path = os.path.join("extracted", csv_filename)
+          csv_path = csv_filename  # inputFiles lands it in the working directory
 
           conn = psycopg2.connect(
               host="{{ vars.pg_host }}",
@@ -100,6 +117,7 @@ tasks:
               dbname="{{ vars.pg_database }}",
               user="{{ vars.pg_user }}",
               password="{{ vars.pg_password }}",
+              options="-c search_path={{ vars.pg_schema }}",
           )
 
           try:
@@ -114,6 +132,10 @@ tasks:
                   columns = list(rows[0].keys())
 
                   with conn.cursor() as cur:
+                      # DAG 1 self-creates its schema: the tables come from
+                      # whatever CSVs the ZIP holds, so there is nothing to seed.
+                      cur.execute('CREATE SCHEMA IF NOT EXISTS "{{ vars.pg_schema }}"')
+
                       col_defs = ", ".join(f'"{col}" TEXT' for col in columns)
                       cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({col_defs})')
 
@@ -138,7 +160,9 @@ tasks:
               conn.close()
 
   - id: run_sql_transform
-    type: io.kestra.plugin.jdbc.postgresql.Query
+    # Queries, not Query: the single-statement Query task rejects the
+    # DROP-then-CREATE pair outright rather than splitting it.
+    type: io.kestra.plugin.jdbc.postgresql.Queries
     description: >
       Join orders, customers, and products into a combined_report table.
     retry:
@@ -146,7 +170,7 @@ tasks:
       maxAttempt: 3
       interval: PT10S
       maxInterval: PT120S
-    url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+    url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}?currentSchema={{ vars.pg_schema }}"
     username: "{{ vars.pg_user }}"
     password: "{{ vars.pg_password }}"
     sql: |
@@ -172,7 +196,7 @@ tasks:
   - id: get_transform_row_count
     type: io.kestra.plugin.jdbc.postgresql.Query
     description: Get the row count from the combined_report table
-    url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+    url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}?currentSchema={{ vars.pg_schema }}"
     username: "{{ vars.pg_user }}"
     password: "{{ vars.pg_password }}"
     sql: SELECT COUNT(*) AS row_count FROM combined_report;
@@ -186,7 +210,7 @@ tasks:
       maxAttempt: 3
       interval: PT5S
     beforeCommands:
-      - pip install psycopg2-binary pandas pyarrow
+      - pip install kestra psycopg2-binary pandas pyarrow
     outputFiles:
       - "output/**"
     script: |
@@ -201,6 +225,7 @@ tasks:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
 
       try:
@@ -223,6 +248,8 @@ errors:
   - id: pipeline_failed
     type: io.kestra.plugin.scripts.python.Script
     description: Log ETL pipeline failure details
+    beforeCommands:
+      - pip install kestra
     script: |
       from kestra import Kestra
       Kestra.outputs({

@@ -15,16 +15,24 @@ spec:
   activeDeadlineSeconds: 300
   arguments:
     parameters:
+      # Accounts must exist in <bakeoff-ns>_dag3.accounts, seeded by
+      # shared-services/init-db.sql: ACC-001 (Alice, 5000.00), ACC-002 (Bob,
+      # 3000.00), ACC-003 (Merchant, 0.00), ACC-004 (suspended -- use it to
+      # reach the non-retriable validation-failure branch).
       - name: input
         value: |
           {
             "payment_id": "PAY-001",
             "amount": 100.00,
             "currency": "USD",
-            "from_account": "ACCT-001",
-            "to_account": "ACCT-002",
+            "from_account": "ACC-001",
+            "to_account": "ACC-003",
             "idempotency_key": "PAY-001"
           }
+      # Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+      # Every step sets search_path to "<bakeoff-ns>_dag3".
+      - name: bakeoff-ns
+        value: "argo"
   templates:
     # ---------- Main DAG ----------
     - name: payment-pipeline
@@ -129,6 +137,24 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded accounts, so it is NOT self-creating. Check
+          # it up front: SET search_path to a missing schema succeeds silently
+          # and every later query then fails with "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag3"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           is_valid = False
 
           try:
@@ -189,6 +215,8 @@ spec:
         env:
           - name: INPUT
             value: "{{workflow.parameters.input}}"
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -322,6 +350,24 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded accounts, so it is NOT self-creating. Check
+          # it up front: SET search_path to a missing schema succeeds silently
+          # and every later query then fails with "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag3"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
               now = datetime.now(timezone.utc).isoformat()
@@ -380,6 +426,8 @@ spec:
               conn.close()
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -473,6 +521,24 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded accounts, so it is NOT self-creating. Check
+          # it up front: SET search_path to a missing schema succeeds silently
+          # and every later query then fails with "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag3"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
               now = datetime.now(timezone.utc).isoformat()
@@ -508,6 +574,8 @@ spec:
           sys.exit(1)
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT

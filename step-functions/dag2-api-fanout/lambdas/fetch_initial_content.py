@@ -46,7 +46,7 @@ def handler(event, context):
         items.append(
             {
                 "id": item.get("id"),
-                "name": item.get("name", item.get("id")),
+                "name": item.get("title") or item.get("name") or item.get("id"),
                 "detail_url": item.get("url"),
             }
         )

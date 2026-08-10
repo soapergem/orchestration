@@ -27,7 +27,7 @@ Run with:
         --amount 150.00 \
         --currency USD \
         --from-account ACC-001 \
-        --to-account ACC-002 \
+        --to-account ACC-003 \
         --run-id my-run-001
 """
 
@@ -37,9 +37,9 @@ import random
 import time
 from datetime import datetime, timezone
 
-import luigi
 import psycopg2
 
+import luigi
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -56,14 +56,38 @@ DB_CONFIG = {
 MARKER_DIR = os.environ.get("LUIGI_MARKER_DIR", "/tmp/luigi-markers/dag3")
 
 
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "luigi")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag3"
+
+
 def get_db_connection():
-    return psycopg2.connect(
+    """Connection scoped to this runner's DAG 3 schema.
+
+    This schema holds seeded accounts, so it is not self-creating. The check is
+    deliberate: SET search_path to a nonexistent schema succeeds silently, and
+    every later query then fails with a confusing "relation does not exist".
+    """
+    conn = psycopg2.connect(
         host=DB_CONFIG["host"],
         port=DB_CONFIG["port"],
         database=DB_CONFIG["database"],
         user=DB_CONFIG["user"],
         password=DB_CONFIG["password"],
     )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (BAKEOFF_SCHEMA,),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{BAKEOFF_SCHEMA}" does not exist -- seed it with: '
+                f"just seed {BAKEOFF_NS}"
+            )
+        cur.execute(f'SET search_path TO "{BAKEOFF_SCHEMA}"')
+    return conn
 
 
 # ---------------------------------------------------------------------------

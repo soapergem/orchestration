@@ -17,4 +17,10 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "pyarrow>=16",
     "psycopg2-binary>=2.9.12",
+    # DAG 1 Parquet conversion (airflow/dagster/flyte/hatchet/prefect) and the
+    # requests-based HTTP calls in the airflow/dagster implementations.
+    "pandas>=2.2",
+    "requests>=2.32",
+    "prefect-docker>=0.7.3",
+    "conductor-python>=2.0.0",
 ]

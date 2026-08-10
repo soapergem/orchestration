@@ -1,3 +1,10 @@
+# NOTE ON THE `domain:` FIELDS BELOW
+# They ship as `example.com` placeholders on purpose. `deploy.sh` overrides all
+# four from $BASE_DOMAIN (or $PUBLIC_DOMAIN) at install time, so the normal path
+# is to set that in `.envrc` -- see `.envrc.example` -- and never edit this file.
+# Deploying with the placeholders left in place gives you ingress rules that
+# resolve nowhere and a cert-manager Order that retries forever.
+
 image:
   # Pre-existing docker-registry secret for pulling from private ECR. The K3s
   # cluster refreshes this out-of-band; the chart only references it. Set to ""
@@ -19,7 +26,7 @@ callbackFetch:
   tag: latest
   replicas: 1
   port: 8090
-  domain: orch-callback-fetch.gemovationlabs.com
+  domain: orch-callback-fetch.example.com
   autoResume: "true"                   # resume the SFN task as soon as the fetch completes
 
 approval:
@@ -28,7 +35,7 @@ approval:
   tag: latest
   replicas: 1
   port: 8091
-  domain: orch-approval.gemovationlabs.com
+  domain: orch-approval.example.com
   autoDecideDelaySeconds: "10"         # auto-decide + resume after a delay (hands-off DAG 4)
   autoDecideAction: approved
 
@@ -38,7 +45,31 @@ shipping:
   tag: latest
   replicas: 1
   port: 8092
-  domain: orch-shipping.gemovationlabs.com
+  domain: orch-shipping.example.com
+
+# Read-only Books API for DAG 2 plus DAG 1's ZIP (RUNNING.md 0b). No DB, no AWS.
+# The Step Functions path needs it publicly reachable (Lambdas run outside the
+# cluster); in-cluster callers (Argo, Flyte) use http://fixture-service:8099.
+fixture:
+  name: fixture-service
+  repository: ""                       # <acct>.dkr.ecr.us-east-1.amazonaws.com/fixture-service
+  tag: latest
+  replicas: 1
+  port: 8099
+  domain: orch-fixture.example.com
+  defaultPerPage: "5"                  # raise past 20 to exercise DAG 2's concurrency cap
+  baseUrl: ""                          # leave empty: detail URLs are derived per request
+  # Neither data file is committed or baked into the image; the pod fetches both
+  # from S3 on boot. From `terraform output fixture_books_url` /
+  # `fixture_sample_zip_url`.
+  #  - booksUrl empty  -> /books and /health return 503 (readiness fails, loudly)
+  #  - sampleZipUrl empty -> only /sample-data.zip fails; DAG 2 is unaffected
+  booksUrl: ""                         # s3://<bucket>/input/books.json.gz
+  sampleZipUrl: ""                     # s3://<bucket>/input/sample-data.zip
+  # Secret holding the read-only S3 creds from `terraform output
+  # fixture_reader_access_key_id` / `..._secret_access_key`.
+  # Keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Only needed for an s3:// URL.
+  s3SecretName: fixture-s3-creds
 
 ingress:
   enabled: true

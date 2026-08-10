@@ -5,9 +5,13 @@ variable "aws_region" {
 }
 
 variable "aws_profile" {
-  description = "Named AWS CLI/SDK profile to authenticate with."
+  description = <<-EOT
+    Named AWS CLI/SDK profile to authenticate with, from ~/.aws/credentials.
+    Deliberately has NO default: a hard-coded profile name silently fails on
+    every machine but the one it was written on. Set it in terraform.tfvars, or
+    export TF_VAR_aws_profile (see .envrc.example).
+  EOT
   type        = string
-  default     = "soapergem"
 }
 
 variable "name_prefix" {
@@ -39,13 +43,29 @@ variable "lambda_architecture" {
 }
 
 variable "mock_service_base_domain" {
-  description = "Base domain for the mock services on K3s. Hostnames are <prefix><service>.<domain>, e.g. orch-callback-fetch.<domain>."
+  description = <<-EOT
+    Base domain for the publicly-reachable mock services. Hostnames are
+    <prefix><service>.<domain>, e.g. orch-callback-fetch.<domain>. Must be a
+    domain whose DNS you control, since cert-manager issues certificates for
+    those names. No default: set it in terraform.tfvars or export
+    TF_VAR_mock_service_base_domain (see .envrc.example).
+  EOT
   type        = string
-  default     = "gemovationlabs.com"
 }
 
 variable "mock_service_subdomain_prefix" {
   description = "Prefix applied to each mock-service subdomain. Must match the domains in shared-services/deploy/values.yaml."
   type        = string
   default     = "orch-"
+}
+
+variable "bakeoff_ns" {
+  description = <<-EOT
+    Schema namespace for this runner (shared-services/init-db.sql). The lambdas'
+    db.py pins search_path to <bakeoff_ns>_dag1/_dag3/_dag4. Neon is shared with
+    the Google Workflows implementation, so this is what keeps the two apart.
+    Seed it first: SELECT bootstrap_bakeoff('stepfunctions');
+  EOT
+  type        = string
+  default     = "stepfunctions"
 }

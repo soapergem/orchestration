@@ -1,16 +1,30 @@
 # API Fan-Out with Async Callback: Create callback, submit fetch, await result, fan-out, combine
-# Deploy: gcloud workflows deploy api-fanout --source=dag2_api_fanout.yaml
 #
-# Google Workflows has first-class HTTP callback support via events.create_callback_endpoint
-# and events.await_callback. The workflow suspends with zero resource cost during the wait.
+# Deploy: terraform/gcp
 #
-# Expected input:
+# This is the DAG that shows Google Workflows at its best.
+# events.create_callback_endpoint mints a URL, events.await_callback suspends the
+# execution against it, and the workflow is *not running* while it waits -- no
+# worker, no poller, no billed step, and the wait can last up to a year. Compare
+# Airflow, which polls from its triggerer, and Luigi, which cannot suspend at all.
+#
+# The callback URL goes to the callback-fetch service under the broker's
+# `google_workflows` provider (RUNNING.md 2b). It needs its own provider rather
+# than plain `http_callback` because a callback endpoint lives on
+# workflowexecutions.googleapis.com and rejects an unauthenticated POST -- the
+# broker mints a Google access token for it. The service runs with
+# AUTO_RESUME=true, so it fetches and resumes hands-off.
+#
+# Note the auth asymmetry: no step here carries an `auth` block. The fetch service
+# and the fixture are both public HTTPS on the Kubernetes cluster, so sending a GCP
+# OIDC token to either would be wrong. Only DAG 1/3/4, which call the *private*
+# Cloud Run task service, authenticate. The token in this DAG travels the other
+# direction: from the broker back into Workflows.
+#
+# Expected input (all optional; env vars supply the defaults):
 # {
-#   "url": "https://api.github.com/orgs/google/repos",
-#   "request_config": {
-#     "callback_fetch_service_url": "http://callback-fetch-service:8090",
-#     "api_key": "optional-bearer-token"
-#   }
+#   "url": "https://<fixture-service>/books",
+#   "request_config": { "callback_fetch_service_url": "https://..." }
 # }
 
 main:
@@ -18,9 +32,20 @@ main:
   steps:
     - init:
         assign:
-          - fetch_url: ${input.url}
-          - request_config: ${default(map.get(input, "request_config"), {})}
-          - callback_fetch_service_url: ${default(map.get(request_config, "callback_fetch_service_url"), "http://callback-fetch-service:8090")}
+          # `{}` is NOT a literal in the Workflows expression language -- an
+          # inline `${default(..., {})}` is a parse error at deploy time. Bind the
+          # empty map as a plain YAML value first, then reference it.
+          - empty_map: {}
+          # Must exist before `parallel: shared:` can declare it.
+          - api_results: []
+          - request_config: ${default(map.get(input, "request_config"), empty_map)}
+          # `base=` matters: the fixture derives each item's detail URL from it,
+          # and its in-cluster default (http://fixture-service:8099) is
+          # unreachable from here. per_page=30 gives a fan-out worth measuring --
+          # the service defaults to 5.
+          - fixture_base: ${sys.get_env("FIXTURE_SERVICE_URL")}
+          - fetch_url: ${default(map.get(input, "url"), fixture_base + "/books?per_page=30&base=" + fixture_base)}
+          - callback_fetch_service_url: ${default(map.get(request_config, "callback_fetch_service_url"), sys.get_env("CALLBACK_FETCH_SERVICE_URL"))}
 
     # Step 1: Create a unique callback endpoint. Google Workflows generates a URL
     # that external services can POST to in order to resume this workflow execution.
@@ -42,8 +67,13 @@ main:
               User-Agent: "orchestration-bakeoff/1.0"
             body:
               url: ${fetch_url}
-              headers: ${default(map.get(request_config, "fetch_headers"), {})}
-              callback_url: ${callback_details.url}
+              headers: ${default(map.get(request_config, "fetch_headers"), empty_map)}
+              # A callback endpoint on workflowexecutions.googleapis.com only
+              # accepts an AUTHENTICATED POST, so the broker needs its own
+              # provider: `http_callback` posts bare JSON and would get 401.
+              provider: "google_workflows"
+              resume_data:
+                callback_url: ${callback_details.url}
               correlation_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
             timeout: 10
           result: submit_response
@@ -84,7 +114,7 @@ main:
           steps:
             - check_timeout:
                 switch:
-                  - condition: ${"TimeoutError" in e.message}
+                  - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
                     raise:
                       code: "CALLBACK_TIMEOUT"
                       message: "Async fetch did not complete within 60 seconds"
@@ -112,6 +142,8 @@ main:
     - fan_out_api_requests:
         try:
           parallel:
+            # Spec cap (README.md).
+            concurrency_limit: 20
             shared: [api_results]
             for:
               value: item
@@ -151,7 +183,7 @@ main:
                           data: ${detail_response.body}
                 - collect_detail:
                     assign:
-                      - api_results: ${list.concat(default(api_results, []), [detail_entry])}
+                      - api_results: ${list.concat(default(api_results, []), detail_entry)}
         except:
           as: e
           steps:
@@ -206,11 +238,11 @@ process_fetch_result:
                 assign:
                   - new_item:
                       id: ${raw_item.id}
-                      name: ${default(map.get(raw_item, "name"), string(raw_item.id))}
+                      name: ${default(map.get(raw_item, "title"), default(map.get(raw_item, "name"), string(raw_item.id)))}
                       detail_url: ${raw_item.url}
             - append_item:
                 assign:
-                  - items: ${list.concat(items, [new_item])}
+                  - items: ${list.concat(items, new_item)}
     - return_processed:
         return:
           source_url: ${source_url}
@@ -253,13 +285,13 @@ retry_on_server_error:
   steps:
     - check_error:
         switch:
-          - condition: ${e.code == 429}
+          - condition: ${default(map.get(e, "code"), 0) == 429}
             return: true
-          - condition: ${e.code >= 500 and e.code < 600}
+          - condition: ${default(map.get(e, "code"), 0) >= 500 and default(map.get(e, "code"), 0) < 600}
             return: true
-          - condition: ${"ConnectionError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "ConnectionError")}
             return: true
-          - condition: ${"TimeoutError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
             return: true
         next: return_false
     - return_false:

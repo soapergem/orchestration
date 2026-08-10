@@ -1,0 +1,16 @@
+# Low-value order: total 59.98 < 500 threshold, so it ships inline in job 1
+# with no approval round-trip.
+ops:
+  validate_order:
+    config:
+      order_id: ORD-DAGSTER-LOW-001
+      customer_id: CUST-42
+      items:
+        - sku: WIDGET-A
+          quantity: 2
+      shipping_address:
+        street: 456 Congress Ave
+        city: Austin
+        state: TX
+        zip: "78701"
+      approval_threshold: 500.0

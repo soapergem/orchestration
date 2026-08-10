@@ -18,12 +18,20 @@ Hatchet features used:
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import httpx
 import psycopg2
-
-from hatchet_sdk import Context, DurableContext, Hatchet, NonRetryableException
+from hatchet_sdk import (
+    Context,
+    DurableContext,
+    Hatchet,
+    NonRetryableException,
+    SleepCondition,
+    UserEventCondition,
+)
+from hatchet_sdk.conditions import OrGroup
 
 hatchet = Hatchet()
 
@@ -45,20 +53,57 @@ APPROVAL_SERVICE_URL = os.environ.get(
 SHIPPING_SERVICE_URL = os.environ.get(
     "SHIPPING_SERVICE_URL", "http://shipping-service:8092"
 )
-HATCHET_EVENT_API_URL = os.environ.get(
-    "HATCHET_EVENT_API_URL", "http://localhost:8080/api/v1/events"
+# Callback target is event_relay.py -- see the note in dag2_api_fanout.py.
+HATCHET_EVENT_RELAY_URL = os.environ.get(
+    "HATCHET_EVENT_RELAY_URL", "http://host.containers.internal:8096"
 )
+# How long ManagerApproval waits for a decision before compensating.
+APPROVAL_TIMEOUT_SECONDS = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "120"))
+# Condition keys -- the engine returns matches keyed by `readable_data_key`, so
+# these are how we tell "a decision arrived" from "the wait expired".
+APPROVAL_EVENT_KEY = "approval_decision"
+APPROVAL_TIMEOUT_KEY = "approval_timeout"
+
+
+def _extract_event_payload(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Pull the event payload out of an `aio_wait_for` result.
+
+    Shape is ``{"CREATE": {"<readable_data_key>": [payload, ...]}}``. Returns
+    None when only the sleep branch matched, i.e. the wait timed out.
+    """
+    matches = result.get("CREATE", {})
+    payloads = matches.get(APPROVAL_EVENT_KEY)
+    if not payloads:
+        return None
+    return payloads[0]
+
+
+# Per-(runner, DAG) schema isolation -- see CLAUDE.md. Like DAG 3, this one fails
+# fast: it needs the seeded customers/inventory/orders fixtures.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "hatchet")
+SCHEMA = f"{BAKEOFF_NS}_dag4"
 
 
 def get_db_connection(db_config: dict | None = None) -> psycopg2.extensions.connection:
     cfg = db_config or DB_CONFIG
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg.get("port", 5432),
         dbname=cfg.get("dbname", cfg.get("database", "orchestration")),
         user=cfg["user"],
         password=cfg["password"],
     )
+    schema = cfg.get("schema", SCHEMA)
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (schema,))
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- run `just seed {BAKEOFF_NS}` first'
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +150,20 @@ async def reserve_items(input: dict, context: Context) -> dict:
                 "idempotent": True,
             }
 
+        # The orders row MUST exist before any reservation references it --
+        # inventory_reservations.order_id is a non-deferrable FK, so inserting
+        # reservations first fails for every new order_id.
+        total = sum(i["quantity"] * i["unit_price"] for i in items)
+        cur.execute(
+            """
+            INSERT INTO orders (order_id, customer_id, total_amount, status)
+            VALUES (%s, %s, %s, 'reserved')
+            ON CONFLICT (order_id)
+                DO UPDATE SET status = 'reserved', updated_at = NOW()
+            """,
+            (order_id, customer_id, total),
+        )
+
         items_reserved = []
         for item in items:
             sku = item["sku"]
@@ -135,18 +194,6 @@ async def reserve_items(input: dict, context: Context) -> dict:
                 (f"{reservation_id}-{sku}", order_id, sku, quantity),
             )
             items_reserved.append(sku)
-
-        # Create / update the order record
-        total = sum(i["quantity"] * i["unit_price"] for i in items)
-        cur.execute(
-            """
-            INSERT INTO orders (order_id, customer_id, total_amount, status)
-            VALUES (%s, %s, %s, 'reserved')
-            ON CONFLICT (order_id)
-                DO UPDATE SET status = 'reserved', updated_at = NOW()
-            """,
-            (order_id, customer_id, total),
-        )
 
         conn.commit()
 
@@ -188,9 +235,10 @@ async def request_approval(input: dict, context: Context) -> dict:
 
     approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
 
-    # Callback URL points to Hatchet's event API
+    # Callback URL points at the relay, which turns the decision POST into an
+    # "approval_decision" Hatchet event carrying our order_id.
     callback_url = (
-        f"{HATCHET_EVENT_API_URL}"
+        f"{HATCHET_EVENT_RELAY_URL.rstrip('/')}/approval-callback"
         f"?event_type=approval_decision"
         f"&order_id={order_id}"
         f"&approval_request_id={approval_request_id}"
@@ -257,6 +305,9 @@ async def request_approval(input: dict, context: Context) -> dict:
 @manager_approval_wf.durable_task(
     name="wait_for_approval",
     parents=[request_approval],
+    # See dag2: the 1-minute default would cancel the wait long before the
+    # approval timeout below ever fires. Keep this comfortably above it.
+    execution_timeout=timedelta(seconds=APPROVAL_TIMEOUT_SECONDS + 120),
 )
 async def wait_for_approval(input: dict, context: DurableContext) -> dict:
     """
@@ -268,17 +319,38 @@ async def wait_for_approval(input: dict, context: DurableContext) -> dict:
     order_id = request_result["order_id"]
     approval_request_id = request_result["approval_request_id"]
 
-    try:
-        event_data = await context.aio_wait_for_event(
-            "approval_decision",
-            expression=f"{{{{ .order_id }}}} == '{order_id}'",
-        )
-    except TimeoutError:
-        # Approval timed out -- treat as expired
+    # `aio_wait_for_event` takes no timeout, so the wait must be expressed as an
+    # OrGroup of the event condition and a sleep -- whichever fires first wins.
+    # The engine returns {"CREATE": {"<signal key>": [payload]}}, and the key
+    # tells us which branch matched.
+    result = await context.aio_wait_for(
+        f"approval-{order_id}",
+        OrGroup(
+            [
+                UserEventCondition(
+                    event_key=APPROVAL_EVENT_KEY,
+                    # CEL addresses the event payload as `input`.
+                    expression=f"input.order_id == '{order_id}'",
+                    readable_data_key=APPROVAL_EVENT_KEY,
+                ),
+                SleepCondition(
+                    duration=timedelta(seconds=APPROVAL_TIMEOUT_SECONDS),
+                    readable_data_key=APPROVAL_TIMEOUT_KEY,
+                ),
+            ]
+        ),
+    )
+
+    event_data = _extract_event_payload(result)
+
+    if event_data is None:
+        # The sleep branch fired first: nobody decided in time.
         return {
             "decision": "expired",
             "approver": None,
-            "reason": "Approval request timed out",
+            "reason": (
+                f"Approval request timed out after {APPROVAL_TIMEOUT_SECONDS}s"
+            ),
             "decided_at": None,
             "approval_request_id": approval_request_id,
             "order_id": order_id,

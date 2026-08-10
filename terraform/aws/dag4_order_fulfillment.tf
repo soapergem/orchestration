@@ -24,7 +24,7 @@ locals {
   }
 
   dag4_env = { for k, v in local.dag4_lambdas : k => merge(
-    v.db ? { NEON_DB_PARAM = aws_ssm_parameter.neon_database_url.name } : {},
+    v.db ? { NEON_DB_PARAM = aws_ssm_parameter.neon_database_url.name, BAKEOFF_NS = var.bakeoff_ns } : {},
     v.approval ? { APPROVAL_SERVICE_URL = local.approval_url } : {},
     v.shipping ? { SHIPPING_SERVICE_URL = local.shipping_url } : {},
   ) }

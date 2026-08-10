@@ -1,10 +1,17 @@
 """Shared DB helper for the DAG 1 ETL lambdas.
 
-Same SSM-DSN pattern as the other DAGs, but every connection is pinned to a
-dedicated `dag1_etl` schema via search_path. DAG 1 creates tables named after
-the CSV files (orders, customers, products) plus combined_report; isolating
-them in their own schema keeps them from colliding with the public transactional
-tables that DAG 3/4 use in the same Neon database.
+Reads the Neon connection string (DSN) from an SSM Parameter Store SecureString
+named by the NEON_DB_PARAM env var, caches it across warm invocations, and
+returns a psycopg2 connection. Neon requires TLS; the DSN carries
+`sslmode=require`, so no extra connect args are needed.
+
+Every connection is pinned to this runner's DAG 1 schema via `search_path` --
+`<BAKEOFF_NS>_dag1`, the repo-wide convention from shared-services/init-db.sql.
+Self-creating, because DAG 1's tables are named after whatever CSVs the ZIP
+happens to contain (orders, customers, products) plus combined_report.
+
+Neon is shared with the Google Workflows implementation, so the namespace is what
+keeps the two apart: `stepfunctions_dag1` vs `google_workflows_dag1`.
 """
 
 import os
@@ -15,7 +22,8 @@ import psycopg2
 _ssm = boto3.client("ssm")
 _dsn = None
 
-SCHEMA = "dag1_etl"
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "stepfunctions")
+SCHEMA = f"{BAKEOFF_NS}_dag1"
 
 
 def _dsn_from_ssm():
@@ -29,7 +37,7 @@ def _dsn_from_ssm():
 def get_db_connection():
     conn = psycopg2.connect(_dsn_from_ssm())
     with conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        cur.execute(f"SET search_path TO {SCHEMA}")
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+        cur.execute(f'SET search_path TO "{SCHEMA}"')
     conn.commit()
     return conn

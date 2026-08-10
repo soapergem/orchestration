@@ -17,6 +17,10 @@ spec:
       - name: customer-id
         value: "unknown"
       - name: items
+      # Only used for standalone submission: via templateRef this resolves
+      # against the calling workflow, which defines its own bakeoff-ns.
+      - name: bakeoff-ns
+        value: "argo"
   templates:
     - name: reserve-inventory
       inputs:
@@ -66,6 +70,25 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # This schema holds seeded customers/inventory, so it is NOT
+          # self-creating. Check it up front: SET search_path to a missing schema
+          # succeeds silently and every later query then fails with
+          # "relation does not exist".
+          BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "argo")
+          SCHEMA = f"{BAKEOFF_NS}_dag4"
+          with conn.cursor() as _cur:
+              _cur.execute(
+                  "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                  (SCHEMA,),
+              )
+              if _cur.fetchone() is None:
+                  raise RuntimeError(
+                      f'schema "{SCHEMA}" does not exist -- seed it with: '
+                      f"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');"
+                  )
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+
           try:
               cur = conn.cursor()
 
@@ -86,6 +109,20 @@ spec:
                       json.dump(result, f)
                   print(f"Idempotent: reservation {existing[0]} already exists")
                   sys.exit(0)
+
+              # The orders row MUST be inserted before any inventory_reservations
+              # row: inventory_reservations.order_id carries a non-deferrable FK
+              # to orders(order_id), so reserving first fails with a foreign-key
+              # violation for any order_id that does not already exist.
+              total = sum(i["quantity"] * i.get("unit_price", 0) for i in items)
+              cur.execute(
+                  """
+                  INSERT INTO orders (order_id, customer_id, total_amount, status)
+                  VALUES (%s, %s, %s, 'reserved')
+                  ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+                  """,
+                  (order_id, customer_id, total),
+              )
 
               items_reserved = []
               for item in items:
@@ -116,16 +153,6 @@ spec:
                   )
                   items_reserved.append(sku)
 
-              # Create/update the order record
-              total = sum(i["quantity"] * i.get("unit_price", 0) for i in items)
-              cur.execute(
-                  """
-                  INSERT INTO orders (order_id, customer_id, total_amount, status)
-                  VALUES (%s, %s, %s, 'reserved')
-                  ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
-                  """,
-                  (order_id, customer_id, total),
-              )
 
               conn.commit()
 
@@ -146,6 +173,8 @@ spec:
               conn.close()
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT

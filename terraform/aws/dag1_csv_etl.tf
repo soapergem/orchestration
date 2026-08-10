@@ -6,7 +6,7 @@
 # (reads combined_report, writes Parquet to S3).
 #
 # DB-touching lambdas get the psycopg2 layer + NEON_DB_PARAM; their db.py pins a
-# dedicated `dag1_etl` schema so DAG 1's dynamic tables don't collide with the
+# dedicated `<BAKEOFF_NS>_dag1` schema so DAG 1's dynamic tables don't collide with the
 # DAG 3/4 transactional tables in the same Neon database. convert_to_parquet
 # also gets the pyarrow layer.
 # ---------------------------------------------------------------------------
@@ -55,6 +55,7 @@ resource "aws_lambda_function" "dag1" {
   environment {
     variables = {
       NEON_DB_PARAM = aws_ssm_parameter.neon_database_url.name
+      BAKEOFF_NS    = var.bakeoff_ns
     }
   }
 

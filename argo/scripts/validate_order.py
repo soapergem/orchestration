@@ -11,13 +11,34 @@ import psycopg2
 
 
 def get_connection():
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=os.environ.get("PGHOST", "postgres"),
         port=int(os.environ.get("PGPORT", "5432")),
         dbname=os.environ.get("PGDATABASE", "orchestration"),
         user=os.environ.get("PGUSER", "orchestration"),
         password=os.environ.get("PGPASSWORD", "orchestration"),
     )
+
+    # ---- Per-(runner, DAG) schema isolation ----
+    # Mirrors the inline copy in ../dag4-*.yaml. This schema holds seeded
+    # fixtures, so it is not self-creating: SET search_path to a missing schema
+    # succeeds silently and every later query then fails with a confusing
+    # "relation does not exist".
+    bakeoff_ns = os.environ.get("BAKEOFF_NS", "argo")
+    schema = f"{bakeoff_ns}_dag4"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (schema,),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- seed it with: '
+                f"SELECT bootstrap_bakeoff('{bakeoff_ns}');"
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    return conn
 
 
 def main():

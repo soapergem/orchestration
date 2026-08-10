@@ -1,0 +1,113 @@
+{
+  "name": "dag2_api_fanout",
+  "version": 1,
+  "description": "DAG 2: async callback (workflow suspends) -> branch -> dynamic detail fan-out -> combine",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 900,
+  "inputParameters": [
+    "correlation_id",
+    "per_page",
+    "auto_resume",
+    "fetch_url"
+  ],
+  "tasks": [
+    {
+      "name": "submit_async_fetch",
+      "taskReferenceName": "submit_fetch",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "workflow_id": "${workflow.workflowId}",
+        "correlation_id": "${workflow.input.correlation_id}",
+        "per_page": "${workflow.input.per_page}",
+        "auto_resume": "${workflow.input.auto_resume}",
+        "fetch_url": "${workflow.input.fetch_url}"
+      }
+    },
+    {
+      "name": "wait_for_fetch_callback",
+      "taskReferenceName": "wait_for_callback",
+      "type": "WAIT",
+      "inputParameters": {}
+    },
+    {
+      "name": "process_fetch_result",
+      "taskReferenceName": "process_result",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "callback_payload": "${wait_for_callback.output}"
+      }
+    },
+    {
+      "name": "check_items_exist",
+      "taskReferenceName": "check_items",
+      "type": "SWITCH",
+      "evaluatorType": "value-param",
+      "expression": "has_items",
+      "inputParameters": {
+        "has_items": "${process_result.output.has_items}"
+      },
+      "decisionCases": {
+        "yes": [
+          {
+            "name": "prepare_detail_fanout",
+            "taskReferenceName": "prepare_fanout",
+            "type": "SIMPLE",
+            "inputParameters": {
+              "items": "${process_result.output.items}"
+            }
+          },
+          {
+            "name": "fan_out_details",
+            "taskReferenceName": "fan_out_details",
+            "type": "FORK_JOIN_DYNAMIC",
+            "dynamicForkTasksParam": "dynamicTasks",
+            "dynamicForkTasksInputParamName": "dynamicTasksInput",
+            "inputParameters": {
+              "dynamicTasks": "${prepare_fanout.output.dynamic_tasks}",
+              "dynamicTasksInput": "${prepare_fanout.output.dynamic_inputs}"
+            }
+          },
+          {
+            "name": "join_details",
+            "taskReferenceName": "join_details",
+            "type": "JOIN"
+          },
+          {
+            "name": "combine_results",
+            "taskReferenceName": "combine",
+            "type": "SIMPLE",
+            "inputParameters": {
+              "detail_results": "${join_details.output}",
+              "item_count": "${process_result.output.item_count}"
+            }
+          }
+        ]
+      },
+      "defaultCase": [
+        {
+          "name": "no_items_found",
+          "taskReferenceName": "no_items",
+          "type": "TERMINATE",
+          "inputParameters": {
+            "terminationStatus": "COMPLETED",
+            "workflowOutput": {
+              "outcome": "no_items",
+              "requested": 0,
+              "success_count": 0,
+              "failure_count": 0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "outputParameters": {
+    "correlation_id": "${workflow.input.correlation_id}",
+    "outcome": "fanned_out",
+    "item_count": "${process_result.output.item_count}",
+    "summary": "${combine.output}"
+  }
+}

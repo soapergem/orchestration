@@ -32,6 +32,10 @@ from typing import Any
 import httpx
 import psycopg2
 from prefect import flow, get_run_logger, task
+from prefect.deployments import run_deployment
+from prefect.exceptions import FlowPauseTimeout
+from prefect.flow_runs import pause_flow_run, suspend_flow_run
+from prefect.runtime import flow_run as runtime_flow_run
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -50,6 +54,36 @@ APPROVAL_SERVICE_URL = os.environ.get(
 )
 SHIPPING_SERVICE_URL = os.environ.get(
     "SHIPPING_SERVICE_URL", "http://shipping-service:8092"
+)
+
+# Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+BAKEOFF_NS = os.environ.get("BAKEOFF_NS", "prefect")
+BAKEOFF_SCHEMA = f"{BAKEOFF_NS}_dag4"
+
+# How the manager-approval wait is implemented:
+#   "suspend" -- suspend_flow_run(): the approval flow's PROCESS EXITS while
+#                waiting and is rescheduled on resume. Zero resource cost, but
+#                requires (a) a deployment and (b) the approval flow to be a
+#                TOP-LEVEL run, because Prefect raises "Cannot suspend subflows".
+#                So this mode invokes it via run_deployment() instead of as an
+#                in-process subflow. See serve_dag4.py.
+#   "pause"   -- pause_flow_run(): process stays alive polling for the resume.
+#                Native suspend/resume semantics, no deployment needed.
+#   "poll"    -- loop on GET /approval-requests/<id>. Kept for A/B comparison.
+APPROVAL_WAIT_MODE = os.environ.get("APPROVAL_WAIT_MODE", "pause").lower()
+
+# Deployment invoked for the approval step when APPROVAL_WAIT_MODE=suspend.
+MANAGER_APPROVAL_DEPLOYMENT = os.environ.get(
+    "MANAGER_APPROVAL_DEPLOYMENT", "manager_approval_flow/dag4-manager-approval"
+)
+
+# Base Prefect API URL as seen FROM the approval-service CONTAINER, used to build
+# the resume callback. This is NOT localhost: localhost inside the container is
+# the container. Use the runtime's host-gateway hostname (RUNNING.md §2) --
+# host.containers.internal on Podman, host.docker.internal on Docker/finch. The
+# server must also be bound to 0.0.0.0, not 127.0.0.1, to accept it.
+PREFECT_RESUME_API_URL = os.environ.get(
+    "PREFECT_RESUME_API_URL", "http://host.containers.internal:4200/api"
 )
 
 
@@ -82,14 +116,29 @@ class ShippingTransientError(Exception):
 # ---------------------------------------------------------------------------
 
 def _get_db_connection(db_config: dict | None = None):
+    """Connection scoped to this runner's DAG 4 schema (``<BAKEOFF_NS>_dag4``),
+    which holds the seeded customers/inventory this DAG validates against."""
     cfg = db_config or DB_CONFIG
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg.get("port", 5432),
         dbname=cfg["database"],
         user=cfg["user"],
         password=cfg["password"],
     )
+    schema = cfg.get("schema", BAKEOFF_SCHEMA)
+    with conn.cursor() as cur:
+        # Seeded schema, so it must already exist. SET search_path to a missing
+        # schema succeeds silently, so check up front and name the fix.
+        cur.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (schema,))
+        if cur.fetchone() is None:
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- seed it with: '
+                f"psql -c \"SELECT bootstrap_bakeoff('{BAKEOFF_NS}');\""
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    conn.commit()
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +246,22 @@ def reserve_inventory_task(
                     "idempotent": True,
                 }
 
+            # Upsert the order row FIRST: inventory_reservations.order_id has a
+            # non-deferrable FK to orders(order_id), so the reservation rows
+            # below cannot be inserted until the order exists.
+            total = sum(
+                i["quantity"] * i.get("unit_price", 0) for i in items
+            )
+            cur.execute(
+                """
+                INSERT INTO orders (order_id, customer_id, total_amount, status)
+                VALUES (%s, %s, %s, 'reserved')
+                ON CONFLICT (order_id) DO UPDATE
+                    SET status = 'reserved', updated_at = NOW()
+                """,
+                (order_id, customer_id, total),
+            )
+
             items_reserved = []
             for item in items:
                 sku = item["sku"]
@@ -227,20 +292,6 @@ def reserve_inventory_task(
                     (f"{reservation_id}-{sku}", order_id, sku, quantity),
                 )
                 items_reserved.append(sku)
-
-            # Upsert order record
-            total = sum(
-                i["quantity"] * i.get("unit_price", 0) for i in items
-            )
-            cur.execute(
-                """
-                INSERT INTO orders (order_id, customer_id, total_amount, status)
-                VALUES (%s, %s, %s, 'reserved')
-                ON CONFLICT (order_id) DO UPDATE
-                    SET status = 'reserved', updated_at = NOW()
-                """,
-                (order_id, customer_id, total),
-            )
 
         conn.commit()
         logger.info(
@@ -332,10 +383,24 @@ def submit_approval_request(
     total_amount: float,
     items: list[dict],
     db_config: dict | None = None,
+    resume_callback_url: str | None = None,
+    approval_request_id: str | None = None,
 ) -> str:
-    """POST an approval request to the approval-service. Returns the request id."""
+    """POST an approval request to the approval-service. Returns the request id.
+
+    ``approval_request_id`` may be supplied by the caller so the id is known
+    before the approval flow starts -- needed in "suspend" mode, where the parent
+    invokes the approval flow as a separate deployment run and must be able to
+    read the decision back afterwards. It also makes a re-executed submit
+    (which happens when a suspended run resumes) reuse the same id.
+
+    ``resume_callback_url`` is registered as the ``http_callback`` provider's
+    resume handle: when the manager decides, the service POSTs the decision
+    there. In "pause" mode it is Prefect's own resume endpoint, so the decision
+    un-pauses this flow run directly.
+    """
     logger = get_run_logger()
-    approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
+    approval_request_id = approval_request_id or f"APR-{uuid.uuid4().hex[:12].upper()}"
 
     items_summary = ", ".join(f"{i['quantity']}x {i['sku']}" for i in items)
 
@@ -344,8 +409,10 @@ def submit_approval_request(
         "order_id": order_id,
         "total_amount": total_amount,
         "customer_id": customer_id,
-        # In production, callback_url would point to Prefect's resume endpoint.
-        "callback_url": "http://localhost:0/noop",
+        # No resume URL in "poll" mode: the flow polls instead, so nothing should
+        # be resumed. The broker still requires a callback_url to infer the
+        # provider, hence the deliberately dead placeholder.
+        "callback_url": resume_callback_url or "http://localhost:0/noop",
         "items_summary": items_summary,
     }
 
@@ -390,6 +457,53 @@ def submit_approval_request(
         order_id,
     )
     return approval_request_id
+
+
+@task(name="read_approval_decision", retries=3, retry_delay_seconds=[1, 2, 4])
+def read_approval_decision(approval_request_id: str) -> dict:
+    """Single read of the recorded decision, used after a pause-based resume.
+
+    The resume only tells us *that* a decision happened; the decision itself is
+    read back from the service. (The alternative -- pause_flow_run(
+    wait_for_input=...) -- would carry the decision in the resume payload, but
+    requires the caller to POST a Prefect-shaped RunInput, which would couple the
+    approval service to Prefect's schema.)
+    """
+    logger = get_run_logger()
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.get(
+            f"{APPROVAL_SERVICE_URL}/approval-requests/{approval_request_id}"
+        )
+    resp.raise_for_status()
+    body = resp.json()
+    status = body.get("status")
+
+    if status not in ("approved", "rejected"):
+        # Resumed but nothing decided -- treat as expired rather than hanging.
+        logger.warning(
+            "Approval %s resumed with status=%s; treating as expired",
+            approval_request_id,
+            status,
+        )
+        return {
+            "decision": "expired",
+            "approver": None,
+            "reason": f"Resumed without a decision (status={status})",
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    logger.info(
+        "Approval %s decided: %s by %s",
+        approval_request_id,
+        status,
+        body.get("approver", "unknown"),
+    )
+    return {
+        "decision": status,
+        "approver": body.get("approver"),
+        "reason": body.get("reason", ""),
+        "decided_at": body.get("decided_at", datetime.now(timezone.utc).isoformat()),
+    }
 
 
 @task(name="poll_approval_decision")
@@ -641,6 +755,76 @@ def send_order_notification(
     }
 
 
+def run_approval_deployment(
+    approval_params: dict,
+    approval_request_id: str,
+    order_id: str,
+    timeout: int,
+    db_config: dict | None = None,
+) -> dict:
+    """Run the manager-approval deployment and return its decision.
+
+    Used only in "suspend" mode. ``run_deployment`` blocks until the child run
+    finishes -- including across its suspension -- so the CHILD's process exits
+    while waiting but this parent process does not. Making the whole chain
+    zero-cost would mean suspending the parent too, or splitting it into
+    event-triggered deployments.
+
+    The decision is read back from the approval service rather than from the
+    child run's return value, so no result-serialization round trip is needed.
+    """
+    logger = get_run_logger()
+
+    # as_subflow=False is REQUIRED, not cosmetic. run_deployment() defaults to
+    # linking the child via parent_task_run_id, and Prefect rejects suspending
+    # any run with a parent ("Cannot suspend subflows") -- being a deployment run
+    # is not sufficient. The cost is real: severing that link also removes the
+    # parent/child nesting from the UI, so DAG 4's sub-workflow lineage is no
+    # longer visible as a tree. Zero-cost suspension and composition lineage are
+    # mutually exclusive here.
+    #
+    # +30s so the child's own timeout fires first and it can record "expired"
+    # itself, rather than this wait giving up on a still-running child.
+    flow_run = run_deployment(
+        name=MANAGER_APPROVAL_DEPLOYMENT,
+        parameters=approval_params,
+        timeout=timeout + 30,
+        as_subflow=False,
+    )
+
+    state = flow_run.state
+    logger.info(
+        "Approval deployment run %s finished in state %s",
+        flow_run.id,
+        state.type if state else "UNKNOWN",
+    )
+
+    if state and state.is_completed():
+        return read_approval_decision(approval_request_id=approval_request_id)
+
+    # Crashed, timed out, or was cancelled -- fail closed so the saga compensates
+    # rather than shipping an order whose approval status is unknown.
+    logger.warning(
+        "Approval deployment run %s did not complete (state=%s) — treating as expired",
+        flow_run.id,
+        state.type if state else "UNKNOWN",
+    )
+    decision = {
+        "decision": "expired",
+        "approver": None,
+        "reason": f"Approval flow did not complete (state={state.type if state else 'UNKNOWN'})",
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # The child records its own decision on the happy path; on this path it
+    # could not, so record it here.
+    return record_approval_decision(
+        approval_request_id=approval_request_id,
+        order_id=order_id,
+        decision=decision,
+        db_config=db_config,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sub-flows
 # ---------------------------------------------------------------------------
@@ -661,7 +845,9 @@ def reserve_inventory_flow(
     )
 
 
-@flow(name="manager_approval_flow")
+# persist_result is required for suspend_flow_run(): the run is rescheduled on
+# resume and re-executes, so completed task states must be retrievable.
+@flow(name="manager_approval_flow", persist_result=True)
 def manager_approval_flow(
     order_id: str,
     customer_id: str,
@@ -670,31 +856,85 @@ def manager_approval_flow(
     db_config: dict | None = None,
     poll_interval: int = 5,
     poll_timeout: int = 120,
+    approval_request_id: str | None = None,
 ) -> dict:
     """
     Sub-flow: Request manager approval and wait for the decision.
 
-    Uses polling against the approval-service status endpoint.  In production
-    this would use ``pause_flow_run(timeout=120)`` with the approval-service
-    callback hitting the Prefect resume API.
+    Three wait strategies, selected by ``APPROVAL_WAIT_MODE`` (see module header):
+
+    "suspend" -- ``suspend_flow_run()``: this process EXITS while waiting and is
+        rescheduled when the approval service hits the resume endpoint. Zero
+        resource cost. Only valid when this flow is a top-level deployment run
+        (Prefect: "Cannot suspend subflows"), so the parent invokes it via
+        ``run_deployment()``.
+
+    "pause" (default) -- ``pause_flow_run()``: process stays alive polling for
+        the resume, so a slot is still held. No deployment required.
+
+    "poll" -- the original loop against GET /approval-requests/<id>.
     """
     logger = get_run_logger()
 
-    # Submit the approval request
+    use_suspend = APPROVAL_WAIT_MODE == "suspend"
+    use_pause = APPROVAL_WAIT_MODE == "pause"
+
+    # For both native modes the resume target is THIS flow run. Read the id from
+    # the runtime rather than threading it in, so it is correct whether this flow
+    # is an in-process subflow or its own deployment run.
+    resume_callback_url = None
+    if use_suspend or use_pause:
+        this_run_id = runtime_flow_run.id
+        resume_callback_url = (
+            f"{PREFECT_RESUME_API_URL.rstrip('/')}/flow_runs/{this_run_id}/resume"
+        )
+        logger.info("Approval will resume flow run %s", this_run_id)
+
+    # Submit the approval request. On a suspend-resume the flow function
+    # re-executes from the top; the cached task state means this does not
+    # re-submit, and the caller-supplied id keeps it stable regardless.
     approval_request_id = submit_approval_request(
         order_id=order_id,
         customer_id=customer_id,
         total_amount=total_amount,
         items=items,
         db_config=db_config,
+        resume_callback_url=resume_callback_url,
+        approval_request_id=approval_request_id,
     )
 
-    # Poll for the decision
-    decision = poll_approval_decision(
-        approval_request_id=approval_request_id,
-        poll_interval=poll_interval,
-        poll_timeout=poll_timeout,
-    )
+    if use_suspend:
+        # Process exits here and is rescheduled on resume. No poll_interval:
+        # nothing is polling, the run is simply not running.
+        suspend_flow_run(timeout=poll_timeout)
+        decision = read_approval_decision(approval_request_id=approval_request_id)
+    elif use_pause:
+        try:
+            # Blocks until the approval service POSTs to the resume endpoint.
+            # poll_interval bounds how quickly the resume is noticed.
+            pause_flow_run(timeout=poll_timeout, poll_interval=poll_interval)
+        except FlowPauseTimeout:
+            logger.warning(
+                "Approval %s not decided within %ds — treating as expired",
+                approval_request_id,
+                poll_timeout,
+            )
+            decision = {
+                "decision": "expired",
+                "approver": None,
+                "reason": "Approval request timed out",
+                "decided_at": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            decision = read_approval_decision(
+                approval_request_id=approval_request_id
+            )
+    else:
+        decision = poll_approval_decision(
+            approval_request_id=approval_request_id,
+            poll_interval=poll_interval,
+            poll_timeout=poll_timeout,
+        )
 
     # Record the decision in the database
     recorded = record_approval_decision(
@@ -732,26 +972,48 @@ def shipping_flow(
 
 @flow(name="order_fulfillment", log_prints=True)
 def order_fulfillment(
-    order_id: str,
-    customer_id: str,
-    items: list[dict],
-    shipping_address: dict,
+    order_id: str | None = None,
+    customer_id: str = "CUST-42",
+    items: list[dict] | None = None,
+    shipping_address: dict | None = None,
     approval_threshold: float = 500.00,
     db_config: dict | None = None,
+    approval_timeout: int = 120,
+    approval_poll_interval: int = 5,
 ) -> dict:
     """
     Order fulfillment pipeline with saga compensation:
       1. Validate order (read-only, no compensation needed)
       2. Reserve inventory (sub-flow) — compensation: release_inventory
-      3. If total >= threshold: manager approval (sub-flow with polling wait)
+      3. If total >= threshold: manager approval (sub-flow; pauses or polls)
       4. Ship order (sub-flow with retries)
       5. Update order status & notify
 
     On failure after inventory is reserved, compensations are executed in
     reverse order to ensure consistency.
+
+    ``order_id`` is the reservation's idempotency key, so it defaults to a fresh
+    generated id: a deployment has static parameters, and a constant id would make
+    every run after the first an idempotent no-op. ``items`` defaults to
+    GADGET-B + WIDGET-A ($529.98) from the bootstrap_bakeoff() seed, which clears
+    the $500 threshold and so exercises the approval path.
     """
     logger = get_run_logger()
     cfg = db_config or DB_CONFIG
+    order_id = order_id or f"ORD-{uuid.uuid4().hex[:12].upper()}"
+    if items is None:
+        items = [
+            {"sku": "GADGET-B", "quantity": 1, "unit_price": 499.99},
+            {"sku": "WIDGET-A", "quantity": 1, "unit_price": 29.99},
+        ]
+    if shipping_address is None:
+        shipping_address = {
+            "street": "123 Main St",
+            "city": "Springfield",
+            "state": "IL",
+            "zip": "62701",
+            "country": "US",
+        }
     compensations: list[tuple[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -796,13 +1058,33 @@ def order_fulfillment(
                 total_amount,
                 approval_threshold,
             )
-            decision = manager_approval_flow(
-                order_id=order_id,
-                customer_id=customer_id,
-                total_amount=total_amount,
-                items=items,
-                db_config=cfg,
-            )
+            approval_params = {
+                "order_id": order_id,
+                "customer_id": customer_id,
+                "total_amount": total_amount,
+                "items": items,
+                "db_config": cfg,
+                "poll_interval": approval_poll_interval,
+                "poll_timeout": approval_timeout,
+            }
+
+            if APPROVAL_WAIT_MODE == "suspend":
+                # The approval flow must be a top-level run to suspend, so invoke
+                # its deployment instead of calling it as a subflow. Its id is
+                # fixed up front so the decision can be read back here.
+                approval_request_id = f"APR-{uuid.uuid4().hex[:12].upper()}"
+                decision = run_approval_deployment(
+                    approval_params={
+                        **approval_params,
+                        "approval_request_id": approval_request_id,
+                    },
+                    approval_request_id=approval_request_id,
+                    order_id=order_id,
+                    timeout=approval_timeout,
+                    db_config=cfg,
+                )
+            else:
+                decision = manager_approval_flow(**approval_params)
 
             if decision["decision"] == "rejected":
                 raise OrderRejected(
@@ -911,20 +1193,17 @@ def order_fulfillment(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    result = order_fulfillment(
-        order_id="ORD-001",
-        customer_id="CUST-001",
-        items=[
-            {"sku": "SKU-A", "quantity": 2, "unit_price": 150.00},
-            {"sku": "SKU-B", "quantity": 1, "unit_price": 300.00},
-        ],
-        shipping_address={
-            "street": "123 Main St",
-            "city": "Springfield",
-            "state": "IL",
-            "zip": "62701",
-            "country": "US",
-        },
-        approval_threshold=500.00,
-    )
+    # All parameters fall back to flow defaults: a generated order_id (so this is
+    # re-runnable) for CUST-42 buying GADGET-B + WIDGET-A = $529.98, which clears
+    # the $500 threshold and therefore exercises the manager-approval wait.
+    #
+    # To take other branches, pass explicit values:
+    #   items=[{"sku": "THING-C", "quantity": 3, "unit_price": 9.99}]
+    #                             -> $29.97, below threshold, skips approval
+    #   customer_id="CUST-99"     -> inactive customer, validation fails
+    #   items=[{"sku": "RARE-D", "quantity": 2, ...}]
+    #                             -> only 2 units exist; last-unit contention
+    #   approval_timeout=5        -> beats the service's 10s auto-decide, so the
+    #                                approval expires and the saga compensates
+    result = order_fulfillment()
     print(json.dumps(result, indent=2, default=str))

@@ -1,0 +1,171 @@
+{
+  "name": "dag4_order_fulfillment",
+  "version": 1,
+  "description": "DAG 4: validate -> reserve -> (approval, suspending) -> ship, with saga compensation on rejection, timeout, or shipping failure",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 1800,
+  "failureWorkflow": "dag4_compensation",
+  "inputParameters": [
+    "order_id",
+    "customer_id",
+    "items",
+    "shipping_address"
+  ],
+  "tasks": [
+    {
+      "name": "validate_order",
+      "taskReferenceName": "validate",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "customer_id": "${workflow.input.customer_id}",
+        "items": "${workflow.input.items}"
+      }
+    },
+    {
+      "name": "reserve_inventory_sub",
+      "taskReferenceName": "reserve_inventory_sub",
+      "type": "SUB_WORKFLOW",
+      "subWorkflowParam": {
+        "name": "dag4_reserve_inventory",
+        "version": 1
+      },
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "items": "${workflow.input.items}"
+      }
+    },
+    {
+      "name": "check_approval_required",
+      "taskReferenceName": "check_approval_required",
+      "type": "SWITCH",
+      "evaluatorType": "value-param",
+      "expression": "approval_required",
+      "inputParameters": {
+        "approval_required": "${validate.output.approval_required}"
+      },
+      "decisionCases": {
+        "yes": [
+          {
+            "name": "manager_approval_sub",
+            "taskReferenceName": "manager_approval_sub",
+            "type": "SUB_WORKFLOW",
+            "subWorkflowParam": {
+              "name": "dag4_manager_approval",
+              "version": 1
+            },
+            "inputParameters": {
+              "order_id": "${workflow.input.order_id}",
+              "customer_id": "${workflow.input.customer_id}",
+              "total_amount": "${validate.output.total_amount}"
+            }
+          },
+          {
+            "name": "check_decision",
+            "taskReferenceName": "check_decision",
+            "type": "SWITCH",
+            "evaluatorType": "value-param",
+            "expression": "decision",
+            "inputParameters": {
+              "decision": "${manager_approval_sub.output.decision}"
+            },
+            "decisionCases": {
+              "approved": [],
+              "rejected": [
+                {
+                  "name": "compensate_rejected_sub",
+                  "taskReferenceName": "compensate_rejected_sub",
+                  "type": "SUB_WORKFLOW",
+                  "subWorkflowParam": {
+                    "name": "dag4_compensation",
+                    "version": 1
+                  },
+                  "inputParameters": {
+                    "order_id": "${workflow.input.order_id}",
+                    "reason": "approval rejected by ${manager_approval_sub.output.approver}: ${manager_approval_sub.output.reason}",
+                    "cancel_status": "cancelled"
+                  }
+                },
+                {
+                  "name": "terminate_rejected",
+                  "taskReferenceName": "terminate_rejected",
+                  "type": "TERMINATE",
+                  "inputParameters": {
+                    "terminationStatus": "COMPLETED",
+                    "workflowOutput": {
+                      "outcome": "cancelled_by_rejection",
+                      "order_id": "${workflow.input.order_id}",
+                      "saga_trigger": "approval_rejected",
+                      "compensation": "${compensate_rejected_sub.output}"
+                    }
+                  }
+                }
+              ]
+            },
+            "defaultCase": [
+              {
+                "name": "terminate_unknown_decision",
+                "taskReferenceName": "terminate_unknown_decision",
+                "type": "TERMINATE",
+                "inputParameters": {
+                  "terminationStatus": "FAILED",
+                  "terminationReason": "unrecognised approval decision: ${manager_approval_sub.output.decision}"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "defaultCase": []
+    },
+    {
+      "name": "shipping_sub",
+      "taskReferenceName": "shipping_sub",
+      "type": "SUB_WORKFLOW",
+      "subWorkflowParam": {
+        "name": "dag4_shipping",
+        "version": 1
+      },
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "customer_id": "${workflow.input.customer_id}",
+        "items": "${workflow.input.items}",
+        "shipping_address": "${workflow.input.shipping_address}"
+      }
+    },
+    {
+      "name": "update_order_status",
+      "taskReferenceName": "mark_shipped",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "shipment_id": "${shipping_sub.output.shipment_id}",
+        "tracking_number": "${shipping_sub.output.tracking_number}"
+      }
+    },
+    {
+      "name": "send_order_notification",
+      "taskReferenceName": "notify_shipped",
+      "type": "SIMPLE",
+      "optional": true,
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "customer_id": "${workflow.input.customer_id}",
+        "tracking_number": "${shipping_sub.output.tracking_number}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "_comment_outcome": "Derived from mark_shipped, NOT a literal: outputParameters are evaluated even on a FAILED run, so a hard-coded \"shipped\" would appear in the output of an order that was actually compensated.",
+    "outcome": "${mark_shipped.output.status}",
+    "order_id": "${workflow.input.order_id}",
+    "total_amount": "${validate.output.total_amount}",
+    "approval_required": "${validate.output.approval_required}",
+    "reserved_count": "${reserve_inventory_sub.output.reserved_count}",
+    "tracking_number": "${shipping_sub.output.tracking_number}",
+    "notification_status": "${notify_shipped.output.notification_status}"
+  }
+}

@@ -29,7 +29,8 @@ import time
 import uuid
 
 import httpx
-from prefect import flow, get_run_logger, task
+from prefect import flow, get_run_logger, task, unmapped
+from prefect.task_runners import ThreadPoolTaskRunner
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,6 +39,11 @@ from prefect import flow, get_run_logger, task
 CALLBACK_FETCH_SERVICE_URL = os.environ.get(
     "CALLBACK_FETCH_SERVICE_URL", "http://callback-fetch-service:8090"
 )
+
+# Spec (../README.md, DAG 2 step 5): FanOutAPIRequests runs with max concurrency
+# 20. Enforced by bounding the flow's task runner -- .map() otherwise fans out
+# with no cap.
+MAX_FANOUT_CONCURRENCY = int(os.environ.get("MAX_FANOUT_CONCURRENCY", "20"))
 
 DEFAULT_POLL_INTERVAL = 5   # seconds
 DEFAULT_POLL_TIMEOUT = 60   # seconds
@@ -198,7 +204,7 @@ def process_fetch_result(fetch_response: dict) -> dict:
             items.append(
                 {
                     "id": item.get("id"),
-                    "name": item.get("name", item.get("id")),
+                    "name": item.get("title") or item.get("name") or item.get("id"),
                     "detail_url": item.get("url"),
                 }
             )
@@ -282,7 +288,11 @@ def combine_results(api_results: list[dict], source_url: str = "unknown") -> dic
 # Flow
 # ---------------------------------------------------------------------------
 
-@flow(name="api_fanout_pipeline", log_prints=True)
+@flow(
+    name="api_fanout_pipeline",
+    log_prints=True,
+    task_runner=ThreadPoolTaskRunner(max_workers=MAX_FANOUT_CONCURRENCY),
+)
 def api_fanout_pipeline(
     url: str,
     request_config: dict | None = None,
@@ -324,10 +334,12 @@ def api_fanout_pipeline(
             "message": "No items found from initial content fetch.",
         }
 
-    # Step 4: Fan-out — fetch detail for each item in parallel
+    # Step 4: Fan-out — fetch detail for each item in parallel.
+    # request_config must be unmapped(): .map() zips every iterable argument,
+    # so a bare dict is treated as an iterable of its keys (length 0 when empty).
     detail_futures = fetch_item_detail.map(
         items,
-        request_config=processed.get("request_config"),
+        request_config=unmapped(processed.get("request_config")),
     )
 
     detail_results = [f.result() for f in detail_futures]
@@ -351,7 +363,7 @@ def api_fanout_pipeline(
 if __name__ == "__main__":
     # Example invocation
     result = api_fanout_pipeline(
-        url="https://api.github.com/orgs/PrefectHQ/repos",
+        url="http://fixture-service:8099/books?base=http://localhost:8099",
         request_config={},
     )
     print(json.dumps(result, indent=2))

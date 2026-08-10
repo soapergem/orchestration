@@ -52,6 +52,7 @@ resource "aws_lambda_function" "dag3" {
   environment {
     variables = {
       NEON_DB_PARAM = aws_ssm_parameter.neon_database_url.name
+      BAKEOFF_NS    = var.bakeoff_ns
     }
   }
 

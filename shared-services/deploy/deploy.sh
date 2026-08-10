@@ -48,15 +48,45 @@ kubectl -n "${namespace}" create secret generic aws-resume-creds \
   --from-literal=AWS_SECRET_ACCESS_KEY="$(tfout callback_resume_secret_access_key)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# Read-only S3 creds for fixture-service, which fetches DAG 1's archive on boot.
+# A separate, least-privilege user: GetObject on one prefix, nothing else.
+kubectl -n "${namespace}" create secret generic fixture-s3-creds \
+  --from-literal=AWS_ACCESS_KEY_ID="$(tfout fixture_reader_access_key_id)" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$(tfout fixture_reader_secret_access_key)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 # Warn (don't fail) if the out-of-band ECR pull secret isn't there yet.
 if ! kubectl -n "${namespace}" get secret "${pull_secret}" >/dev/null 2>&1; then
   echo "WARNING: pull secret '${pull_secret}' not found in ${namespace} — image pulls will fail until it exists (or pass -- --set image.pullSecretName=...)."
+fi
+
+# Ingress hostnames. values.yaml ships example.com placeholders, which resolve
+# nowhere and would get cert-manager stuck retrying; set BASE_DOMAIN (or
+# PUBLIC_DOMAIN) to a domain whose DNS you control and the four hosts are
+# derived here. See .envrc.example.
+domain="${BASE_DOMAIN:-${PUBLIC_DOMAIN:-}}"
+domain_args=()
+if [ -n "$domain" ]; then
+  echo "==> ingress hostnames under ${domain}"
+  domain_args=(
+    --set callbackFetch.domain="orch-callback-fetch.${domain}"
+    --set approval.domain="orch-approval.${domain}"
+    --set shipping.domain="orch-shipping.${domain}"
+    --set fixture.domain="orch-fixture.${domain}"
+  )
+else
+  echo "WARNING: BASE_DOMAIN/PUBLIC_DOMAIN unset — using the example.com placeholders in values.yaml."
+  echo "         Ingress will not resolve and cert-manager will not issue certificates."
 fi
 
 helm upgrade --install "${release}" "${here}" -n "${namespace}" --create-namespace \
   --set callbackFetch.repository="$(img callback-fetch)" \
   --set approval.repository="$(img approval)" \
   --set shipping.repository="$(img shipping)" \
+  --set fixture.repository="$(img fixture-service)" \
+  --set fixture.sampleZipUrl="$(tfout fixture_sample_zip_url)" \
+  --set fixture.booksUrl="$(tfout fixture_books_url)" \
+  "${domain_args[@]}" \
   "$@"
 
 echo "==> Done. helm status ${release} -n ${namespace}"

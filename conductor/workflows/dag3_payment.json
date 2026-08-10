@@ -1,0 +1,121 @@
+{
+  "name": "dag3_payment",
+  "version": 1,
+  "description": "DAG 3: validate -> flaky gateway with backoff -> idempotent DB update -> best-effort notification",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 900,
+  "failureWorkflow": "dag3_payment_failure",
+  "inputParameters": [
+    "payment_id",
+    "from_account",
+    "to_account",
+    "amount",
+    "currency",
+    "idempotency_key"
+  ],
+  "tasks": [
+    {
+      "name": "validate_payment",
+      "taskReferenceName": "validate",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "payment_id": "${workflow.input.payment_id}",
+        "from_account": "${workflow.input.from_account}",
+        "to_account": "${workflow.input.to_account}",
+        "amount": "${workflow.input.amount}",
+        "currency": "${workflow.input.currency}",
+        "idempotency_key": "${workflow.input.idempotency_key}"
+      }
+    },
+    {
+      "name": "check_validation",
+      "taskReferenceName": "check_validation",
+      "type": "SWITCH",
+      "evaluatorType": "value-param",
+      "expression": "validation_status",
+      "inputParameters": {
+        "validation_status": "${validate.output.validation_status}"
+      },
+      "decisionCases": {
+        "valid": [
+          {
+            "name": "process_payment",
+            "taskReferenceName": "process_payment",
+            "type": "SIMPLE",
+            "inputParameters": {
+              "payment_id": "${workflow.input.payment_id}",
+              "amount": "${workflow.input.amount}",
+              "idempotency_key": "${workflow.input.idempotency_key}"
+            }
+          },
+          {
+            "name": "update_payment_database",
+            "taskReferenceName": "update_db",
+            "type": "SIMPLE",
+            "inputParameters": {
+              "payment_id": "${workflow.input.payment_id}",
+              "from_account": "${workflow.input.from_account}",
+              "to_account": "${workflow.input.to_account}",
+              "amount": "${workflow.input.amount}",
+              "currency": "${workflow.input.currency}",
+              "idempotency_key": "${workflow.input.idempotency_key}",
+              "gateway_transaction_id": "${process_payment.output.gateway_transaction_id}"
+            }
+          },
+          {
+            "name": "send_payment_notification",
+            "taskReferenceName": "notify",
+            "type": "SIMPLE",
+            "optional": true,
+            "inputParameters": {
+              "payment_id": "${workflow.input.payment_id}",
+              "amount": "${workflow.input.amount}",
+              "to_account": "${workflow.input.to_account}"
+            }
+          }
+        ]
+      },
+      "defaultCase": [
+        {
+          "name": "handle_payment_failure",
+          "taskReferenceName": "handle_invalid",
+          "type": "SIMPLE",
+          "inputParameters": {
+            "payment_id": "${workflow.input.payment_id}",
+            "from_account": "${workflow.input.from_account}",
+            "to_account": "${workflow.input.to_account}",
+            "amount": "${workflow.input.amount}",
+            "currency": "${workflow.input.currency}",
+            "idempotency_key": "${workflow.input.idempotency_key}",
+            "reason": "${validate.output.reason}"
+          }
+        },
+        {
+          "name": "terminate_invalid",
+          "taskReferenceName": "terminate_invalid",
+          "type": "TERMINATE",
+          "inputParameters": {
+            "terminationStatus": "COMPLETED",
+            "workflowOutput": {
+              "outcome": "rejected_at_validation",
+              "reason": "${validate.output.reason}",
+              "payment_id": "${workflow.input.payment_id}"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "outputParameters": {
+    "_comment_outcome": "Derived from update_db, NOT a literal. outputParameters are evaluated even when the workflow FAILS, so a hard-coded \"paid\" would appear in the output of a declined payment.",
+    "outcome": "${update_db.output.db_status}",
+    "payment_id": "${workflow.input.payment_id}",
+    "gateway_transaction_id": "${process_payment.output.gateway_transaction_id}",
+    "db_status": "${update_db.output.db_status}",
+    "idempotent_skip": "${update_db.output.idempotent_skip}",
+    "notification_status": "${notify.output.notification_status}"
+  }
+}

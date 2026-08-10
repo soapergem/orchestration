@@ -8,7 +8,7 @@
 set -euo pipefail
 
 region="${1:-us-east-1}"
-profile="${2:-soapergem}"
+profile="${2:-${AWS_PROFILE:?set AWS_PROFILE or pass the profile as $2}}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # terraform/aws
 services_root="${here}/../../shared-services"
 

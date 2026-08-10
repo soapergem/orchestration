@@ -15,9 +15,9 @@ Hatchet features used:
 import json
 import os
 import uuid
+from datetime import timedelta
 
 import httpx
-
 from hatchet_sdk import Context, DurableContext, Hatchet
 
 hatchet = Hatchet()
@@ -25,8 +25,12 @@ hatchet = Hatchet()
 CALLBACK_FETCH_SERVICE_URL = os.environ.get(
     "CALLBACK_FETCH_SERVICE_URL", "http://callback-fetch-service:8090"
 )
-HATCHET_EVENT_API_URL = os.environ.get(
-    "HATCHET_EVENT_API_URL", "http://localhost:8080/api/v1/events"
+# The callback target is event_relay.py, not Hatchet itself: Hatchet's event
+# endpoint needs a bearer token and a {key, data} envelope, neither of which the
+# callback-fetch-service sends. Default is the relay as seen from *inside* a
+# container (Podman host gateway), since that's who POSTs to it.
+HATCHET_EVENT_RELAY_URL = os.environ.get(
+    "HATCHET_EVENT_RELAY_URL", "http://host.containers.internal:8096"
 )
 
 
@@ -111,11 +115,10 @@ async def submit_async_fetch(input: dict, context: Context) -> dict:
         "callback_fetch_service_url", CALLBACK_FETCH_SERVICE_URL
     )
 
-    # The callback URL points to Hatchet's event ingestion endpoint.
-    # The callback-fetch-service will POST the result here, which Hatchet
-    # ingests as a "fetch_completed" event with our correlation_id.
+    # The callback URL points at the relay, which turns the POST into a
+    # "fetch_completed" Hatchet event carrying our correlation_id.
     callback_url = (
-        f"{HATCHET_EVENT_API_URL}"
+        f"{HATCHET_EVENT_RELAY_URL.rstrip('/')}/fetch-callback"
         f"?event_type=fetch_completed"
         f"&correlation_id={correlation_id}"
     )
@@ -157,6 +160,10 @@ async def submit_async_fetch(input: dict, context: Context) -> dict:
 @api_fanout_wf.durable_task(
     name="wait_for_callback",
     parents=[submit_async_fetch],
+    # `durable_task` defaults execution_timeout to 1 MINUTE, and that ceiling
+    # applies to the suspended wait as well -- the task is cancelled mid-wait
+    # with "Task exceeded timeout of 1m" no matter how durable it is.
+    execution_timeout=timedelta(minutes=10),
 )
 async def wait_for_callback(input: dict, context: DurableContext) -> dict:
     """
@@ -168,10 +175,11 @@ async def wait_for_callback(input: dict, context: DurableContext) -> dict:
     correlation_id = submit_result["correlation_id"]
 
     # Durable event wait -- Hatchet suspends this task to disk and resumes
-    # when the matching event arrives.
+    # when the matching event arrives. The CEL expression addresses the event
+    # payload as `input`; a `{{ .field }}` template silently matches nothing.
     event_data = await context.aio_wait_for_event(
         "fetch_completed",
-        expression=f"{{{{ .correlation_id }}}} == '{correlation_id}'",
+        expression=f"input.correlation_id == '{correlation_id}'",
     )
 
     return {
@@ -217,7 +225,7 @@ async def process_fetch_result(input: dict, context: Context) -> dict:
             items.append(
                 {
                     "id": item.get("id"),
-                    "name": item.get("name", item.get("id")),
+                    "name": item.get("title") or item.get("name") or item.get("id"),
                     "detail_url": item.get("url"),
                 }
             )

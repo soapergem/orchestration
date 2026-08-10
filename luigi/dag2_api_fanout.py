@@ -21,7 +21,7 @@ MAJOR DIVERGENCES FROM STEP FUNCTIONS:
 
 Run with:
     luigi --module dag2_api_fanout CombineResults \
-        --url https://api.example.com/items \
+        --url http://fixture-service:8099/books?base=http://localhost:8099 \
         --run-id my-run-001 \
         --workers 8
 
@@ -33,9 +33,9 @@ import os
 import time
 import uuid
 
-import luigi
 import urllib3
 
+import luigi
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -95,13 +95,18 @@ class FetchContent(luigi.Task):
         if self.api_key:
             fetch_headers["Authorization"] = f"Bearer {self.api_key}"
 
-        # POST the async fetch request.
-        # NOTE: We do NOT provide a callback_url because Luigi cannot receive
-        # callbacks. Instead we will poll the status endpoint.
+        # POST the async fetch request. Luigi cannot receive a callback at all,
+        # so this polls the status endpoint -- but the fetch service is a resume
+        # BROKER (RUNNING.md 2b) and its validator rejects a registration it
+        # cannot classify, returning 422 "cannot infer provider". Omitting
+        # callback_url is therefore not an option: register http_callback with a
+        # deliberately dead URL and let the poll below do the work.
         payload = {
             "url": self.url,
             "headers": fetch_headers,
             "correlation_id": correlation_id,
+            "provider": "http_callback",
+            "resume_data": {"callback_url": "http://unused.invalid/luigi-polls-instead"},
         }
 
         response = http.request(
@@ -168,7 +173,7 @@ class FetchContent(luigi.Task):
                 items.append(
                     {
                         "id": item.get("id"),
-                        "name": item.get("name", item.get("id")),
+                        "name": item.get("title") or item.get("name") or item.get("id"),
                         "detail_url": item.get("url"),
                     }
                 )

@@ -38,10 +38,11 @@ Production note on wait_for_input:
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Optional
 
 import psycopg2
 import urllib3
@@ -66,7 +67,15 @@ from .types import (
 # ---------------------------------------------------------------------------
 # Container image spec
 # ---------------------------------------------------------------------------
-order_image = ImageSpec(
+# A prebuilt image can be substituted for the ImageSpec entirely. ImageSpec
+# assumes a working local container builder AND that the build host can produce
+# the cluster's architecture -- neither holds when building arm64 from an x86
+# workstation without qemu binfmt handlers (rootless podman cannot register
+# them). FLYTE_TASK_IMAGE points at an image built natively on the cluster
+# instead, and registration then pushes nothing. See flyte/README.md.
+_PREBUILT = os.environ.get("FLYTE_TASK_IMAGE")
+
+order_image = _PREBUILT or ImageSpec(
     name="order-fulfillment",
     packages=[
         "psycopg2-binary",
@@ -74,6 +83,12 @@ order_image = ImageSpec(
         "flytekit",
     ],
     python_version="3.11",
+    # Target platform must match the cluster's node architecture. flytekit
+    # defaults this to linux/amd64 (it only picks arm64 when pushing to a LOCAL
+    # registry from an arm64 build host), so an arm64 cluster needs it set
+    # explicitly -- otherwise the image pulls and schedules fine and then the
+    # container dies with "exec format error". See RUNNING.md 7b.
+    platform=os.environ.get("FLYTE_IMAGE_PLATFORM", "linux/amd64"),
 )
 
 _http = urllib3.PoolManager()
@@ -86,13 +101,34 @@ SHIPPING_SERVICE_URL = "http://shipping-service:8092"
 # Helper: Postgres connection
 # ---------------------------------------------------------------------------
 def _get_connection(cfg: DBConfig) -> psycopg2.extensions.connection:
-    return psycopg2.connect(
+    """Connect with ``search_path`` scoped to this runner's DAG 4 schema.
+
+    This schema holds seeded customers and inventory, so it is not self-creating. The check is
+    deliberate: ``SET search_path`` to a nonexistent schema succeeds silently,
+    and every later query then fails with a confusing
+    "relation does not exist".
+    """
+    conn = psycopg2.connect(
         host=cfg.host,
         port=cfg.port,
         dbname=cfg.database,
         user=cfg.user,
         password=cfg.password,
     )
+    schema = f"{cfg.namespace}_dag4"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (schema,),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- seed it with: '
+                f"psql -c \"SELECT bootstrap_bakeoff('{cfg.namespace}');\""
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +263,21 @@ def reserve_inventory(
                 idempotent=True,
             )
 
+        # The orders row MUST exist before any inventory_reservations row:
+        # inventory_reservations.order_id carries a non-deferrable FK to
+        # orders(order_id), so reserving first fails with a foreign-key
+        # violation for any order_id that does not already exist. The same bug
+        # was present in the Prefect and Argo implementations.
+        total = sum(item.quantity * item.unit_price for item in items)
+        cur.execute(
+            """
+            INSERT INTO orders (order_id, customer_id, total_amount, status)
+            VALUES (%s, %s, %s, 'reserved')
+            ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
+            """,
+            (order_id, customer_id, total),
+        )
+
         items_reserved: List[str] = []
         for item in items:
             cur.execute(
@@ -254,17 +305,6 @@ def reserve_inventory(
                 (f"{reservation_id}-{item.sku}", order_id, item.sku, item.quantity),
             )
             items_reserved.append(item.sku)
-
-        # Create/update order record
-        total = sum(item.quantity * item.unit_price for item in items)
-        cur.execute(
-            """
-            INSERT INTO orders (order_id, customer_id, total_amount, status)
-            VALUES (%s, %s, %s, 'reserved')
-            ON CONFLICT (order_id) DO UPDATE SET status = 'reserved', updated_at = NOW()
-            """,
-            (order_id, customer_id, total),
-        )
 
         conn.commit()
 
@@ -330,7 +370,16 @@ def request_approval(
         "order_id": order_id,
         "total_amount": total_amount,
         "customer_id": customer_id,
-        "callback_url": "",  # Not used in polling mode
+        # The approval service is a resume BROKER (RUNNING.md 2b) and its
+        # validator rejects a registration it cannot classify. An empty
+        # callback_url is not classifiable -- it returns 422 "cannot infer
+        # provider". There is no `flyte` provider (the enum offers
+        # stepfunctions / http_callback / kestra / conductor), so this polling
+        # implementation registers http_callback with a deliberately dead URL:
+        # the decision is still recorded before the resume is attempted, and
+        # polling is what advances the workflow. Same shape as DAG 2 and Argo.
+        "provider": "http_callback",
+        "resume_data": {"callback_url": "http://unused.invalid/flyte-polls-instead"},
         "items_summary": items_summary,
     }
 
@@ -518,7 +567,11 @@ def call_shipping_api(
         "street": shipping_address.street,
         "city": shipping_address.city,
         "state": shipping_address.state,
-        "zip_code": shipping_address.zip_code,
+        # The shipping service requires "zip", not "zip_code" -- its
+        # required_fields check is ("street", "city", "state", "zip"), so sending
+        # the dataclass field name verbatim fails with
+        # "InvalidAddress: Missing address fields: zip". Verified on the cluster.
+        "zip": shipping_address.zip_code,
         "country": shipping_address.country,
     }
 
@@ -766,6 +819,32 @@ def release_inventory(
 # ---------------------------------------------------------------------------
 # Sub-workflow: Saga compensation sequence
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Output assembler
+# ---------------------------------------------------------------------------
+# A @workflow body builds a graph; it does not run eagerly, so every task result
+# there is a Promise. Constructing a dataclass from Promises fails at
+# REGISTRATION with "can not serialize 'Promise' object". Assemble in a @task,
+# which receives real values.
+@task(container_image=order_image)
+def build_order_output(
+    order_id: str,
+    status: str,
+    shipment: Optional[ShipmentResult] = None,
+    notification: Optional[OrderNotification] = None,
+    compensation: Optional[CompensationResult] = None,
+    failure_reason: Optional[str] = None,
+) -> OrderOutput:
+    return OrderOutput(
+        order_id=order_id,
+        status=status,
+        shipment=shipment,
+        notification=notification,
+        compensation=compensation,
+        failure_reason=failure_reason,
+    )
+
+
 @workflow
 def compensate_order(
     order_id: str,
@@ -796,7 +875,14 @@ def compensate_order(
         failure_reason=failure_reason,
     )
 
-    return OrderOutput(
+    # Compensation must unwind in order: release stock, then mark the order
+    # cancelled, then notify. None of these consumes the previous one's output,
+    # so without explicit edges Flyte runs all three in parallel and the
+    # "saga" stops being a sequence. See DAG 1's race for the verified case.
+    compensation >> order_update
+    order_update >> notification
+
+    return build_order_output(
         order_id=order_id,
         status="cancelled",
         compensation=compensation,
@@ -842,7 +928,11 @@ def ship_and_finalize(
         estimated_delivery=shipment.estimated_delivery,
     )
 
-    return OrderOutput(
+    # update_order_status already depends on `shipment` through shipment_id, but
+    # the notification consumes nothing from it -- so order it explicitly.
+    order_update >> notification
+
+    return build_order_output(
         order_id=order_id,
         status="shipped",
         shipment=shipment,
@@ -853,6 +943,19 @@ def ship_and_finalize(
 # ---------------------------------------------------------------------------
 # Sub-workflow: Path requiring approval
 # ---------------------------------------------------------------------------
+@task(container_image=order_image)
+def is_approved(decision: ApprovalDecision) -> bool:
+    """Lift the branch flag out of the nested dataclass.
+
+    `conditional().if_(decision.decision == "approved")` reads naturally and
+    fails at registration with MismatchingTypes: comparing a promise attribute
+    yields a STRING where the branch node expects the whole struct. Branching on
+    a task that returns a plain bool sidesteps it -- same fix as
+    `is_payment_valid` in dag3_payment.py.
+    """
+    return decision.decision == "approved"
+
+
 @workflow
 def approval_then_ship(
     order_id: str,
@@ -875,9 +978,11 @@ def approval_then_ship(
     )
 
     # Conditional: approved -> ship; otherwise -> compensate
+    approved = is_approved(decision=decision)
+
     result = (
         conditional("check_approval_decision")
-        .if_(decision.decision == "approved")
+        .if_(approved.is_true())
         .then(
             ship_and_finalize(
                 order_id=order_id,
@@ -902,6 +1007,19 @@ def approval_then_ship(
 # ---------------------------------------------------------------------------
 # Sub-workflow: Valid order path (reserve, approve if needed, ship)
 # ---------------------------------------------------------------------------
+@task(container_image=order_image)
+def needs_approval(validated: OrderValidated) -> bool:
+    """Lift the branch predicate out of the nested dataclass.
+
+    Same class of failure as `is_approved`: comparing two promise attributes
+    (`validated.total_amount >= validated.approval_threshold`) yields a FLOAT
+    where the branch node expects the struct, and registration fails with
+    MismatchingTypes plus "The Workflow contain unreachable nodes". Any
+    non-trivial branch predicate over dataclass fields belongs in a task.
+    """
+    return validated.total_amount >= validated.approval_threshold
+
+
 @workflow
 def order_valid_path(validated: OrderValidated) -> OrderOutput:
     """Path taken when validation succeeds.
@@ -917,9 +1035,16 @@ def order_valid_path(validated: OrderValidated) -> OrderOutput:
         db_config=validated.db_config,
     )
 
+    approval_required = needs_approval(validated=validated)
+
+    # Inventory must be reserved BEFORE anything ships. The branch below consumes
+    # nothing from `reservation`, so without this edge Flyte would ship and
+    # reserve concurrently.
+    reservation >> approval_required
+
     result = (
         conditional("check_approval_required")
-        .if_(validated.total_amount >= validated.approval_threshold)
+        .if_(approval_required.is_true())
         .then(
             approval_then_ship(
                 order_id=validated.order_id,
@@ -964,6 +1089,12 @@ def order_validation_failed(order_id: str, reason: str) -> OrderOutput:
 # ---------------------------------------------------------------------------
 # Top-level workflow
 # ---------------------------------------------------------------------------
+@task(container_image=order_image)
+def is_order_valid(validated: OrderValidated) -> bool:
+    """Lift the branch flag out of the nested dataclass -- see `is_approved`."""
+    return validated.validation.is_valid
+
+
 @workflow
 def order_fulfillment_workflow(order_input: OrderInput) -> OrderOutput:
     """Order Fulfillment Workflow.
@@ -987,9 +1118,11 @@ def order_fulfillment_workflow(order_input: OrderInput) -> OrderOutput:
     validated = validate_order(order_input=order_input)
 
     # Step 2: Branch on validation result
+    order_ok = is_order_valid(validated=validated)
+
     result = (
         conditional("check_order_validation")
-        .if_(validated.validation.is_valid.is_true())
+        .if_(order_ok.is_true())
         .then(order_valid_path(validated=validated))
         .else_()
         .then(

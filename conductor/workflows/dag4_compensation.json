@@ -1,0 +1,55 @@
+{
+  "name": "dag4_compensation",
+  "version": 1,
+  "description": "DAG 4 saga: release inventory -> cancel the order -> notify. Serves BOTH as an explicit SUB_WORKFLOW (approval rejection) and as the main workflow's failureWorkflow (approval timeout, shipping failure).",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 600,
+  "failureWorkflow": "dag4_compensation_dead_letter",
+  "inputParameters": [
+    "order_id",
+    "reason",
+    "cancel_status"
+  ],
+  "tasks": [
+    {
+      "name": "release_inventory",
+      "taskReferenceName": "release",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "reason": "${workflow.input.reason}"
+      }
+    },
+    {
+      "name": "update_order_cancelled",
+      "taskReferenceName": "cancel_order",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "reason": "${workflow.input.reason}",
+        "status": "${workflow.input.cancel_status}"
+      }
+    },
+    {
+      "name": "send_cancellation_notification",
+      "taskReferenceName": "notify_cancelled",
+      "type": "SIMPLE",
+      "optional": true,
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "reason": "${workflow.input.reason}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "outcome": "compensated",
+    "order_id": "${workflow.input.order_id}",
+    "reason": "${workflow.input.reason}",
+    "released_count": "${release.output.released_count}",
+    "already_released": "${release.output.already_released}",
+    "cancelled_status": "${cancel_order.output.status}"
+  }
+}

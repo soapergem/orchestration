@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars and adjust, or export TF_VAR_* from .envrc
+# (see .envrc.example) and skip this file entirely.
+#
+# There is no database variable here on purpose: DAG 3 and DAG 4 take db_config
+# as an *execution input*, not deploy-time config, so the Neon DSN never enters
+# Terraform state. scripts/run-workflow.sh builds the input from
+# $NEON_DATABASE_URL in your environment.
+
+# No default -- deploying into the wrong project should be impossible by accident.
+project_id = "my-gcp-project"
+
+# Base domain for the publicly-reachable mock services (RUNNING.md 7c-i).
+# Hostnames are derived: orch-callback-fetch.<domain>, orch-approval.<domain>,
+# orch-shipping.<domain>, orch-fixture.<domain>.
+mock_service_base_domain = "example.com"
+
+# region      = "us-central1"
+# name_prefix = "orch"
+# bakeoff_ns  = "google_workflows"
+
+# Override if you push the task-service image somewhere else.
+# task_service_image = "<region>-docker.pkg.dev/<project>/<repo>/task-service:latest"

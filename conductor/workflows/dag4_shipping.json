@@ -1,0 +1,35 @@
+{
+  "name": "dag4_shipping",
+  "version": 1,
+  "description": "DAG 4 sub-workflow: ShippingWorkflow. Calls the flaky shipping API with retries; InvalidAddress is terminal.",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 600,
+  "inputParameters": [
+    "order_id",
+    "customer_id",
+    "items",
+    "shipping_address"
+  ],
+  "tasks": [
+    {
+      "name": "call_shipping_api",
+      "taskReferenceName": "ship",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "order_id": "${workflow.input.order_id}",
+        "customer_id": "${workflow.input.customer_id}",
+        "items": "${workflow.input.items}",
+        "shipping_address": "${workflow.input.shipping_address}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "order_id": "${workflow.input.order_id}",
+    "shipment_id": "${ship.output.shipment_id}",
+    "tracking_number": "${ship.output.tracking_number}",
+    "carrier": "${ship.output.carrier}"
+  }
+}

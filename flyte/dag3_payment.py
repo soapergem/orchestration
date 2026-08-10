@@ -23,11 +23,14 @@ Key Flyte features demonstrated:
 from __future__ import annotations
 
 import json
+import os
 import random
 from datetime import datetime, timezone
+from typing import Optional
 
 import psycopg2
 from flytekit import ImageSpec, conditional, task, workflow
+from flytekit.exceptions.user import FlyteRecoverableException
 
 from .types import (
     DBConfig,
@@ -45,13 +48,27 @@ from .types import (
 # ---------------------------------------------------------------------------
 # Container image spec
 # ---------------------------------------------------------------------------
-payment_image = ImageSpec(
+# A prebuilt image can be substituted for the ImageSpec entirely. ImageSpec
+# assumes a working local container builder AND that the build host can produce
+# the cluster's architecture -- neither holds when building arm64 from an x86
+# workstation without qemu binfmt handlers (rootless podman cannot register
+# them). FLYTE_TASK_IMAGE points at an image built natively on the cluster
+# instead, and registration then pushes nothing. See flyte/README.md.
+_PREBUILT = os.environ.get("FLYTE_TASK_IMAGE")
+
+payment_image = _PREBUILT or ImageSpec(
     name="payment",
     packages=[
         "psycopg2-binary",
         "flytekit",
     ],
     python_version="3.11",
+    # Target platform must match the cluster's node architecture. flytekit
+    # defaults this to linux/amd64 (it only picks arm64 when pushing to a LOCAL
+    # registry from an arm64 build host), so an arm64 cluster needs it set
+    # explicitly -- otherwise the image pulls and schedules fine and then the
+    # container dies with "exec format error". See RUNNING.md 7b.
+    platform=os.environ.get("FLYTE_IMAGE_PLATFORM", "linux/amd64"),
 )
 
 
@@ -59,28 +76,60 @@ payment_image = ImageSpec(
 # Helper: Postgres connection
 # ---------------------------------------------------------------------------
 def _get_connection(cfg: DBConfig) -> psycopg2.extensions.connection:
-    return psycopg2.connect(
+    """Connect with ``search_path`` scoped to this runner's DAG 3 schema.
+
+    This schema holds seeded accounts, so it is not self-creating. The check is
+    deliberate: ``SET search_path`` to a nonexistent schema succeeds silently,
+    and every later query then fails with a confusing
+    "relation does not exist".
+    """
+    conn = psycopg2.connect(
         host=cfg.host,
         port=cfg.port,
         dbname=cfg.database,
         user=cfg.user,
         password=cfg.password,
     )
+    schema = f"{cfg.namespace}_dag3"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (schema,),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            raise RuntimeError(
+                f'schema "{schema}" does not exist -- seed it with: '
+                f"psql -c \"SELECT bootstrap_bakeoff('{cfg.namespace}');\""
+            )
+        cur.execute(f'SET search_path TO "{schema}"')
+    return conn
 
 
 # ---------------------------------------------------------------------------
 # Custom exceptions for payment gateway
 # ---------------------------------------------------------------------------
-class PaymentGatewayTimeout(Exception):
+# Retriability in Flyte is decided by the exception's TYPE, not by `retries=`.
+# flytekit retries only FlyteRecoverableException (up to the task's `retries`);
+# every other exception is a permanent USER error and the attempt count is
+# ignored. Inheriting plain Exception here made `retries=5` inert -- verified on
+# the cluster: a gateway timeout failed the workflow on the FIRST attempt, and
+# PaymentDeclined behaved identically, so DAG 3's retriable-vs-terminal
+# distinction was a no-op.
+class PaymentGatewayTimeout(FlyteRecoverableException):
     """Retriable — gateway did not respond in time."""
 
 
-class PaymentGateway5xx(Exception):
+class PaymentGateway5xx(FlyteRecoverableException):
     """Retriable — gateway returned a server error."""
 
 
 class PaymentDeclined(Exception):
-    """Non-retriable — card was declined."""
+    """Non-retriable — card was declined.
+
+    Deliberately a plain Exception: Flyte will not retry it, which is what the
+    spec wants.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +453,43 @@ def handle_payment_failure(
     )
 
 
+@task(container_image=payment_image)
+def is_payment_valid(validated: PaymentValidated) -> bool:
+    """Lift the branch flag out of the nested dataclass.
+
+    `conditional().if_(validated.validation.is_valid.is_true())` looks natural
+    and compiles locally, but flyteadmin rejects the workflow: promise attribute
+    access two levels deep confuses the branch-node type inference, and
+    registration fails with MismatchingTypes claiming validate_payment's output
+    is BOOLEAN where the struct is expected. Branching on a task that returns a
+    plain bool sidesteps it entirely.
+    """
+    return validated.validation.is_valid
+
+
+# ---------------------------------------------------------------------------
+# Output assembler
+# ---------------------------------------------------------------------------
+# A @workflow body is a DSL that builds a graph -- it does NOT execute eagerly,
+# so every task result there is a Promise, not a value. Constructing a dataclass
+# from Promises fails at REGISTRATION time (not run time) with
+# "Failed to bind output o0 ...: can not serialize 'Promise' object". Assembling
+# the output inside a @task is the supported way: the task receives real values.
+@task(container_image=payment_image)
+def build_payment_output(
+    payment_id: str,
+    status: str,
+    notification: Optional[NotificationResult] = None,
+    failure: Optional[PaymentFailureResult] = None,
+) -> PaymentOutput:
+    return PaymentOutput(
+        payment_id=payment_id,
+        status=status,
+        notification=notification,
+        failure=failure,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sub-workflow: success path (process -> update_db -> notify)
 # ---------------------------------------------------------------------------
@@ -428,7 +514,12 @@ def payment_success_path(validated: PaymentValidated) -> PaymentOutput:
         gateway_transaction_id=processed.payment_result.gateway_transaction_id,
     )
 
-    return PaymentOutput(
+    # Same trap as DAG 1: send_notification consumes nothing from
+    # update_database, so without this edge the customer could be notified
+    # before the ledger is written.
+    db_result >> notification
+
+    return build_payment_output(
         payment_id=processed.payment_id,
         status="success",
         notification=notification,
@@ -460,7 +551,7 @@ def payment_failure_path(validated: PaymentValidated) -> PaymentOutput:
         failure_message=failure.failure_message,
     )
 
-    return PaymentOutput(
+    return build_payment_output(
         payment_id=failure.payment_id,
         status="failed",
         failure=failure,
@@ -488,9 +579,11 @@ def payment_workflow(payment_input: PaymentInput) -> PaymentOutput:
 
     # Conditional branch based on validation result.
     # Flyte's conditional() evaluates the is_valid field at runtime.
+    valid = is_payment_valid(validated=validated)
+
     result = (
         conditional("check_validation")
-        .if_(validated.validation.is_valid.is_true())
+        .if_(valid.is_true())
         .then(payment_success_path(validated=validated))
         .else_()
         .then(payment_failure_path(validated=validated))

@@ -18,6 +18,10 @@ spec:
         value: "/tmp/extracted"
       - name: output-dir
         value: "/tmp/output"
+      # Per-(runner, DAG) schema isolation -- see shared-services/init-db.sql.
+      # Every step sets search_path to "<bakeoff-ns>_dag1".
+      - name: bakeoff-ns
+        value: "argo"
   templates:
     # ---------- Main DAG ----------
     - name: csv-etl-pipeline
@@ -185,6 +189,15 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # DAG 1's tables come from the CSVs, so this schema is self-creating
+          # (unlike DAG 3/4, which need seeded fixtures and fail fast instead).
+          SCHEMA = os.environ.get("BAKEOFF_NS", "argo") + "_dag1"
+          with conn.cursor() as _cur:
+              _cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+          conn.commit()
+
           try:
               with conn.cursor() as cur:
                   # Create table if not exists (all columns as TEXT)
@@ -213,6 +226,8 @@ spec:
           print(f"Loaded {len(rows)} rows into table '{table_name}'")
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -276,6 +291,15 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # DAG 1's tables come from the CSVs, so this schema is self-creating
+          # (unlike DAG 3/4, which need seeded fixtures and fail fast instead).
+          SCHEMA = os.environ.get("BAKEOFF_NS", "argo") + "_dag1"
+          with conn.cursor() as _cur:
+              _cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+          conn.commit()
+
           try:
               with conn.cursor() as cur:
                   cur.execute("DROP TABLE IF EXISTS combined_report")
@@ -294,6 +318,8 @@ spec:
           print(f"SQL transform complete: combined_report has {row_count} rows")
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT
@@ -342,6 +368,15 @@ spec:
               password=os.environ.get("PGPASSWORD", "orchestration"),
           )
 
+          # ---- Per-(runner, DAG) schema isolation ----
+          # DAG 1's tables come from the CSVs, so this schema is self-creating
+          # (unlike DAG 3/4, which need seeded fixtures and fail fast instead).
+          SCHEMA = os.environ.get("BAKEOFF_NS", "argo") + "_dag1"
+          with conn.cursor() as _cur:
+              _cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+              _cur.execute(f'SET search_path TO "{SCHEMA}"')
+          conn.commit()
+
           try:
               df = pd.read_sql(f'SELECT * FROM "{table_name}"', conn)
           finally:
@@ -354,6 +389,8 @@ spec:
           print(f"File size: {os.path.getsize(output_path)} bytes")
           PYEOF
         env:
+          - name: BAKEOFF_NS
+            value: "{{workflow.parameters.bakeoff-ns}}"
           - name: PGHOST
             value: "postgres"
           - name: PGPORT

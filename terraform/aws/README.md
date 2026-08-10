@@ -12,20 +12,21 @@ DAG 2's mock service (callback-fetch) is **not** hosted in AWS — no long-runni
 container. Terraform creates the ECR repos + a least-privilege IAM user; you
 build/push arm64 images (`scripts/build-push-mock-services.sh`) and deploy the
 shared services to your **K3s** cluster (`shared-services/deploy/`, namespace
-`orchestrators`), exposed at `*.gemovationlabs.com`. The service calls
+`orchestrators`), exposed at `*.example.com`. The service calls
 `SendTaskSuccess` from K3s using the IAM user's key (a K8s Secret), resuming the
 suspended `.waitForTaskToken` state. The SFN lambda reaches it at
 `https://<mock_service_subdomain_prefix>callback-fetch.<mock_service_base_domain>`.
 
 DAG 1 isolates its dynamic tables (`orders`/`customers`/`products`/
-`combined_report`) in a dedicated `dag1_etl` Postgres schema (set in its
+`combined_report`) in a dedicated `<BAKEOFF_NS>_dag1` Postgres schema (set in its
 `db.py`) so they don't collide with DAG 3/4's transactional tables in the same
 Neon database.
 
 ## Prerequisites
 
-- Terraform >= 1.9, an AWS account, and the `soapergem` profile configured
-  (`aws configure --profile soapergem`).
+- Terraform >= 1.9, an AWS account, and a named AWS profile configured
+  (`aws configure --profile <name>`). Export it as `AWS_PROFILE` — `.envrc.example`
+  has a slot for it — and set `aws_profile` in `terraform.tfvars` to match.
 - `NEON_DATABASE_URL` exported (it already is, via `.envrc`).
 - Expose it to Terraform and build the psycopg2 layer:
 
@@ -47,7 +48,7 @@ terraform apply
 
 ```bash
 aws stepfunctions start-execution \
-  --profile soapergem \
+  --profile "$AWS_PROFILE" \
   --state-machine-arn "$(terraform output -raw dag3_state_machine_arn)" \
   --input '{"payment_id":"PAY-1","amount":100,"currency":"USD","from_account":"ACC-001","to_account":"ACC-003"}'
 ```
@@ -61,13 +62,14 @@ The sample ZIP is seeded into the bucket at apply time.
 
 ```bash
 aws stepfunctions start-execution \
-  --profile soapergem \
+  --profile "$AWS_PROFILE" \
   --state-machine-arn "$(terraform output -raw dag1_state_machine_arn)" \
   --input "{\"s3_bucket\":\"$(terraform output -raw dag1_bucket)\",\"zip_key\":\"$(terraform output -raw dag1_sample_zip_key)\"}"
 ```
 
-Result: CSVs loaded into the `dag1_etl` schema in Neon, joined into
-`dag1_etl.combined_report`, and written to `s3://<bucket>/output/combined_report.parquet`.
+Result: CSVs loaded into the `stepfunctions_dag1` schema in Neon, joined into
+`stepfunctions_dag1.combined_report`, and written to
+`s3://<bucket>/output/combined_report.parquet`.
 
 ## Run DAG 2
 
@@ -78,9 +80,9 @@ returning a JSON list of items with `url` fields (each item's `url` is then
 fetched in the fan-out). Keep the list small to avoid rate-limiting.
 
 ```bash
-aws stepfunctions start-execution --profile soapergem \
+aws stepfunctions start-execution --profile "$AWS_PROFILE" \
   --state-machine-arn "$(terraform output -raw dag2_state_machine_arn)" \
-  --input '{"url":"https://api.github.com/orgs/argoproj/repos?per_page=5","request_config":{}}'
+  --input '{"url":"https://orch-fixture.example.com/books?per_page=5","request_config":{}}'
 ```
 
 The submit lambda registers a task token with the K3s callback-fetch service;
@@ -96,7 +98,7 @@ auto-approves after ~10s via `AUTO_DECIDE_ACTION=approved`); below it skips
 straight to shipping.
 
 ```bash
-aws stepfunctions start-execution --profile soapergem \
+aws stepfunctions start-execution --profile "$AWS_PROFILE" \
   --state-machine-arn "$(terraform output -raw dag4_state_machine_arn)" \
   --name "dag4-$(uuidgen)" \
   --input '{"order_id":"ORD-'"$(uuidgen | cut -c1-8)"'","customer_id":"CUST-42","items":[{"sku":"GADGET-B","quantity":2,"unit_price":499.99}],"shipping_address":{"street":"123 Main St","city":"Springfield","state":"IL","zip":"01234"},"approval_threshold":500}'
@@ -110,15 +112,31 @@ compensation path (ReleaseInventory → UpdateOrderCancelled). `shipping` is fla
 
 ## Schema note
 
-The `transactions` table in `shared-services/init-db.sql` was reconciled to match
-the DAG 3 code contract (`id`, `payment_id`, `from_account`/`to_account`,
-`gateway_transaction_id`, `error_message`). If you seeded Neon before that fix,
-re-apply it (the table has no seed data, so a drop is safe):
+**Seeding Neon is a prerequisite** (2026-08-06). The lambdas now follow the
+repo-wide `BAKEOFF_NS` convention: every connection pins `search_path` to
+`<BAKEOFF_NS>_dagN`, defaulting to `stepfunctions`. DAG 1 self-creates its schema;
+**DAG 3 and DAG 4 fail fast** with a `bootstrap_bakeoff` hint, because they need
+seeded fixtures.
 
 ```bash
-psql "$NEON_DATABASE_URL" -c "DROP TABLE IF EXISTS transactions CASCADE;"
-psql "$NEON_DATABASE_URL" -f ../../shared-services/init-db.sql
+psql "$NEON_DATABASE_URL" -f ../../shared-services/init-db.sql   # defines bootstrap_bakeoff
+psql "$NEON_DATABASE_URL" -c "SELECT bootstrap_bakeoff('stepfunctions');"
 ```
+
+Why it matters here more than elsewhere: **Neon is shared with the Google
+Workflows implementation**, which is the only other orchestrator needing a
+publicly reachable Postgres. `stepfunctions_dag3.accounts` and
+`google_workflows_dag3.accounts` hold independent balances; before this change
+DAG 3/4 wrote flat `public.*` tables and the two would have debited the same rows.
+
+Two leftovers from the migration, both harmless: the old `dag1_etl` schema is now
+orphaned (DAG 1 uses `stepfunctions_dag1`), and the flat `public.*` tables DAG 3/4
+used are no longer read. Drop them when you are confident nothing else wants them.
+
+The `transactions` table in `shared-services/init-db.sql` was also reconciled to
+match the DAG 3 code contract (`id`, `payment_id`, `from_account`/`to_account`,
+`gateway_transaction_id`, `error_message`). A Neon seeded before that fix needs it
+re-applied; the table has no seed data, so a drop is safe.
 
 ## Teardown
 

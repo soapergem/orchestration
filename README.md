@@ -13,6 +13,7 @@ I need to put together a presentation that compares the following workflow orche
 9. [Luigi](https://github.com/spotify/luigi)
 10. [Hatchet](https://hatchet.run/)
 11. [Google Workflows](https://cloud.google.com/workflows)
+12. [Conductor](https://github.com/conductor-oss/conductor)
 
 I ultimately want to speak authoritatively on why workflow orchestration is valuable and what the point of these tools are. I also need to be able to compare and contrast each of these tools on the following metrics (and more):
 

@@ -1,31 +1,55 @@
 # Payment Processing: Validate, process with retries, update DB, send notification
-# Deploy: gcloud workflows deploy payment-processing --source=dag3_payment.yaml
 #
-# Expected input:
+# Deploy: terraform/gcp  (or, by hand:
+#   gcloud workflows deploy orch-dag3-payment --source=dag3_payment.yaml \
+#     --set-env-vars TASK_SERVICE_URL=https://...,BAKEOFF_NS=google_workflows)
+#
+# Every step body is an HTTP call to the Cloud Run task service -- Workflows runs
+# no code of its own. Retry classification is therefore driven entirely by HTTP
+# status: the gateway returns 402 for a decline (routed straight to failure
+# handling) and 503/504 for transient faults (retried with backoff). Contrast
+# Temporal/Prefect, which classify on exception type.
+#
+# Service URLs come from user_env_vars rather than being templated in, because
+# Terraform's templatefile() would collide with this language's own ${} syntax.
+#
+# Expected input (accounts come from bootstrap_bakeoff -- ACC-001..ACC-004):
 # {
 #   "payment_id": "PAY-001",
-#   "amount": 150.00,
+#   "amount": 100.00,
 #   "currency": "USD",
 #   "from_account": "ACC-001",
 #   "to_account": "ACC-002",
-#   "idempotency_key": "idem-001",
-#   "db_config": { "host": "postgres", "port": 5432, "database": "orchestration", "user": "orchestration", "password": "orchestration" }
+#   "idempotency_key": "PAY-001",
+#   "gateway_force": "",          # ""|success|declined|server_error|timeout
+#   "db_config": { "host": "...", "port": 5432, "database": "orchestration", "user": "...", "password": "..." }
 # }
+#
+# Failure branches to try:
+#   from_account: "ACC-004"     -> suspended account, validation fails
+#   amount: 99999               -> insufficient balance
+#   gateway_force: "declined"   -> 402, non-retriable, no retry storm
+#   gateway_force: "timeout"    -> 504, retried with backoff until it succeeds
 
 main:
   params: [input]
   steps:
     - init:
         assign:
-          - db_proxy_url: "http://db-proxy-service:8080"
-          - payment_gateway_url: "http://payment-gateway:8080"
-          - notification_service_url: "http://notification-service:8080"
+          # One Cloud Run service backs all of these; the paths differ, not the
+          # host. Split into three names to keep the parallel with the Step
+          # Functions lambdas (db / gateway / notification) legible.
+          - task_service_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - db_proxy_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - payment_gateway_url: ${sys.get_env("TASK_SERVICE_URL")}
+          - notification_service_url: ${sys.get_env("TASK_SERVICE_URL")}
           - payment_id: ${input.payment_id}
           - amount: ${input.amount}
-          - currency: ${input.currency}
+          - currency: ${default(map.get(input, "currency"), "USD")}
           - from_account: ${input.from_account}
           - to_account: ${input.to_account}
           - idempotency_key: ${default(map.get(input, "idempotency_key"), input.payment_id)}
+          - gateway_force: ${default(map.get(input, "gateway_force"), "")}
           - db_config: ${input.db_config}
 
     # Step 1: Validate the payment against the database (account exists, balance, fraud checks)
@@ -34,6 +58,8 @@ main:
           call: http.post
           args:
             url: ${db_proxy_url + "/validate-payment"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -101,6 +127,8 @@ main:
           call: http.post
           args:
             url: ${payment_gateway_url + "/process"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -110,6 +138,10 @@ main:
               from_account: ${from_account}
               to_account: ${to_account}
               idempotency_key: ${idempotency_key}
+              # Pins the simulated outcome for this execution. Without it the
+              # decline branch is only reachable by luck (5%), or by redeploying
+              # the service with GATEWAY_FORCE set.
+              force_outcome: ${gateway_force}
             timeout: 60
           result: payment_response
         retry:
@@ -124,7 +156,7 @@ main:
           steps:
             - check_decline:
                 switch:
-                  - condition: ${e.code == 402}
+                  - condition: ${default(map.get(e, "code"), 0) == 402}
                     assign:
                       - failure_context:
                           payment_id: ${payment_id}
@@ -156,6 +188,8 @@ main:
           call: http.post
           args:
             url: ${db_proxy_url + "/update-payment"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -202,6 +236,8 @@ main:
           call: http.post
           args:
             url: ${notification_service_url + "/notify"}
+            auth:
+              type: OIDC
             headers:
               Content-Type: "application/json"
             body:
@@ -244,6 +280,8 @@ main:
                 call: http.post
                 args:
                   url: ${db_proxy_url + "/record-failure"}
+                  auth:
+                    type: OIDC
                   headers:
                     Content-Type: "application/json"
                   body:
@@ -279,6 +317,8 @@ main:
                 call: http.post
                 args:
                   url: ${notification_service_url + "/notify"}
+                  auth:
+                    type: OIDC
                   headers:
                     Content-Type: "application/json"
                   body:
@@ -310,13 +350,13 @@ retry_on_server_error:
   steps:
     - check_error:
         switch:
-          - condition: ${e.code == 429}
+          - condition: ${default(map.get(e, "code"), 0) == 429}
             return: true
-          - condition: ${e.code >= 500 and e.code < 600}
+          - condition: ${default(map.get(e, "code"), 0) >= 500 and default(map.get(e, "code"), 0) < 600}
             return: true
-          - condition: ${"ConnectionError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "ConnectionError")}
             return: true
-          - condition: ${"TimeoutError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
             return: true
         next: return_false
     - return_false:
@@ -328,19 +368,19 @@ retry_on_gateway_error:
   steps:
     - check_error:
         switch:
-          - condition: ${e.code == 504}
+          - condition: ${default(map.get(e, "code"), 0) == 504}
             return: true
-          - condition: ${e.code == 503}
+          - condition: ${default(map.get(e, "code"), 0) == 503}
             return: true
-          - condition: ${e.code == 502}
+          - condition: ${default(map.get(e, "code"), 0) == 502}
             return: true
-          - condition: ${e.code == 500}
+          - condition: ${default(map.get(e, "code"), 0) == 500}
             return: true
-          - condition: ${e.code == 429}
+          - condition: ${default(map.get(e, "code"), 0) == 429}
             return: true
-          - condition: ${"TimeoutError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "TimeoutError")}
             return: true
-          - condition: ${"ConnectionError" in e.message}
+          - condition: ${text.match_regex(default(map.get(e, "message"), ""), "ConnectionError")}
             return: true
         next: return_false
     - return_false:

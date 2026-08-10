@@ -1,0 +1,96 @@
+# Machine-specific configuration for the bake-off.
+#
+#   cp .envrc.example .envrc    &&    $EDITOR .envrc    &&    direnv allow
+#
+# `.envrc` is gitignored (`*.env*`); this template is the committed counterpart.
+# Everything here is a value that differs per machine, per cloud account, or per
+# person -- cluster contexts, your own domain, cloud account identifiers, and
+# tokens. Nothing in the repo hard-codes any of it, so a fresh clone works once
+# this file is filled in.
+#
+# Local-only runs (`just up`, the Python orchestrators, Temporal, Hatchet,
+# Kestra, Conductor) need NONE of this -- the compose defaults cover them. These
+# variables matter only for the Kubernetes (Argo, Flyte) and cloud (Step
+# Functions, Google Workflows) paths.
+
+# ---------------------------------------------------------------- Kubernetes
+# The kube context to target. Every script takes `--context "$KCTX"`; none of
+# them assume a current-context, so switching clusters is one variable.
+#
+# Two clusters were used while writing this, and the distinction is load-bearing
+# rather than cosmetic -- CPU ARCHITECTURE decides whether your task images run
+# at all (RUNNING.md §7):
+#   * an arm64 cluster  (OCI)          -- images must be built for arm64
+#   * an amd64 cluster  (EKS Fargate)  -- no persistent volumes, so STORAGE_CLASS=""
+export KCTX=my-arm64-cluster
+
+# Kubernetes namespaces. Defaults in the scripts are fine for most setups.
+# export ORCH_NS=orchestrators
+# export WORKFLOW_NS=argo
+# export FLYTE_NS=flyte
+
+# Storage class for the in-cluster Postgres PVC. Set to the empty string on a
+# cluster with no dynamic provisioning (EKS Fargate), which drops the PV.
+# export STORAGE_CLASS=oci-bv
+# export PG_STORAGE=10Gi
+
+# Ingress + TLS, for exposing the mock services publicly (the Step Functions and
+# Google Workflows paths need to reach them from outside the cluster).
+# export INGRESS_CLASS=traefik
+# export CLUSTER_ISSUER=letsencrypt-prod
+
+# ------------------------------------------------------------------- domain
+# YOUR domain. The mock services are published as
+# orch-callback-fetch.$PUBLIC_DOMAIN, orch-approval.$PUBLIC_DOMAIN, etc., and
+# cert-manager issues certs for those names -- so this must be a domain whose
+# DNS you control. A wildcard `*.$PUBLIC_DOMAIN` A-record pointed at the ingress
+# IP is the simplest setup (RUNNING.md §7c).
+export PUBLIC_DOMAIN=example.com
+# Some scripts read BASE_DOMAIN; keep them in step.
+export BASE_DOMAIN="$PUBLIC_DOMAIN"
+
+# ---------------------------------------------------------------------- AWS
+# The named profile from ~/.aws/credentials that Terraform and the AWS CLI use.
+export AWS_PROFILE=my-aws-profile
+export AWS_REGION=us-east-1
+
+# Your ECR registry, i.e. <aws-account-id>.dkr.ecr.<region>.amazonaws.com.
+# Used for the Flyte task images and the mock-service images. There is no
+# default anywhere in the repo -- the scripts fail loudly if this is unset,
+# rather than silently pushing to someone else's registry.
+export ECR="123456789012.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+# Real Postgres for the Step Functions path (Lambdas cannot reach a laptop).
+# Terraform reads it as TF_VAR_neon_database_url and writes it to SSM; it is
+# never committed. Any publicly reachable Postgres works -- Neon is just what
+# was used here.
+# export NEON_DATABASE_URL="postgresql://user:pass@host/orchestration?sslmode=require"
+# export TF_VAR_neon_database_url="$NEON_DATABASE_URL"
+
+# ---------------------------------------------------------------------- GCP
+# Google Workflows path (RUNNING.md §10). `gcloud config get-value project` if
+# you are unsure. There is no default anywhere in the repo: the scripts and
+# Terraform both fail loudly if this is unset, rather than deploying into
+# whatever project your gcloud happens to point at.
+# export PROJECT_ID=my-gcp-project
+# export GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
+# export TF_VAR_project_id="$PROJECT_ID"
+# export REGION=us-central1
+
+# The mock services Google Workflows calls. Same domain as PUBLIC_DOMAIN above;
+# Terraform derives orch-callback-fetch.<domain> and friends from it.
+# export TF_VAR_mock_service_base_domain="$PUBLIC_DOMAIN"
+
+# ------------------------------------------------------------------ Hatchet
+# Client token minted at runtime -- see RUNNING.md §5. Long-lived JWT: keep it
+# in .envrc (gitignored) and never in a tracked file.
+# export HATCHET_CLIENT_TOKEN="..."
+# export HATCHET_CLIENT_TLS_STRATEGY=none
+# export HATCHET_CLIENT_HOST_PORT=localhost:7077
+
+# --------------------------------------------------------------- host-side
+# Only needed when running an orchestrator's workers on the host rather than in
+# compose. Each tool's own env.sh already exports these; listed here so the
+# override point is obvious.
+# export POSTGRES_HOST=localhost
+# export POSTGRES_PORT=54321

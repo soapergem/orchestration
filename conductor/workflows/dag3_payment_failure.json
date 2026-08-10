@@ -1,0 +1,40 @@
+{
+  "name": "dag3_payment_failure",
+  "version": 1,
+  "description": "DAG 3 failure handler: records the failed transaction when the gateway declines or exhausts its retries",
+  "ownerEmail": "bakeoff@orchestration.local",
+  "schemaVersion": 2,
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 300,
+  "inputParameters": [
+    "payment_id",
+    "reason",
+    "workflowId",
+    "failureStatus"
+  ],
+  "tasks": [
+    {
+      "name": "handle_payment_failure",
+      "taskReferenceName": "handle_failure",
+      "type": "SIMPLE",
+      "inputParameters": {
+        "payment_id": "${workflow.input.payment_id}",
+        "from_account": "${workflow.input.from_account}",
+        "to_account": "${workflow.input.to_account}",
+        "amount": "${workflow.input.amount}",
+        "currency": "${workflow.input.currency}",
+        "idempotency_key": "${workflow.input.idempotency_key}",
+        "reason": "${workflow.input.reason}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "outcome": "payment_failed",
+    "payment_id": "${workflow.input.payment_id}",
+    "reason": "${workflow.input.reason}",
+    "failed_workflow_id": "${workflow.input.workflowId}",
+    "failure_status": "${workflow.input.failureStatus}",
+    "failure_recorded": "${handle_failure.output.failure_recorded}"
+  }
+}

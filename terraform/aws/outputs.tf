@@ -25,7 +25,7 @@ output "dag1_bucket" {
 
 output "dag1_sample_zip_key" {
   description = "Key of the seeded sample ZIP (use as zip_key in the DAG 1 input)."
-  value       = aws_s3_object.sample_zip.key
+  value       = "input/sample-data.zip"
 }
 
 output "dag2_state_machine_arn" {
@@ -56,5 +56,34 @@ output "callback_resume_access_key_id" {
 output "callback_resume_secret_access_key" {
   description = "Secret access key for the SendTaskSuccess IAM user (sensitive)."
   value       = aws_iam_access_key.callback_resume.secret
+  sensitive   = true
+}
+
+output "fixture_sample_zip_url" {
+  description = "s3:// URI of DAG 1's archive; set as FIXTURE_SAMPLE_ZIP_URL on fixture-service."
+  value       = "s3://${aws_s3_bucket.dag1.id}/input/sample-data.zip"
+}
+
+output "fixture_books_url" {
+  description = "s3:// URI of the Open Library corpus; set as FIXTURE_BOOKS_URL on fixture-service."
+  value       = "s3://${aws_s3_bucket.dag1.id}/input/books.json.gz"
+}
+
+output "fixture_objects_uploaded" {
+  description = "Which fixture artefacts were present locally and uploaded (build them first if empty)."
+  value = compact([
+    length(aws_s3_object.sample_zip) > 0 ? "sample-data.zip" : "",
+    length(aws_s3_object.books_corpus) > 0 ? "books.json.gz" : "",
+  ])
+}
+
+output "fixture_reader_access_key_id" {
+  description = "Access key ID for the fixture-service S3 reader (put in the K8s fixture-s3-creds Secret)."
+  value       = aws_iam_access_key.fixture_reader.id
+}
+
+output "fixture_reader_secret_access_key" {
+  description = "Secret access key for the fixture-service S3 reader (sensitive)."
+  value       = aws_iam_access_key.fixture_reader.secret
   sensitive   = true
 }

@@ -31,6 +31,7 @@ Production note on wait_for_input:
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import timedelta
@@ -52,13 +53,27 @@ from .types import (
 # ---------------------------------------------------------------------------
 # Container image spec
 # ---------------------------------------------------------------------------
-fanout_image = ImageSpec(
+# A prebuilt image can be substituted for the ImageSpec entirely. ImageSpec
+# assumes a working local container builder AND that the build host can produce
+# the cluster's architecture -- neither holds when building arm64 from an x86
+# workstation without qemu binfmt handlers (rootless podman cannot register
+# them). FLYTE_TASK_IMAGE points at an image built natively on the cluster
+# instead, and registration then pushes nothing. See flyte/README.md.
+_PREBUILT = os.environ.get("FLYTE_TASK_IMAGE")
+
+fanout_image = _PREBUILT or ImageSpec(
     name="api-fanout",
     packages=[
         "urllib3",
         "flytekit",
     ],
     python_version="3.11",
+    # Target platform must match the cluster's node architecture. flytekit
+    # defaults this to linux/amd64 (it only picks arm64 when pushing to a LOCAL
+    # registry from an arm64 build host), so an arm64 cluster needs it set
+    # explicitly -- otherwise the image pulls and schedules fine and then the
+    # container dies with "exec format error". See RUNNING.md 7b.
+    platform=os.environ.get("FLYTE_IMAGE_PLATFORM", "linux/amd64"),
 )
 
 _http = urllib3.PoolManager()
@@ -93,10 +108,21 @@ def submit_async_fetch(url: str, request_config: RequestConfig) -> FetchResult:
     if request_config.api_key:
         fetch_headers["Authorization"] = f"Bearer {request_config.api_key}"
 
+    # The fetch service is a resume BROKER (RUNNING.md 2b): it needs a provider
+    # plus a resume handle, and its validator rejects a registration it cannot
+    # classify. An empty callback_url is NOT classifiable -- it returns 422
+    # ("cannot infer provider"), which is what this task used to send.
+    #
+    # This implementation polls GET /status/<correlation_id>, so register
+    # http_callback with a deliberately dead URL: the service still records the
+    # completed fetch, and polling is what advances the workflow. Swap in a real
+    # FlyteAdmin signal endpoint if the native wait_for_input path is ever
+    # implemented (see the module docstring).
     payload = {
         "url": url,
         "headers": fetch_headers,
-        "callback_url": "",  # Not used in polling mode
+        "provider": "http_callback",
+        "resume_data": {"callback_url": "http://unused.invalid/flyte-polls-instead"},
         "correlation_id": correlation_id,
     }
 
@@ -231,7 +257,7 @@ def process_fetch_result(
             items.append(
                 FanOutItem(
                     id=str(item.get("id", "")),
-                    name=str(item.get("name", item.get("id", ""))),
+                    name=str(item.get("title") or item.get("name") or item.get("id", "")),
                     detail_url=str(item.get("url", "")),
                 )
             )

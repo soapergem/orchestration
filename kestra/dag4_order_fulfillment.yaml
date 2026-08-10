@@ -25,11 +25,22 @@ inputs:
     description: Orders at or above this amount require manager approval
 
 variables:
+  task_network: shared-services_default
   pg_host: postgres
   pg_port: "5432"
   pg_database: orchestration
   pg_user: orchestration
   pg_password: orchestration
+  pg_schema: kestra_dag4
+
+pluginDefaults:
+  # Task-runner containers are siblings of the Kestra container, so they must be
+  # placed on the compose network for `postgres` / the mock services to resolve.
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: "{{ vars.task_network }}"
 
 tasks:
   - id: validate_order
@@ -43,7 +54,11 @@ tasks:
       interval: PT2S
       maxInterval: PT30S
     beforeCommands:
-      - pip install psycopg2-binary
+      - pip install kestra psycopg2-binary
+    # Passed as a file, not interpolated: JSON escapes `"` as \" and Python's
+    # triple-quoted literals process backslashes, corrupting the JSON.
+    inputFiles:
+      items.json: "{{ inputs.items }}"
     script: |
       import json
 
@@ -51,7 +66,8 @@ tasks:
 
       order_id = "{{ inputs.order_id }}"
       customer_id = "{{ inputs.customer_id }}"
-      items = json.loads("""{{ inputs.items }}""")
+      with open("items.json") as f:
+          items = json.load(f)
       approval_threshold = float("{{ inputs.approval_threshold }}")
 
       conn = psycopg2.connect(
@@ -60,6 +76,7 @@ tasks:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
 
       from kestra import Kestra
@@ -165,7 +182,7 @@ tasks:
             description: >
               If the manager approved, proceed to shipping. Otherwise,
               compensate by releasing inventory.
-            condition: "{{ outputs.manager_approval.outputs.record_decision.vars.decision == 'approved' }}"
+            condition: "{{ outputs.manager_approval.outputs.decision == 'approved' }}"
             then:
               - id: ship_after_approval
                 type: io.kestra.plugin.core.flow.Subflow
@@ -191,14 +208,14 @@ tasks:
                   type: constant
                   maxAttempt: 3
                   interval: PT2S
-                url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+                url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}?currentSchema={{ vars.pg_schema }}"
                 username: "{{ vars.pg_user }}"
                 password: "{{ vars.pg_password }}"
                 sql: |
                   UPDATE orders
                   SET status = 'shipped',
-                      shipment_id = '{{ outputs.ship_after_approval.outputs.ship.vars.shipment_id }}',
-                      tracking_number = '{{ outputs.ship_after_approval.outputs.ship.vars.tracking_number }}',
+                      shipment_id = '{{ outputs.ship_after_approval.outputs.shipment_id }}',
+                      tracking_number = '{{ outputs.ship_after_approval.outputs.tracking_number }}',
                       updated_at = NOW()
                   WHERE order_id = '{{ inputs.order_id }}';
 
@@ -210,14 +227,16 @@ tasks:
                   type: constant
                   maxAttempt: 3
                   interval: PT2S
+                beforeCommands:
+                  - pip install kestra
                 script: |
                   import json
                   from datetime import datetime, timezone
 
                   order_id = "{{ inputs.order_id }}"
-                  tracking_number = "{{ outputs.ship_after_approval.outputs.ship.vars.tracking_number }}"
-                  carrier = "{{ outputs.ship_after_approval.outputs.ship.vars.carrier }}"
-                  estimated_delivery = "{{ outputs.ship_after_approval.outputs.ship.vars.estimated_delivery }}"
+                  tracking_number = "{{ outputs.ship_after_approval.outputs.tracking_number }}"
+                  carrier = "{{ outputs.ship_after_approval.outputs.carrier }}"
+                  estimated_delivery = "{{ outputs.ship_after_approval.outputs.estimated_delivery }}"
 
                   message = (
                       f"Your order {order_id} has been shipped! "
@@ -240,7 +259,7 @@ tasks:
                   Order was rejected or approval timed out. Release inventory,
                   cancel the order, and send a cancellation notification.
                 beforeCommands:
-                  - pip install psycopg2-binary
+                  - pip install kestra psycopg2-binary
                 script: |
                   import json
                   from datetime import datetime, timezone
@@ -255,6 +274,7 @@ tasks:
                       dbname="{{ vars.pg_database }}",
                       user="{{ vars.pg_user }}",
                       password="{{ vars.pg_password }}",
+                      options="-c search_path={{ vars.pg_schema }}",
                   )
 
                   try:
@@ -354,14 +374,14 @@ tasks:
               type: constant
               maxAttempt: 3
               interval: PT2S
-            url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}"
+            url: "jdbc:postgresql://{{ vars.pg_host }}:{{ vars.pg_port }}/{{ vars.pg_database }}?currentSchema={{ vars.pg_schema }}"
             username: "{{ vars.pg_user }}"
             password: "{{ vars.pg_password }}"
             sql: |
               UPDATE orders
               SET status = 'shipped',
-                  shipment_id = '{{ outputs.call_shipping.outputs.ship.vars.shipment_id }}',
-                  tracking_number = '{{ outputs.call_shipping.outputs.ship.vars.tracking_number }}',
+                  shipment_id = '{{ outputs.call_shipping.outputs.shipment_id }}',
+                  tracking_number = '{{ outputs.call_shipping.outputs.tracking_number }}',
                   updated_at = NOW()
               WHERE order_id = '{{ inputs.order_id }}';
 
@@ -373,14 +393,16 @@ tasks:
               type: constant
               maxAttempt: 3
               interval: PT2S
+            beforeCommands:
+              - pip install kestra
             script: |
               import json
               from datetime import datetime, timezone
 
               order_id = "{{ inputs.order_id }}"
-              tracking_number = "{{ outputs.call_shipping.outputs.ship.vars.tracking_number }}"
-              carrier = "{{ outputs.call_shipping.outputs.ship.vars.carrier }}"
-              estimated_delivery = "{{ outputs.call_shipping.outputs.ship.vars.estimated_delivery }}"
+              tracking_number = "{{ outputs.call_shipping.outputs.tracking_number }}"
+              carrier = "{{ outputs.call_shipping.outputs.carrier }}"
+              estimated_delivery = "{{ outputs.call_shipping.outputs.estimated_delivery }}"
 
               message = (
                   f"Your order {order_id} has been shipped! "
@@ -409,7 +431,7 @@ errors:
       interval: PT3S
       maxInterval: PT60S
     beforeCommands:
-      - pip install psycopg2-binary
+      - pip install kestra psycopg2-binary
     script: |
       import json
       from datetime import datetime, timezone
@@ -424,6 +446,7 @@ errors:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
 
       try:
@@ -482,7 +505,7 @@ errors:
       maxAttempt: 3
       interval: PT2S
     beforeCommands:
-      - pip install psycopg2-binary
+      - pip install kestra psycopg2-binary
     script: |
       import psycopg2
       from datetime import datetime, timezone
@@ -495,6 +518,7 @@ errors:
           dbname="{{ vars.pg_database }}",
           user="{{ vars.pg_user }}",
           password="{{ vars.pg_password }}",
+          options="-c search_path={{ vars.pg_schema }}",
       )
 
       try:
@@ -532,6 +556,8 @@ errors:
       type: constant
       maxAttempt: 3
       interval: PT2S
+    beforeCommands:
+      - pip install kestra
     script: |
       import json
       from datetime import datetime, timezone
