@@ -111,7 +111,7 @@ source dagster_bakeoff/env.sh && uv run dagster dev -m dagster_bakeoff.repositor
 cd prefect  && uv run prefect server start                                 # :4200
 cd luigi    && uv run python dag1_csv_etl.py
 cd temporal && uv run python worker.py    # + uvicorn signal_server:app --port 8095
-cd presentation && just serve             # or: just build
+just slides-serve                          # or: just slides-build
 ```
 
 Ports: postgres **54321** (non-standard, deliberate), callback-fetch 8090,

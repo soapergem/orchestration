@@ -119,3 +119,13 @@ seed runner:
 # Open a psql shell against the bake-off database.
 psql:
     {{ compose }} exec postgres psql -U orchestration -d orchestration
+
+# Build the presentation slides.
+slides-build:
+    uv --directory presentation run mkslides build
+
+# Serve the presentation slides locally with live-reload (port 8084, avoiding Conductor's 8000).
+slides-serve:
+    uv --directory presentation run mkslides serve -a 0.0.0.0:8084
+
+alias slides := slides-serve
