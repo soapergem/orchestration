@@ -1,14 +1,80 @@
 # Workflow Orchestration
+### Concepts, Trade-offs, & 12-Tool Comparison
 
 ---
 
-## What is workflow orchestration?
+## What is Workflow Orchestration?
 
-The automated coordination, management, and sequencing of interdependent tasks, systems, and data — typically modeled as a state machine.
+The automated coordination, management, and execution of interdependent tasks, microservices, and data pipelines.
+
+<div class="fragment">
+It manages state transitions, enforces dependencies, handles failures, and tracks execution history across distributed systems.
+</div>
 
 ---
 
-## What is a state machine?
+## The Common Question
+
+> *"Why do we need an orchestrator? Can't we just write Python scripts, cron jobs, or pub/sub events?"*
+
+---
+
+## The Alternatives to Orchestration
+
+1. **The Monolith Script / Lambda**
+   - Single process handling business logic AND control flow AND retries AND state tracking.
+
+2. **Peer-to-Peer Choreography**
+   - Services talking via pub/sub or direct REST calls. State is scattered across message topics and database tables.
+
+---
+
+## The "Do-It-Yourself" Pitfall
+
+When you build pipelines without an orchestrator, you eventually need:
+
+* Retries with exponential backoff and jitter
+* Task dependency resolution & parallel execution
+* A database to track job state and timestamps for idempotency
+* Log aggregation & failure alerting
+* A UI to find why step 99,648 of 100,000 failed
+
+<div class="fragment">
+<strong>You end up re-inventing a workflow orchestrator — just more fragile, with zero visibility.</strong>
+</div>
+
+---
+
+## What Happens When Step 3 of 10 Fails?
+
+### Without an Orchestration Engine:
+* The entire script or Lambda fails — **re-run from scratch**
+* Risk of duplicating side effects (charging a card twice, re-inserting DB rows)
+* Long-running operations time out
+* Partial failures become total failures
+* Answering *"Where is order #12345 stuck?"* requires searching log files across multiple servers
+
+---
+
+## Why Use a Workflow Orchestrator?
+
+* **Reliability & Resiliency:** Built-in retries, timeouts, and saga/compensation for clean rollbacks.
+* **Observability & Audit Trail:** Visual graph of execution, step-by-step I/O inspection, and instant status tracking.
+* **State Persistence & Resume:** Resume directly from the failed step without repeating completed work.
+* **Decoupled Architecture:** Business logic stays in clean, stateless workers; control flow is handled by the engine.
+* **Backpressure & Concurrency:** Managed task queues, rate limiting, and dynamic fan-out.
+
+---
+
+## Orchestration vs. Choreography vs. State Tracking
+
+* **Choreography (Pub/Sub):** Decentralized events. Easy for 2-3 services; impossible to track or reason about across complex multi-step workflows.
+* **State Tracker (e.g. AASM / DB flag):** Tracks *where an object is* in its lifecycle, but doesn't execute anything. You still write the execution loop.
+* **Workflow Orchestration Engine:** An **execution engine**. It calls services, enforces dependencies, handles retries, persists state, and drives execution automatically.
+
+---
+
+## What is a State Machine?
 
 A model of computation defined by:
 
@@ -18,12 +84,17 @@ A model of computation defined by:
 * One or more **terminal states**
 
 <div class="fragment">
-At any point in time, the machine is in exactly one state. An event or condition causes it to transition to the next.
+At any point in time, the system is in exactly one state. An event or condition causes it to transition to the next.
 </div>
 
 ---
 
-When referring to workflow orchestration, you often hear about DAGs: directed, acyclic graphs.
+## Directed Acyclic Graphs (DAGs)
+
+Workflows are commonly modeled as **DAGs**: directed, acyclic graphs.
+
+* **Directed:** Edges have a clear direction ($A \rightarrow B$).
+* **Acyclic:** No cycles or infinite loops allowed in the graph structure.
 
 ---
 
@@ -43,141 +114,62 @@ When referring to workflow orchestration, you often hear about DAGs: directed, a
 
 ---
 
-![Invalid DAG 1](images/loopback.png)
+![Invalid DAG 1 (Cycle)](images/loopback.png)
 
-![Invalid DAG 2](images/sneaky.png)
-
----
-
-Workflow orchestration runs tasks in a DAG, keeping track of the overall state and triggering transitions.
-
-<div class="fragment">
-Isn't that just <em>programming</em>?
-</div>
+![Invalid DAG 2 (Self-Loop)](images/sneaky.png)
 
 ---
 
-The alternative is running a complex script that handles everything: both business logic and orchestration.
+## Modular Architecture: Pull the Control Flow Out
 
----
-
-## The Monolith Lambda
-
-* The Lambda handles the full chain of API calls executed sequentially
-* The Lambda handles all conditional branches
-* The Lambda is responsible for error handling
-* The Lambda handles retry logic
-* Oh, and it still has to do the work!
-
----
-
-
-## What happens when step 3 fails?
-
-* The entire Lambda fails — re-run from scratch
-* Need to dig through logs for errors
-* Long-running processes can time out
-* Partial failures often become total failures
-
----
-
-## Modular Approach
-
-Treat each task in the DAG as an independent worker responsible only for its own focus area.
-
----
-
-## Pull the control flow out
-
-* Each step becomes its own Lambda with a single job
-* The workflow definition handles routing, retries, and error handling
-* **Choice states** replace `if/else` branches
-* **Parallel states** replace hand-rolled concurrency
-* **Map states** replace `for` loops over collections
+* Each step is an independent worker with **one job**
+* The workflow engine handles routing, state, retries, and error handling
+* **Choice states** replace `if/else` logic
+* **Parallel states** replace hand-rolled threads/concurrency
+* **Map / Dynamic states** replace `for` loops over collections
 
 ---
 
 ## Visibility & Debugging
 
-* See exactly which step failed and why
-* Inspect the input and output at each step
-* Trace the full execution history visually
+* See visually which step failed and why
+* Inspect exact inputs and outputs at every step
+* Re-run failed steps with the click of a button or single API call
+* Full execution audit trail for compliance and debugging
 
 ---
 
-In other words, by packaging up scripts inside Lambdas _without_ workflow orchestration tools, we end up building an orchestrator ourselves anyway.
+## Common Architecture Patterns
 
-It's just more fragile and less visible.
+Most orchestrators separate the **Control Plane** from the **Data Plane**:
 
----
-
-## Sound familiar?
-
-AASM defines states and transitions for Ruby classes.
-
-_e.g. "an order can go from pending to confirmed to shipped"_
+* **Scheduler / Coordinator / Decider:** Tracks workflow state, evaluates transitions, enqueues tasks.
+* **Worker Pool:** Pulls or receives tasks, executes business logic, and reports status back.
 
 ---
 
-## AASM at ApartmentIQ
+## The 12-Tool Orchestrator Bake-Off
 
-We are currently using aasm on the `Apartmentiq::DataPipeline` class, with only three states:
+To compare workflow orchestrators objectively, we implemented the **exact same 4 real-world DAGs** across 12 orchestration tools:
 
-1. collecting
-2. completed
-3. errored
-
----
-
-## AASM vs. Workflow Orchestration
-
-**AASM** models state — it tracks *where an object is* in its lifecycle, but it doesn't execute anything.
-
-Your code is still responsible for doing the work and triggering transitions.
-
-**Workflow orchestration** actually *runs* the work. It calls services, handles retries, manages failures, and moves to the next step automatically.
-
----
-
-AASM is a **state tracker**.
-
-A workflow orchestrator is an **execution engine**.
+1. **AWS Step Functions**
+2. **Apache Airflow**
+3. **Argo Workflows**
+4. **Dagster**
+5. **Temporal**
+6. **Kestra**
+7. **Prefect**
+8. **Flyte**
+9. **Luigi**
+10. **Hatchet**
+11. **Google Workflows**
+12. **Conductor**
 
 ---
 
-## AWS Step Functions
+## The 4 Benchmark DAGs
 
-Step Functions is a serverless workflow orchestrator.
-
-* Fully managed service
-* DAGs defined in ASL (Amazon State Language)
-* Visual editor in Console or VS Code
-* Past execution history
-* Many ways to trigger invocations
-
----
-
-Let's see it...
-
----
-
-There are many workflow orchestrators:
-
-1. AWS Step Functions
-1. Google Workflows
-1. Apache Airflow
-1. Argo Workflows
-1. Dagster
-1. Temporal
-1. Kestra
-1. Prefect
-1. Flyte
-1. Luigi
-1. Hatchet
-1. Conductor
-
----
-
-Most of them define a concept of a scheduler/coordinator, and a worker.
-
-Usually you will have a single scheduler process, and a pool of multiple workers that can scale.
+1. **DAG 1: CSV ETL** — Dynamic parallel CSV load into Postgres → SQL transform → Parquet.
+2. **DAG 2: API Fanout & Callback** — Async callback (workflow suspends) → conditional branch → 30-item parallel detail fetches → combine.
+3. **DAG 3: Payment Processing** — Validation → flaky gateway call with backoff/jitter → idempotent DB update → notification.
+4. **DAG 4: Order Fulfillment** — Reserve inventory → human approval (suspends) → shipping → **saga compensation** on rejection/timeout.

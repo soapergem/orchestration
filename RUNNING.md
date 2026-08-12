@@ -47,6 +47,7 @@ port anywhere.**
 | 8081 | Kestra | UI (`KESTRA_PORT`; container still listens on 8080 internally) |
 | 8082 | Luigi | `luigid` central scheduler, if used (Luigi's own default) |
 | 8083 | Flyte | `flyteconsole` port-forward |
+| 8084 | presentation | `mkslides serve` presentation slides |
 | 8095 | Temporal | signal-relay server (host) |
 | 8096 | Hatchet | event-relay server (host) |
 | 8233 | Temporal | Web UI |

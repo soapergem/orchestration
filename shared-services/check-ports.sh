@@ -21,6 +21,7 @@ MAP="
 8081|Kestra|UI (container listens on 8080)
 8082|Luigi|luigid central scheduler
 8083|Flyte|flyteconsole port-forward
+8084|presentation|mkslides serve
 8095|Temporal|signal-relay server
 8096|Hatchet|event-relay server
 8233|Temporal|Web UI
