@@ -1,0 +1,23 @@
+# Backend settings for `terraform init -backend-config=backend.hcl`.
+#
+#   cp backend.hcl.example backend.hcl      # then edit; backend.hcl is gitignored
+#   terraform -chdir=terraform/aws init -backend-config=backend.hcl
+#
+# The `backend "s3" {}` block in versions.tf is deliberately empty so none of
+# this is committed. Terraform state for this stack contains the Neon DSN and
+# other secrets in plaintext, so the bucket must be private, encrypted and
+# versioned.
+#
+# `use_lockfile` replaces the old DynamoDB lock table (Terraform >= 1.10); drop
+# it and use `dynamodb_table` instead if you are on an older CLI.
+
+bucket       = "your-terraform-state-bucket"
+key          = "orchestration/gcp.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
+
+# If your state bucket is reached through a named profile rather than ambient
+# credentials, set it here too -- the provider's `profile` does not apply to the
+# backend.
+# profile = "your-profile"

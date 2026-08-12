@@ -20,7 +20,7 @@
 #   KCTX          kube context (required)
 #   FLYTE_NS      namespace running flyteadmin      (default: flyte)
 #   TASK_IMAGE    prebuilt task image               (default: $ECR/orch-bakeoff-flyte:latest)
-#   PROJECT       flyte project                     (default: flytesnacks)
+#   PROJECT       flyte project                     (default: bakeoff)
 #   DOMAIN        flyte domain                      (default: development)
 
 set -euo pipefail
@@ -29,7 +29,7 @@ set -euo pipefail
 FLYTE_NS="${FLYTE_NS:-flyte}"
 : "${ECR:?set ECR to your registry, e.g. <account-id>.dkr.ecr.<region>.amazonaws.com (see .envrc.example)}"
 TASK_IMAGE="${TASK_IMAGE:-$ECR/orch-bakeoff-flyte:latest}"
-PROJECT="${PROJECT:-flytesnacks}"
+PROJECT="${PROJECT:-bakeoff}"
 DOMAIN="${DOMAIN:-development}"
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"

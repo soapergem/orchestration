@@ -1,0 +1,102 @@
+{{/*
+In-cluster Postgres for the bake-off DAGs.
+
+Off by default, because the two cloud runners (Step Functions, Google Workflows)
+use Neon and want nothing here. Argo and Flyte DO need it: their DAG steps carry
+`PGHOST: "postgres"` as a literal env value, so the Service must be named exactly
+`postgres` regardless of what the Deployment is called (RUNNING.md 7c). That is
+why `postgres.serviceName` is separate from the workload name.
+
+This is the piece deploy-backbone.sh had and the chart did not, which is the main
+reason two deployment paths existed at all.
+*/}}
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.postgres.pvcName }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.postgres.storage }}
+  {{- if .Values.postgres.storageClass }}
+  storageClassName: {{ .Values.postgres.storageClass }}
+  {{- else if eq .Values.postgres.storageClass "" }}
+  {{- /* Explicit empty string = the Fargate cluster, which has no dynamic
+         provisioner. Omitting the key entirely lets the default class apply. */}}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.postgres.serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.postgres.name }}
+spec:
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+  selector:
+    app: {{ .Values.postgres.name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.postgres.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.postgres.name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO volume: never two pods holding it at once
+  selector:
+    matchLabels:
+      app: {{ .Values.postgres.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.postgres.name }}
+    spec:
+      containers:
+      - name: postgres
+        image: {{ .Values.postgres.image }}
+        env:
+        - {name: POSTGRES_DB, value: {{ .Values.postgres.database | quote }}}
+        - {name: POSTGRES_USER, value: {{ .Values.postgres.user | quote }}}
+        - {name: POSTGRES_PASSWORD, value: {{ .Values.postgres.password | quote }}}
+        # Subdirectory, not the mount root: a PVC's lost+found makes initdb
+        # refuse to run on an otherwise empty volume.
+        - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - {name: pgdata, mountPath: /var/lib/postgresql/data}
+        {{- if .Values.postgres.initDbConfigMap }}
+        # init-db.sql runs ONLY on a fresh volume. On an existing one use
+        # `just seed <runner>` / `just reset <runner>`, which reload the
+        # bootstrap_bakeoff function first.
+        - {name: initdb, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+        {{- end }}
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 6
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+      volumes:
+      - name: pgdata
+        persistentVolumeClaim:
+          claimName: {{ .Values.postgres.pvcName }}
+      {{- if .Values.postgres.initDbConfigMap }}
+      - name: initdb
+        configMap: {name: {{ .Values.postgres.initDbConfigMap }}}
+      {{- end }}
+      restartPolicy: Always
+{{- end }}

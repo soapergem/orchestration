@@ -5,3 +5,5 @@ build/
 *.tfvars
 !*.tfvars.example
 crash.log
+# Backend settings: bucket name stays out of git. The .example is the template.
+backend.hcl

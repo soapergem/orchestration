@@ -29,6 +29,15 @@ services:
   postgres:
     restart: unless-stopped
     image: postgres:16
+    # `just up-all` runs four engines against this one server and the stock
+    # max_connections=100 is not enough for them: measured on a bare up-all,
+    # temporal held 67 connections, hatchet 13, conductor 10, kestra 10 -- exactly
+    # 100, leaving nothing for the mock services, host-run workers, or a GUI
+    # client (the symptom is `FATAL: sorry, too many clients already`, and it
+    # exhausts the superuser-reserved slots too, so even psql inside the
+    # container is locked out). 300 leaves room for all of that at once; each
+    # slot costs a few hundred KB of shared memory, so the overhead is trivial.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_DB: orchestration
       POSTGRES_USER: orchestration
@@ -155,6 +164,15 @@ services:
       POSTGRES_USER: orchestration
       POSTGRES_PWD: orchestration
       POSTGRES_SEEDS: postgres    # auto-setup creates the temporal + temporal_visibility DBs
+      # auto-setup runs frontend/history/matching/worker in one container and each
+      # opens its own pools, so the defaults (SQL 20, visibility 10) come to 120
+      # potential connections -- 67 in practice, two thirds of the server. These
+      # caps bring it to ~40 max. Plenty for a single-node evaluation; raise them
+      # if history tasks start queueing.
+      SQL_MAX_CONNS: "6"
+      SQL_MAX_IDLE_CONNS: "3"
+      SQL_VIS_MAX_CONNS: "4"
+      SQL_VIS_MAX_IDLE_CONNS: "2"
     ports:
       - "7233:7233"               # gRPC -- host worker connects here
 

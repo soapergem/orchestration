@@ -1,0 +1,53 @@
+# Preset for a cluster that RUNS the DAGs itself -- Argo and Flyte.
+#
+#   helm upgrade --install mock-services . -n orchestrators \
+#     -f values-incluster.yaml --set <domains...>
+#
+# This is what `deploy-backbone.sh` used to do imperatively in 508 lines of
+# inline YAML. Keeping it as chart values rather than a second implementation is
+# the point: the two paths had drifted (the script had Postgres and no AWS resume
+# credentials; the chart had the credentials and no Postgres), and the gap only
+# ever surfaced as a DAG failing in a misleading way.
+#
+# The AWS path (Step Functions) uses plain `values.yaml` instead: pre-built ECR
+# images, Neon rather than in-cluster Postgres.
+
+# Registry-free. Building arm64 images from an x86 host needs qemu binfmt, which
+# rootless podman cannot register (RUNNING.md 7b/9), so the arm64 cluster has no
+# practical route to per-service images.
+packaging: source
+
+image:
+  # No ECR pulls in source mode; a stock python image comes from Docker Hub.
+  pullSecretName: ""
+
+postgres:
+  enabled: true
+  # Cluster-specific. The OCI cluster provisions `oci-bv`; the Fargate cluster
+  # has no dynamic provisioning at all (STORAGE_CLASS="" in RUNNING.md 7).
+  storageClass: oci-bv
+  storage: 50Gi
+
+# Both resume providers. Either may be left empty on a cluster that does not run
+# that cloud's DAGs -- the env vars and volumes are then omitted entirely rather
+# than the pod failing on a missing Secret.
+aws:
+  resumeSecretName: aws-resume-creds
+gcp:
+  resumeSecretName: google-resume-creds
+
+fixture:
+  # s3:// plus an IAM credential, NOT a presigned URL. The deployment this
+  # replaced used presigned URLs with X-Amz-Expires=604800 -- a 7-day fuse that
+  # would have silently expired and taken DAG 2's corpus with it. These come
+  # from `terraform -chdir=terraform/aws output`.
+  booksUrl: s3://orch-bakeoff-dag1-602436928406/input/books.json.gz
+  sampleZipUrl: s3://orch-bakeoff-dag1-602436928406/input/sample-data.zip
+  s3SecretName: fixture-s3-creds
+  # Deliberately EMPTY. Setting it pins the per-item detail URLs to one host,
+  # and the previous deployment pinned them to `http://fixture-service:8099` --
+  # unresolvable from a Lambda, which is exactly why Step Functions' DAG 2
+  # fan-out died with NameResolutionError on every iteration. Left empty,
+  # fixture-service derives detail URLs from each request, so in-cluster and
+  # public callers both work.
+  baseUrl: ""
