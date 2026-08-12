@@ -48,6 +48,7 @@ port anywhere.**
 | 8082 | Luigi | `luigid` central scheduler, if used (Luigi's own default) |
 | 8083 | Flyte | `flyteconsole` port-forward |
 | 8084 | presentation | `mkslides serve` presentation slides |
+| 8085 | Flyte | console proxy (`just flyte-ui`) — merges flyteconsole + flyteadmin |
 | 8095 | Temporal | signal-relay server (host) |
 | 8096 | Hatchet | event-relay server (host) |
 | 8233 | Temporal | Web UI |
@@ -57,6 +58,33 @@ port anywhere.**
 | 2746 | Argo | `argo-server` port-forward |
 | 8000 | Conductor | server REST API (`/api`) — workers and `register.py` talk here |
 | 8127 | Conductor | UI (nginx inside the same container, on :5000) |
+
+### Logins — `just creds`
+
+Four of these UIs want a password and the rest want nothing, so run **`just
+creds`** rather than hunting: it reads the live values and names the services
+that have no auth. Where each one comes from, since they differ in kind:
+
+| Service | Credential | Source |
+|---|---|---|
+| Airflow :8080 | `admin` / *generated* | Written to `airflow/.airflow-home/simple_auth_manager_passwords.json.generated` on the **first** `standalone` run. Later starts log *"previously generated … Not echoing it here"*, so the file is the only copy. Delete it and restart to rotate. |
+| Hatchet :8888 | `admin@example.com` / `Admin123!!` | Seeded by the hatchet-lite image, not by our compose file. Verified via `POST /api/v1/users/login`. |
+| Kestra :8081 | `admin@orchestration.local` / `Orchestration_123` | `docker-compose.yml` (`KESTRA_USER`/`KESTRA_PASSWORD`, overridable). Kestra OSS has exactly **one** credential — service accounts are Enterprise-only — so the mock services reuse this to drive its authenticated resume endpoint. |
+| Postgres :54321 | `orchestration` / `orchestration` | `docker-compose.yml`. |
+
+**No auth at all:** Conductor (:8127), Temporal UI (:8233), Dagster (:3000),
+Prefect (:4200), luigid (:8082). Conductor's is a finding rather than a
+convenience — OSS has no authentication whatsoever, so anyone who can reach the
+API can read every execution, complete any task and rewrite every definition.
+It scores 3/5 on auth for exactly this.
+
+`HATCHET_CLIENT_TOKEN` is **not** a UI login — it is the JWT the host worker
+authenticates with, minted at runtime (§5). `just creds` reports whether it is
+set, not its value.
+
+All of this is evaluation-grade and local-only. It is safe to print because none
+of it protects anything; Argo, Flyte, Step Functions and Google Workflows
+authenticate through the cluster or cloud IAM instead and are not covered.
 
 **8080 belongs to Airflow.** Three other things wanted it and each was moved or
 pinned away:
@@ -284,10 +312,56 @@ Each orchestrator engine is behind a **compose profile**, so the default is to
 run one at a time: `just up <name>` (e.g. `just up temporal`, and likewise
 `hatchet`, `kestra`, `conductor`).
 
+**The table above is a port *reservation* map, not a status map.** Only four
+tools have an engine container; Airflow, Dagster, Prefect and Luigi are
+libraries run in your own venv, so no `just up*` recipe can start them and
+3000 / 4200 / 8080 stay unowned until you do. Run
+`./shared-services/check-ports.sh` to see what is actually listening, and
+**`just py-up`** to start the four that serve a UI (a thin wrapper over
+`scripts/py-procs.sh`, whose header carries the detail):
+
+```bash
+just py-up                     # Dagster :3000, Prefect :4200, Airflow :8080, luigid :8082
+just py-up dagster prefect     # or name them
+just py-status                 # what is up, and where
+just py-down                   # stop them
+```
+
+These bind **0.0.0.0**, not 127.0.0.1, so a browser outside the VM (a WSL2 host,
+another machine) can reach them. Airflow already defaults there; Dagster needs
+`-h $DAGSTER_HOST` (its `env.sh` sets it) and Prefect needs
+`PREFECT_SERVER_API_HOST`. `py-down` signals the whole **process group**: both
+`dagster dev` and `airflow standalone` are supervisors, and killing the parent
+alone orphans the children onto their ports — measured at 13 surviving processes
+for Airflow. Workers and relay servers are not included; start those per the
+per-tool sections below.
+
+`luigi` here means **`luigid` only**, Luigi's optional central scheduler. It is
+not needed to run anything — every documented Luigi invocation uses
+`--local-scheduler` and never contacts it; point tasks at it with
+`--scheduler-host localhost --scheduler-port 8082` instead. It needs a
+`setuptools<81` pin to start at all (luigi 3.7.1 imports `pkg_resources`, removed
+in setuptools 82) and an explicit `--state-path`, or it silently discards its
+state on shutdown. Both are handled in the recipe; see `luigi/README.md`.
+
 **`just up-all`** starts the backbone plus all four engines together. That is
 safe — §0 gives every engine its own host port, and all four profiles resolve
 with zero collisions — but heavier, since Kestra and Conductor are each a JVM.
 Prefer one at a time unless you are comparing engines side by side.
+
+All four engines share the one Postgres, and together they used to exhaust it:
+measured on a bare `up-all`, temporal held **67** connections, hatchet 13,
+conductor 10, kestra 10 — exactly the stock `max_connections=100`, with nothing
+left for the mock services, host-run workers, or a GUI client like DBeaver. The
+symptom is `FATAL: sorry, too many clients already`, and because the
+superuser-reserved slots go too, even `podman exec … psql` is locked out, which
+makes it look like the server is down rather than full. Fixed in
+`docker-compose.yml` (2026-08-12) from both ends: `max_connections=300` on the
+server, and caps on Temporal's pools (`SQL_MAX_CONNS`, `SQL_VIS_MAX_CONNS` — its
+auto-setup image runs frontend/history/matching/worker in one container and each
+opens its own pools, defaulting to 20 + 10 *per service*). Now ~62 of 300 in use
+with everything up. Both are container-recreate changes, so a running stack needs
+`just down-all && just up-all`, not a restart.
 
 `up-all` deliberately does **not** start the `temporal-worker` and
 `hatchet-worker` sidecars — it names the engine servers explicitly, because
@@ -751,7 +825,8 @@ Flyte's configured minio on the amd64 cluster.
 **Verified by deploying it (2026-08-03):** the §7c backbone is **live on the
 arm64 cluster** in namespace `orchestrators` — Postgres (50 GiB `oci-bv` PVC,
 `init-db.sql` applied on a fresh volume, `argo_*` and `flyte_*` schemas seeded)
-plus all three mock services, each 1/1 Ready. Smoke-tested from inside the
+plus all four mock services, each 1/1 Ready (fixture-service was added later;
+all five workloads are Helm-managed as of 2026-08-12). Smoke-tested from inside the
 cluster: TCP to all four, `GET /requests` and `GET /approval-requests` both 200,
 and a real `POST /shipments` returning `shipped`. The pods were also confirmed to
 be running current source (`@app.` route counts match the local `app.py`, and the
@@ -929,7 +1004,7 @@ Two hard constraints shape the deployment:
    `callback-fetch-service`, `approval-service`, `shipping-service`.
 2. **Bare names only resolve in the pod's own namespace.** Argo runs its pods in
    `argo`; Flyte runs task pods in per-project namespaces
-   (`flytesnacks-development`, …). Rather than one Postgres per orchestrator,
+   (`bakeoff-development`, …). Rather than one Postgres per orchestrator,
    deploy the backbone once and **alias it** into each workflow namespace with
    `ExternalName` Services (`alias-backbone.sh`, below). Flyte doesn't strictly
    need the aliases — its DB settings are a typed `DBConfig` **input**, so it can
@@ -937,27 +1012,57 @@ Two hard constraints shape the deployment:
 
 #### Deploy
 
-Two scripts in `shared-services/deploy/`. They are the single source of truth for
-these manifests; nothing here is copy-paste YAML that can drift from them.
+**Everything is one Helm chart** (`shared-services/deploy/`) as of 2026-08-12.
+`deploy-backbone.sh` is now a 78-line wrapper over it, not a second
+implementation — it renders the ConfigMaps the chart cannot template, then runs
+`helm upgrade --install -f values-incluster.yaml`.
 
 ```bash
 cd shared-services/deploy
 
-# Postgres (+ init-db.sql, + bootstrap_bakeoff for argo & flyte) and the three
-# mock services. Idempotent -- safe to re-run.
-./deploy-backbone.sh
+# Postgres + the four mock services. Idempotent -- safe to re-run.
+KCTX=my-cluster BASE_DOMAIN=example.com ./deploy-backbone.sh
 
 # Then make the compose names resolve in each workflow namespace:
 WORKFLOW_NS=argo ./alias-backbone.sh
 ```
 
-Knobs: `ORCH_NS` (default `orchestrators`), `STORAGE_CLASS` (`""` → `emptyDir`,
-for Fargate), `PG_STORAGE`, `IMAGE_PREFIX`, `SEED_NS`.
+Knobs live in `values-incluster.yaml` (`postgres.storageClass`,
+`postgres.storage`, `packaging`, the two resume secret names) plus `ORCH_NS`,
+`BASE_DOMAIN` and `SUBDOMAIN_PREFIX` in the environment. Anything else is
+`--set` passed straight through.
 
-**`deploy-backbone.sh` is registry-free by design.** The mock services are pure
-Python, so it runs them on the public `python:3.12-slim` with `app.py` mounted
-from a ConfigMap and dependencies installed by an init container into a shared
-`PYTHONPATH`. That buys three things worth having:
+**Why it was two things before, and what that cost.** The chart served the AWS
+path (prebuilt ECR images, Neon) and the script served this one, and they had
+drifted in *both* directions: the script had Postgres and no AWS resume
+credentials; the chart had the credentials and no Postgres. Neither gap
+announced itself — the missing `aws-resume-creds` Secret surfaced only as Step
+Functions DAG 2 reporting `FanOutError` and DAG 4 reporting *"Order rejected or
+approval timed out"*, a Kubernetes Secret problem presented as a business
+decision two systems away. The chart also rendered Services as bare `approval` /
+`callback-fetch` / `shipping`, which would have broken constraint 1 above the
+moment anyone used it here, while the AWS path kept working because Lambdas come
+in over the public ingress.
+
+**Three credential Secrets are per-cluster and NOT chart-managed** —
+`aws-resume-creds`, `google-resume-creds`, `fixture-s3-creds`, all from
+`terraform output`. `shared-services/deploy/README.md` has the table and what
+each failure looks like. The AWS one is the expensive one to forget.
+
+**Adopting a cluster that ran the old script** needs `--take-ownership`, which
+the wrapper passes. Three things bit doing exactly that on the arm64 cluster:
+probe handlers are mutually exclusive and a patch *merges* them (so the chart
+must match the live handler kind); **removals do not propagate on first adopt**,
+because Helm has no prior manifest to diff against, so a stale env var survives
+an upgrade that no longer renders it; and a PVC cannot shrink, so
+`postgres.storage`/`storageClass` must match what is live.
+
+**Source packaging is registry-free by design** (`packaging: source`, which
+`values-incluster.yaml` selects). The mock services are pure Python, so they run
+on the public `python:3.12-slim` with `app.py` mounted from a ConfigMap and
+dependencies installed by an init container into a shared `PYTHONPATH`. The
+chart's other mode (`packaging: image`, the default) uses prebuilt ECR images
+for the AWS path. That buys three things worth having:
 
 - **No image build and no cross-architecture step** — the same manifests work on
   amd64 and arm64, because the only images involved are upstream multi-arch ones.
@@ -1455,7 +1560,7 @@ output dataclass from task results.
 
 ### 9e. Backbone and DB config
 
-Flyte task pods run in per-project namespaces (`flytesnacks-development` etc.),
+Flyte task pods run in per-project namespaces (`bakeoff-development` etc.),
 not `flyte`. Either run §7c with `ORCH_NS` set to the project namespace you'll
 execute in, or deploy the backbone once elsewhere and pass an FQDN — Flyte makes
 this easy because the DB settings are a workflow **input**:
@@ -1469,22 +1574,73 @@ That is a genuine Flyte advantage worth noting in `comparison.md`: the same DAG
 retargets to a different DB without editing the workflow, whereas Argo's literal
 env values require editing the YAML.
 
+### 9f. Projects and namespaces
+
+A stock `flyte-core` install lands **ten** namespaces: `flyte` for the control
+plane, plus one per project × domain. Both factors are plain Helm values —
+`flyteadmin.initialProjects` defaults to `flytesnacks`/`flytetester`/
+`flyteexamples`, `configmap.domain.domains` to development/staging/production.
+`deploy-flyte.sh` seeds a single project (`FLYTE_PROJECT`, default `bakeoff`), so
+this cluster runs four namespaces, and `register.sh`/`run.sh` default
+`PROJECT=bakeoff` to match.
+
+**Trimming an install that already has the nine takes more than a Helm upgrade.**
+`seed-projects` only adds, and `kubectl delete ns` loses a race with the
+`syncresources` reconcile loop, which recreates the namespace within its 5m
+`refreshInterval`. Archive the project first — flyteadmin's clusterresource
+provider filters `state != ARCHIVED`, so archiving takes it out of the sync walk
+and the delete sticks. There is no delete-project API; archive is the route.
+Done on the arm64 cluster 2026-08-12; the commands are in `flyte/README.md`
+§"Why are there so many Flyte namespaces?".
+
+Two things that go with it: archiving hides the project (and its execution
+history, which is *not* deleted) from the console until you PUT the state back to
+`ACTIVE`; and the per-namespace prerequisites — the `ecr-bakeoff` pull secret and
+the `alias-backbone.sh` ExternalName Services — live in the old task namespace
+and must be recreated in the new one.
+
 ### Accessing the UI
 
 ```bash
-kubectl --context "$KCTX" port-forward -n flyte svc/flyteconsole 8083:80
-# http://localhost:8083   (8080 is Airflow's -- see the port map in §0)
+just flyte-ui                    # http://localhost:8085/console/  -- Ctrl-C stops it
 ```
 
-With `INGRESS_ENABLED=true` you can instead expose it through your ingress
-controller + cert-manager rather than port-forwarding.
+**Do not just port-forward `svc/flyteconsole`.** That was the instruction here
+until 2026-08-12 and it does not work: flyteconsole and flyteadmin are separate
+Services, and only one of them answers each half of what the UI needs.
+
+| path | flyteconsole | flyteadmin |
+|---|---|---|
+| `/console` | serves the SPA | 404 |
+| `/api/v1/*` | **returns SPA HTML, 200** | returns JSON |
+
+So the console loads, renders *"Select a project to get started"*, and lists
+nothing — its `GET /api/v1/projects` receives flyteconsole's own catch-all HTML
+with a 200 rather than JSON. Nothing reports an error. The natural readings are
+both wrong: it is not an empty install (flyteadmin had `flytesnacks`,
+`flyteexamples`, `flytetester` and 5+ executions the whole time) and it is not an
+auth prompt (`useAuth: false` in `flyte-admin-base-config`; the console renders
+its "Login" link unconditionally).
+
+What merges them in a normal deployment is an **ingress** — `INGRESS_ENABLED=true`
+in the flyte-core chart, routing `/console` to one backend and `/api` to the
+other. This cluster runs Traefik but has no Flyte ingress, so
+`scripts/flyte-console-proxy.py` stands in for one: it opens both port-forwards
+itself (on 18083/18088, above the band `check-ports.sh` audits) and serves the
+merged origin on **8085**. `--port`, `--namespace` and `--context` are all
+overridable; it honours `$KCTX` and falls back to the current context.
+
+`flytectl` against a flyteadmin port-forward remains the other option, and needs
+none of this.
 
 ### Notes
 
 - Estimated Fargate cost for the metadata Postgres pod on the amd64 Fargate cluster: ~$9/month.
 - Credentials are hardcoded throughout. Evaluation-grade only.
-- Flyte creates `<project>-<domain>` namespaces (`flytesnacks-development`, …) on
-  install. The amd64 cluster has nine of them, all empty.
+- Flyte creates `<project>-<domain>` namespaces on install — one per pair, and
+  the chart's three default projects × three domains is why a stock install lands
+  ten namespaces. `deploy-flyte.sh` seeds only `bakeoff`, so the arm64 cluster has
+  four: `flyte` + `bakeoff-{development,staging,production}`. See §9f.
 
 ---
 
@@ -1614,11 +1770,10 @@ kubectl --context "$KCTX" delete namespace argo
 # (deploy-flyte.sh creates them), so the namespace delete is what removes them.
 helm --kube-context "$KCTX" uninstall flyte -n flyte
 kubectl --context "$KCTX" delete namespace flyte     # takes flyte-pgdata + flyte-minio PVCs
-# Flyte's project namespaces are not chart-managed:
-kubectl --context "$KCTX" delete ns \
-  flytesnacks-{development,staging,production} \
-  flyteexamples-{development,staging,production} \
-  flytetester-{development,staging,production}
+# Flyte's project namespaces are not chart-managed. One set per seeded project
+# (§9f) -- this install seeds only `bakeoff`; a stock one leaves nine behind
+# under flytesnacks-/flyteexamples-/flytetester-.
+kubectl --context "$KCTX" delete ns bakeoff-{development,staging,production}
 
 # Backbone. deploy-backbone.sh creates plain resources (no Helm release), so
 # deleting the namespace takes everything -- including the PVC.

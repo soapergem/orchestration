@@ -5,6 +5,39 @@
 # Deploying with the placeholders left in place gives you ingress rules that
 # resolve nowhere and a cert-manager Order that retries forever.
 
+# ---------------------------------------------------------------- packaging
+# How the mock services are built and shipped.
+#
+#   image   -- one pre-built image per service, from ECR (terraform/aws builds
+#              and pushes them). The AWS path.
+#   source  -- a stock python image, deps pip-installed by an init container
+#              into an emptyDir, and app.py mounted from a <name>-src ConfigMap.
+#              Registry-free, which is what makes it viable on the arm64
+#              cluster: building arm64 images from x86 needs qemu binfmt, and
+#              rootless podman cannot register it (RUNNING.md 7b/9).
+#
+# Both modes live in one chart deliberately -- that is what lets this be the
+# single source of truth for every cluster, rather than having a second,
+# divergent imperative script for the in-cluster case.
+packaging: image
+
+sourcePackaging:
+  pythonImage: docker.io/library/python:3.12-slim
+  # Per-service `deps:` below override this. These lists are NOT interchangeable:
+  # every service imports pydantic_settings, and omitting it CrashLoops the pod
+  # with ModuleNotFoundError after the init container reports success -- the
+  # install step passes, the app fails.
+  defaultDeps: ["fastapi", "uvicorn", "pydantic-settings"]
+  # Rendered into <name>-src ConfigMaps by deploy.sh from each service's app.py;
+  # the chart references them but does not template their contents (app.py is
+  # too large and too churn-prone to live in values).
+
+# Suffix appended to each service's resource name. MUST stay `-service` for any
+# cluster that runs Argo or Flyte: their DAGs carry `approval-service:8091` and
+# friends as literal env values, matching the compose DNS names. See
+# templates/_helpers.tpl.
+nameSuffix: "-service"
+
 image:
   # Pre-existing docker-registry secret for pulling from private ECR. The K3s
   # cluster refreshes this out-of-band; the chart only references it. Set to ""
@@ -16,7 +49,39 @@ aws:
   # Pre-existing Secret holding creds for states:SendTaskSuccess. Used by
   # callback-fetch and approval to resume suspended Step Functions executions.
   # Keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+  #
+  # Set to "" on a cluster that never runs the Step Functions DAGs -- the env
+  # vars are then omitted rather than the pod failing on a missing Secret. NOT
+  # setting it when you DO run them is the failure that cost the most time in
+  # this repo: boto3 raises NoCredentialsError, the resume never fires, and the
+  # task token ages out -- surfacing as `FanOutError` (DAG 2) or
+  # "Order rejected or approval timed out" (DAG 4). See step-functions/README.md.
   resumeSecretName: aws-resume-creds
+
+# Google Workflows resume credentials. Same shape as aws above: optional, and
+# omitted entirely when unset rather than breaking the pod.
+gcp:
+  resumeSecretName: ""                 # e.g. google-resume-creds
+  credentialsPath: /var/secrets/google/key.json
+
+# In-cluster Postgres for the bake-off DAGs. OFF by default: the cloud runners
+# use Neon. Argo and Flyte need it, and need the Service named exactly
+# `postgres` (their DAGs hardcode PGHOST). See templates/postgres.yaml.
+postgres:
+  enabled: false
+  name: bakeoff-postgres
+  serviceName: postgres
+  image: docker.io/library/postgres:16
+  database: orchestration
+  user: orchestration
+  password: orchestration              # evaluation-grade; not a production pattern
+  pvcName: bakeoff-pgdata
+  storage: 5Gi
+  # null = use the cluster default class. "" = no dynamic provisioning (the
+  # Fargate cluster; STORAGE_CLASS="" in RUNNING.md 7).
+  storageClass: null
+  # ConfigMap holding init-db.sql, applied only on a FRESH volume.
+  initDbConfigMap: bakeoff-init-db
 
 # Per-service repositories come from `terraform output -json ecr_repository_urls`
 # (one repo per service). Fill in the full ECR repo URL for each.
@@ -27,7 +92,16 @@ callbackFetch:
   replicas: 1
   port: 8090
   domain: orch-callback-fetch.example.com
+  needsAwsResume: true                 # resumes Step Functions task tokens
+  needsGcpResume: true                 # and Google Workflows callbacks
+  deps: ["fastapi", "uvicorn", "httpx", "boto3", "pydantic-settings", "google-auth", "requests"]
   autoResume: "true"                   # resume the SFN task as soon as the fetch completes
+  autoResumeDelaySeconds: "0"
+  # DAG 2's async-fetch timing. The workflow's own wait is 60s, so a fetch delay
+  # above that is how you exercise the callback-never-arrives edge case.
+  fetchDelayMinSeconds: "2"
+  fetchDelayMaxSeconds: "10"
+  fetchTimeoutSeconds: "30"
 
 approval:
   name: approval
@@ -36,6 +110,9 @@ approval:
   replicas: 1
   port: 8091
   domain: orch-approval.example.com
+  needsAwsResume: true
+  needsGcpResume: true
+  deps: ["fastapi", "uvicorn", "httpx", "boto3", "pydantic-settings", "google-auth", "requests"]
   autoDecideDelaySeconds: "10"         # auto-decide + resume after a delay (hands-off DAG 4)
   autoDecideAction: approved
 
@@ -46,6 +123,15 @@ shipping:
   replicas: 1
   port: 8092
   domain: orch-shipping.example.com
+  needsAwsResume: false                # shipping never resumes anything
+  needsGcpResume: false
+  deps: ["fastapi", "uvicorn", "pydantic-settings"]
+  # DAG 4's flaky shipping API. These are the spec's rates -- changing them
+  # changes which branch DAG 4 exercises, so they belong in version control
+  # rather than in whatever the last imperative deploy happened to set.
+  successRate: "0.70"
+  timeoutRate: "0.15"
+  serverErrorRate: "0.10"
 
 # Read-only Books API for DAG 2 plus DAG 1's ZIP (RUNNING.md 0b). No DB, no AWS.
 # The Step Functions path needs it publicly reachable (Lambdas run outside the
@@ -57,6 +143,13 @@ fixture:
   replicas: 1
   port: 8099
   domain: orch-fixture.example.com
+  needsAwsResume: false                # its S3 creds are fixture.s3SecretName
+  needsGcpResume: false
+  # The only service with a real health endpoint -- it reports 503 until the S3
+  # corpus has loaded, which is worth surfacing as unready rather than serving
+  # empty results. The others get a TCP probe.
+  healthPath: /health
+  deps: ["fastapi", "uvicorn", "pydantic-settings", "boto3"]
   defaultPerPage: "5"                  # raise past 20 to exercise DAG 2's concurrency cap
   baseUrl: ""                          # leave empty: detail URLs are derived per request
   # Neither data file is committed or baked into the image; the pod fetches both

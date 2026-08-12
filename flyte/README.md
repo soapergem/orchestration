@@ -25,6 +25,13 @@ setup, §9 the Flyte install).
 | 3 | `a8fh56gj5zfpddbnw95v` | ACC-001 5000 → 4900, ACC-003 0 → 100, transaction `completed` with a gateway id, in `flyte_dag3` |
 | 4 | `a4s9gcxrq95pdvdt2vr5` | full approval path: reserved → `pending_approval` → `APR-89633B9CD309` approved by `auto-decider` → `shipped` with tracking, total 559.97, both reservation rows present |
 
+Those four ran under `flytesnacks:development`, the chart's default project. The
+install was retrenched onto a single `bakeoff` project on 2026-08-12 (see
+"Why are there so many Flyte namespaces?"), so **the DAGs need re-registering
+under `bakeoff` before the next run**, and the executions above are only visible
+in the console if `flytesnacks` is un-archived. Their evidence stands — nothing
+about the DAG code changed.
+
 **Seven distinct defect classes across ~25 sites** were fixed getting here — the
 implementation had never been executed. (Counted by class because the same
 mistakes recurred: 5 promise-output constructions, 4 conditional predicates, 5
@@ -59,7 +66,7 @@ Prerequisites beyond the install:
    (`aws ecr get-login-password`, 12h validity — re-mint when pulls start failing).
 3. **The backbone aliased into the task namespace** —
    `shared-services/deploy/alias-backbone.sh` with
-   `WORKFLOW_NS=flytesnacks-development`, because task pods run there, not in
+   `WORKFLOW_NS=bakeoff-development`, because task pods run there, not in
    `flyte`.
 
 ```bash
@@ -70,7 +77,7 @@ kubectl --context "$KCTX" -n flyte port-forward svc/flyteconsole 8083:80   # UI
 
 ## Why are there so many Flyte namespaces?
 
-Installing Flyte creates **ten** namespaces, and it is not leftovers or a broken
+A stock install creates **ten** namespaces, and it is not leftovers or a broken
 install. Nine of them are Flyte's tenancy model expressed as Kubernetes
 namespaces:
 
@@ -87,6 +94,13 @@ flytetester-staging
 flytetester-production
 ```
 
+**This repo no longer runs the stock set** (changed 2026-08-12):
+`deploy-flyte.sh` seeds a single `bakeoff` project, so the arm64 cluster has
+`flyte` + `bakeoff-{development,staging,production}` — four namespaces, and the
+nine above were archived and deleted. The rest of this section explains where
+they came from and how the trim was done, because neither is obvious and the
+teardown is not what you would guess.
+
 ### Where they come from
 
 Two chart defaults multiply together:
@@ -94,9 +108,15 @@ Two chart defaults multiply together:
 | Setting | Default | Where |
 |---|---|---|
 | `flyteadmin.initialProjects` | `flytesnacks`, `flytetester`, `flyteexamples` | chart values |
-| `domains` | `development`, `staging`, `production` | `flyte-admin-base-config` → `domain.yaml` |
+| `configmap.domain.domains` | `development`, `staging`, `production` | chart values → `flyte-admin-base-config`/`domain.yaml` |
 
 3 projects × 3 domains = 9 namespaces, each named `<project>-<domain>`.
+
+`initialProjects` renders a `seed-projects` **init container** on the flyteadmin
+Deployment (`templates/admin/deployment.yaml`) running
+`flyteadmin migrate seed-projects <project>...`. Both settings are ordinary Helm
+values — nothing about the nine is required, and only `flyte` itself is, since it
+holds the control plane.
 
 The `syncresources` Deployment creates them. It runs
 `flyteadmin clusterresource run`, a reconcile loop that walks every
@@ -113,16 +133,70 @@ quota that targets it.
 
 **Project + domain is Flyte's isolation unit**, and it maps onto a Kubernetes
 namespace so each pairing gets its own resource quota, service account, and RBAC
-boundary. A workflow registered to `flytesnacks:development` runs its task pods
-in the `flytesnacks-development` namespace — *not* in `flyte`, which holds only
+boundary. A workflow registered to `bakeoff:development` runs its task pods
+in the `bakeoff-development` namespace — *not* in `flyte`, which holds only
 the control plane. "Project" is roughly a team or application; "domain" is the
-promotion stage, and it is fixed at three by the platform rather than
-user-defined.
+promotion stage. Domains are *global* — every project gets all of them, so the
+count is strictly multiplicative.
+
+### Trimming them
+
+Set the two values. Either alone helps; both give the minimum of one namespace:
+
+```bash
+--set-json 'flyteadmin.initialProjects=["bakeoff"]' \
+--set-json 'configmap.domain.domains=[{"id":"development","name":"development"}]'
+```
+
+`deploy-flyte.sh` now passes the first (`FLYTE_PROJECT`, default `bakeoff`) and
+leaves the three domains alone — they cost nothing and staging/production are the
+one part of Flyte's tenancy model worth having on display in a comparison deck.
+
+`initialProjects: []` is legal — the init container is dropped entirely — but
+then no project exists to register against, and you must
+`flytectl create project` and wait out a sync interval before anything works.
+
+**Trimming does not clean up an existing install**, and this is the part that
+surprises:
+
+- `seed-projects` only *adds*. Re-running Helm with a shorter list leaves the old
+  projects in the metadata DB.
+- `kubectl delete ns` alone **loses** — `syncresources` recreates the namespace
+  within its 5m `refreshInterval`.
+- What actually works is **archiving the project first**. flyteadmin's
+  clusterresource data provider lists projects with a
+  `state NotEqual ARCHIVED` filter, so an archived project drops out of the sync
+  walk and the namespace delete sticks. flyteadmin has no *delete*-project API;
+  archive is the supported route. The filter is visible in the `syncresources`
+  pod's own log — it issues
+  `SELECT * FROM "projects" WHERE state <> 1 ORDER BY created_at desc`, and
+  `1` is `Project_ARCHIVED`.
+
+Done here (2026-08-12) with the flyteadmin HTTP gateway, since `flytectl` was not
+installed — `flytectl update project --project X --archive` is equivalent:
+
+```bash
+kubectl --context "$KCTX" -n flyte port-forward svc/flyteadmin 18088:80 &
+for p in flytesnacks flytetester flyteexamples; do
+  curl -s -X PUT "http://localhost:18088/api/v1/projects/$p" \
+    -H 'Content-Type: application/json' \
+    -d "{\"id\":\"$p\",\"name\":\"$p\",\"state\":\"ARCHIVED\"}"
+done
+kubectl --context "$KCTX" delete ns \
+  flytesnacks-{development,staging,production} \
+  flyteexamples-{development,staging,production} \
+  flytetester-{development,staging,production}
+```
+
+Archiving also removes the project from `GET /api/v1/projects` and therefore from
+the console's project picker. The executions underneath are **not** deleted —
+they stay in the metadata Postgres — but they become unreachable in the UI until
+you PUT the state back to `ACTIVE`. Nothing warns you about this.
 
 ### What it means for this bake-off
 
 - **Task pods do not run in the `flyte` namespace.** When the bake-off DAGs are
-  registered, their pods land in a project-domain namespace, so the backbone's
+  registered, their pods land in `bakeoff-development`, so the backbone's
   compose DNS names (`postgres`, `shipping-service`, …) have to resolve *there* —
   see `../RUNNING.md` §7c on aliasing the backbone.
 - **Flyte handles this better than Argo does.** Its DB settings are a typed
@@ -130,14 +204,19 @@ user-defined.
   `postgres.orchestrators.svc.cluster.local` without touching workflow code.
   Argo's DAG YAML hard-codes `PGHOST` as a literal env value, so it needs the
   namespace aliases. That difference is worth a line in `../comparison.md`.
-- **They are empty and free.** Each contains only a ResourceQuota — no pods, no
-  cost. The amd64 cluster has the same nine, unused for 46 days.
-- **They are not chart-managed.** `helm uninstall flyte` leaves all nine behind,
-  which is why `../RUNNING.md`'s teardown deletes them explicitly.
-- **You can trim them** by setting `flyteadmin.initialProjects` to a single
-  project (3 namespaces instead of 9). Not recommended here: the defaults match
-  the amd64 cluster, which keeps the two comparable. Revisit if the DAGs get
-  registered under a dedicated project.
+- **The nine were empty and free.** Each held only a ResourceQuota — no pods, no
+  cost. They were noise, not overhead; the amd64 cluster carried the same nine
+  unused for 46 days.
+- **They are not chart-managed.** `helm uninstall flyte` leaves project
+  namespaces behind, which is why `../RUNNING.md`'s teardown deletes them
+  explicitly. That list is now the three `bakeoff-*`.
+- **Renaming the project is not free.** Registrations are per project/domain, so
+  the four DAGs must be re-registered under `bakeoff`, and the two per-namespace
+  prerequisites from Launch above lived in `flytesnacks-development` and went
+  with it. Current state: the backbone aliases **have** been recreated in
+  `bakeoff-development`; the `ecr-bakeoff` pull secret has **not** — it was long
+  past its 12h validity anyway, so re-mint it (and re-patch the `default`
+  ServiceAccount's `imagePullSecrets`) before the first `register.sh`.
 
 ---
 
@@ -444,7 +523,7 @@ Still true regardless of execution:
 
 - **The ECR token expires after 12 hours** and task pods then fail to pull.
   Re-mint into the `ecr-bakeoff` secret in both `flyte` and
-  `flytesnacks-development`. Better fix: extend the cluster's
+  `bakeoff-development`. Better fix: extend the cluster's
   `k8s-ecr-login-renew` cronjob to cover the task namespace.
 - **Rebuild the task image after adding a dependency** — it is baked in, not
   resolved by `ImageSpec` at registration.

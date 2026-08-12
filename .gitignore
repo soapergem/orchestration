@@ -23,6 +23,8 @@ dagster_bakeoff/.dagster_home/
 .local-data/
 # mkslides build output.
 presentation/site/
+# Logs and pidfiles for the host-run orchestrator UIs (`just py-up`).
+.hostlogs/
 
 # Hatchet client token minted at runtime (RUNNING.md §5)
 shared-services/hatchet.token

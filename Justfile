@@ -104,17 +104,54 @@ rebuild:
 logs:
     {{ compose }} logs -f
 
-# init-db.sql only runs on a FRESH pgdata volume, so this (re)loads it from the
-# path it's mounted at before onboarding the runner. Idempotent.
+# The 12 runners span THREE databases -- local pod, in-cluster postgres, Neon --
+# so these route by runner name. Naming a runner that lives elsewhere used to
+# operate on the local pod regardless and report success; unknown names used to
+# create schemas for the typo. Both are now hard failures. See the script header.
 
 # Create a runner's per-DAG schemas + seed fixtures, e.g. `just seed prefect`.
 seed runner:
-    {{ compose }} exec -T postgres \
-      psql -q -U orchestration -d orchestration \
-      -f /docker-entrypoint-initdb.d/00-init-db.sql
-    {{ compose }} exec -T postgres \
-      psql -U orchestration -d orchestration \
-      -c "SELECT bootstrap_bakeoff('{{ runner }}');"
+    CONTAINER_RUNNER="{{ container_runner }}" ./scripts/bakeoff-db.sh seed {{ runner }}
+
+# Drop a runner's per-DAG schemas and re-seed fixtures, e.g. `just reset temporal`.
+reset runner *args:
+    CONTAINER_RUNNER="{{ container_runner }}" ./scripts/bakeoff-db.sh reset {{ runner }} {{ args }}
+
+# Show which database a runner uses, and which of its schemas exist there.
+db-status runner:
+    CONTAINER_RUNNER="{{ container_runner }}" ./scripts/bakeoff-db.sh status {{ runner }}
+
+# Airflow, Dagster, Prefect and Luigi have **no engine container** -- they are
+# libraries executed in your own venv, so `just up-all` cannot start them and
+# RUNNING.md §0's port table shows 3000/4200/8080/8082 unowned until you do.
+# The why, the 0.0.0.0 binding and the process-group teardown all live in the
+# script's header.
+
+# Start the host-run orchestrator UIs -- Dagster :3000, Prefect :4200, Airflow :8080, luigid :8082.
+py-up *targets:
+    ./scripts/py-procs.sh up {{ targets }}
+
+# Stop the host-run orchestrator UIs started by `py-up`.
+py-down *targets:
+    ./scripts/py-procs.sh down {{ targets }}
+
+# Show which host-run orchestrator UIs are up, and on which port.
+py-status:
+    ./scripts/py-procs.sh status
+
+# Show the login for every service that has one, and name the ones that don't.
+creds:
+    ./scripts/creds.sh
+
+# flyteconsole and flyteadmin are separate Services; port-forwarding the console
+# alone gives you a UI whose API calls land on its own HTML catch-all, so it
+# lists no projects and looks unauthenticated. An ingress normally merges them
+# and this cluster has none for Flyte -- the script stands in for one. Runs in
+# the foreground and manages both port-forwards; Ctrl-C stops everything.
+
+# Serve a working Flyte console (console + admin merged) on :8085.
+flyte-ui *args:
+    ./scripts/flyte-console-proxy.py {{ args }}
 
 # Open a psql shell against the bake-off database.
 psql:

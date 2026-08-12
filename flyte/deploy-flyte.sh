@@ -26,6 +26,7 @@
 #   IMAGE_PREFIX    registry prefix for docker.io images -- cri-o rejects short
 #                   names, see RUNNING.md 7c        (default: docker.io/library)
 #   CHART_VERSION   pin the chart, e.g. v1.16.8     (default: latest)
+#   FLYTE_PROJECT   the one seeded project           (default: bakeoff)
 
 set -euo pipefail
 
@@ -34,6 +35,7 @@ FLYTE_NS="${FLYTE_NS:-flyte}"
 STORAGE_CLASS="${STORAGE_CLASS-oci-bv}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-docker.io/library}"
 CHART_VERSION="${CHART_VERSION:-}"
+FLYTE_PROJECT="${FLYTE_PROJECT:-bakeoff}"
 # Prebuilt task image; must match what register.sh/run.sh use.
 : "${ECR:?set ECR to your registry, e.g. <account-id>.dkr.ecr.<region>.amazonaws.com (see .envrc.example)}"
 TASK_IMAGE="${TASK_IMAGE:-$ECR/orch-bakeoff-flyte:latest}"
@@ -249,9 +251,20 @@ ENV_JSON='configmap.k8s.plugins.k8s.default-env-vars=[
   {"FLYTE_TASK_IMAGE":"'"$TASK_IMAGE"'"}
 ]'
 
+# The chart seeds three projects (flytesnacks, flytetester, flyteexamples) via a
+# `flyteadmin migrate seed-projects` init container, and `configmap.domain.domains`
+# defaults to development/staging/production. The syncresources loop then walks
+# every pair and creates a `<project>-<domain>` Namespace + ResourceQuota, so the
+# stock install lands TEN namespaces for a bake-off that uses one. Seed only ours.
+#
+# Note this only ADDS on upgrade -- seed-projects never removes. Dropping a
+# project from an existing install means archiving it (flyteadmin's clusterresource
+# provider filters `state != ARCHIVED`, so the sync loop stops recreating its
+# namespaces) and then deleting the namespaces by hand. See RUNNING.md 9f.
 helm --kube-context "$KCTX" upgrade --install flyte flyteorg/flyte-core -n "$FLYTE_NS" \
   "${VERSION_ARG[@]}" \
   --set-json "$ENV_JSON" \
+  --set-json 'flyteadmin.initialProjects=["'"$FLYTE_PROJECT"'"]' \
   --set postgres.enabled=false \
   --set common.ingress.enabled=false \
   --set db.admin.database.host=postgres \

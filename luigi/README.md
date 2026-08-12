@@ -234,9 +234,58 @@ Verified: after a DAG 3 run, `luigi_dag3.accounts` shows ACC-001 at 4900.00 whil
 - **Approval timeout → compensation.** `poll_timeout` is a parameter, so setting
   it below the service's 10s auto-decide delay should reach it.
 - Duplicate decision, and concurrent contention for `RARE-D`'s last 2 units.
-- **`luigid` central scheduler.** Everything was run with `--local-scheduler`.
-  The web UI at :8082 and its 24-hour default retention are unverified, which is
-  the basis of the 1/10 audit-trail score.
+
+---
+
+## `luigid` and the audit-trail score (settled 2026-08-12)
+
+This was the last open item behind the **1/10 audit trail**, and the score is
+now evidence-backed rather than assumed. DAG 1 was run through the central
+scheduler — `--scheduler-host localhost --scheduler-port 8082` in place of
+`--local-scheduler` — and completed **7/7 tasks**, so the daemon works.
+
+What `/api/task_list` retains per task: `name`, `params`, `status`,
+`start_time`, `time_running`, `last_updated`, `worker_running`, `priority`,
+`resources`. What it does **not** retain is the whole basis of the score:
+
+- **No per-step I/O.** No inputs, no return values, no stdout/stderr, no logs.
+  Luigi's unit of state is a *Target* — the scheduler knows a task is `DONE`, not
+  what it produced. `status_message`, `tracking_url` and `progress_percentage`
+  come back `null` unless a task opts in via `set_status_message()`.
+- **Retention is 10 minutes, not 24 hours.** `scheduler.remove_delay` defaults to
+  **600.0** seconds, after which a no-longer-referenced task is dropped from
+  state. The 24-hour figure previously recorded here was a misreading of
+  `disable_persist=86400`, which is how long a repeatedly-failing task stays
+  *auto-disabled* — unrelated to retention.
+- **No history at all by default.** `scheduler.record_task_history` defaults to
+  **False**; persistent history needs `[task_history] db_connection` and a
+  separate database you supply. Even enabled, it records state transitions, not
+  I/O.
+
+Both halves of the rubric's 0-point column — "<24h retention, no I/O inspection"
+— are therefore met exactly, so **1/10 stands**. Every other tool's audit story
+should be read against this floor.
+
+One thing that *does* work, once fixed: state survives a restart.
+`just py-down luigi && just py-up luigi` recovered all 7 tasks from a 5,346-byte
+pickle. That only holds because the recipe pins `--state-path`; see below.
+
+  Getting `luigid` to start took a fix worth recording, because it *is* the maintenance-mode
+  finding in concrete form: **`luigid` cannot run on a current toolchain.**
+  `luigi/server.py` (3.7.1) still does `import pkg_resources`, which setuptools
+  **removed in 82.0.1**; the daemon dies on import with `ModuleNotFoundError`
+  before it logs anything. `just py-up luigi` scopes a `setuptools<81` pin to
+  that one command rather than holding the whole project back — and note the
+  pinned version itself warns that `pkg_resources` was "slated for removal as
+  early as 2025-11-30", i.e. the workaround has an expiry date. Nothing in the
+  task-running path is affected; `--local-scheduler` never imports the server.
+
+  Second trap, silent rather than loud: `luigid` defaults `--state-path` to
+  `/var/lib/luigi-server/state.pickle`, a directory that does not exist and that
+  a non-root user cannot create. The scheduler starts anyway, logs `No prior
+  state file exists`, serves normally, and then fails to persist on shutdown —
+  so every restart looks like a fresh install. The recipe pins `--state-path`
+  into `.hostlogs/`.
 
 ---
 

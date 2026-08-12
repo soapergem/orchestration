@@ -84,7 +84,17 @@ just                          # list recipes
 just up                       # postgres + 4 mock services (always do this first)
 just up temporal              # backbone + one engine profile (temporal|hatchet|kestra|conductor)
 just up-all                   # backbone + ALL engines (no worker sidecars); heavier
+just py-up [tools]            # start the host-run UIs: Dagster :3000, Prefect :4200,
+                              # Airflow :8080 (they have NO engine container, so
+                              # `up-all` cannot start them). py-down / py-status too.
+just creds                    # logins for Airflow/Hatchet/Kestra/Postgres, and which
+                              # services have no auth at all
 just seed <runner>            # create that runner's schemas + seed fixtures
+just reset <runner>           # drop those schemas and re-seed -- `seed` alone does NOT
+                              # undo fixture drift (see Watch out)
+just db-status <runner>       # which of the 3 databases that runner uses, + its schemas
+                              # seed/reset/db-status route by runner name across local pod,
+                              # in-cluster postgres and Neon; unknown names hard-fail
 just rebuild                  # rebuild mock-service images (up does NOT rebuild)
 just psql                     # psql shell against the bake-off DB
 just down temporal            # stop that profile -- bare `just down` does NOT stop engines
@@ -185,6 +195,36 @@ unique.
   if the schema is missing, because they need seeded fixtures.
   `init-db.sql`/`init-engines.sql` only run on a **fresh** `pgdata` volume — on
   an existing one use `just seed <runner>`, which reloads the function first.
+- **Re-running a DAG is not the same as resetting it.** DAG 1 and DAG 2 are
+  genuinely idempotent (DAG 1 drops and rebuilds its tables and overwrites a
+  fixed `{table}.parquet`; DAG 2 touches no database). **DAG 3 and DAG 4 are
+  idempotent by *refusal*** — `validate_payment` rejects a known
+  `idempotency_key` as a duplicate and `reserve_inventory` returns
+  `idempotent=True` for a known `order_id`, so re-running with the id you used
+  last time reports success while doing nothing, and tests the duplicate path
+  rather than the happy path. A real re-test needs a fresh id, which spends
+  fixtures permanently: only saga compensation on a *failed* run returns stock.
+  Drift accumulates (measured 2026-08-12: `temporal_dag4` WIDGET-A at 56/100,
+  `temporal_dag3` ACC-001 at 4572.00/5000.00), and RARE-D seeds **2** units, so
+  the concurrent last-unit race is one-shot per seed. `just seed` will **not**
+  fix this — it is `CREATE TABLE IF NOT EXISTS` + `ON CONFLICT DO NOTHING`, so it
+  restores structure and ignores values. Use **`just reset <runner>`**, which
+  drops the three schemas and re-seeds; the engines' own metadata is untouched,
+  so workflow history survives.
+- **`seed` / `reset` / `db-status` route by runner across all three databases**
+  (`scripts/bakeoff-db.sh`, 2026-08-12). They used to hardcode
+  `compose exec postgres`, so naming a non-local runner operated on the local pod
+  and *reported success* — `reset argo` re-created stray `argo_dag*` schemas
+  there via `CREATE SCHEMA IF NOT EXISTS` while Argo's real data sat untouched in
+  the cluster. That is where the local database's phantom argo/flyte/
+  google_workflows namespaces came from. Routing now: local pod for the eight
+  host-run tools, `deploy/bakeoff-postgres` in ns `orchestrators` for **argo** and
+  **flyte**, `$NEON_DATABASE_URL` for **stepfunctions** and **google_workflows**.
+  Unknown names are a **hard error** (they used to bootstrap schemas for the
+  typo). A Neon reset prompts for the runner name unless given `--yes`, since it
+  is a real cloud database — namespace isolation makes it safe between the two
+  cloud runners, verified: resetting `stepfunctions` left `google_workflows_dag4`
+  at 3 orders.
 - **Python:** `requires-python >=3.14` at the root; some SDKs may lack 3.14
   wheels, so a throwaway 3.12 venv for workers is the documented workaround.
   `uv` for everything. Ruff config is global (`~/.config/ruff/ruff.toml`:
@@ -384,11 +424,65 @@ any task runs, and only the *root* task's parameters are bare flags
 `--ProcessPayment-max-retries`). The retry loop is **silent** — nothing external
 reveals whether a task retried once or five times. See `luigi/README.md`.
 
-**Still untested: Step Functions.** Step Functions' code now follows
-`BAKEOFF_NS` (2026-08-06) but that change has **not been applied to AWS** —
-`terraform -chdir=terraform/aws apply` is pending, and its DAG 3/4 will then read
-the freshly seeded `stepfunctions_dag{3,4}` fixtures instead of the drifted
-`public.*` tables it had been using. Expect the same class of breakage found in
+**Step Functions — all four DAGs verified on real AWS** (2026-08-12,
+`us-east-1`): DAG 1 loading 3 CSVs to `dag1_etl` plus Parquet to S3, DAG 2
+suspending on a task token and resuming to a 5/5 fan-out, DAG 3 moving $100, and
+DAG 4 through the approval path to `shipped` with tracking — *plus* an accidental
+but real saga compensation (order `cancelled`, reservation `released`, inventory
+restored). This corrects a "still untested" claim that stood here until
+2026-08-12; an earlier campaign on 2026-07-14 had also run all four. See
+`step-functions/README.md`, which did not exist before — Step Functions was the
+only orchestrator with no lab notebook, which is exactly why the stale claim
+survived unchallenged.
+
+Three findings, each of which cost real time:
+**(1) The resume credentials are a separate, silent deployment step.** Terraform
+creates IAM user `orch-bakeoff-callback-resume` and an access key scoped to
+`states:SendTaskSuccess`, but *nothing enforces* putting them in the K8s
+`aws-resume-creds` Secret. At the time the Helm chart wired it and
+`deploy-backbone.sh` (the §7c in-cluster path, written for Argo/Flyte) did not —
+so the arm64 cluster's mocks had `google-resume-creds` and no AWS credentials.
+**Both paths are now one chart** (2026-08-12); the Secret is still per-cluster
+and not chart-managed, so the trap survives — it is just no longer
+path-dependent. `boto3` then raised
+`NoCredentialsError`, the resume never fired, and the token aged out. **Both
+failure messages lie**: DAG 2 reports `FanOutError`, and DAG 4 reports
+"Order rejected or approval timed out" — a credentials problem in another system
+presented as a business decision. `helm list -n orchestrators` returning nothing
+is the fastest way to spot the wrong deployment path.
+**(2) DAG 2 needs `base=`, and Step Functions is a *third* case** beyond the
+host-run/in-cluster split documented under "Watch out": the collection is fetched
+in-cluster but the detail URLs are fetched by a **Lambda in AWS**, so
+fixture-service handed back `http://fixture-service:8099/...` and every map
+iteration died on `NameResolutionError`. It needs the *public* base
+(`&base=https://orch-fixture...`). The rule is "whatever can reach the detail
+URLs", not "wherever the collection was fetched".
+**(3) `terraform/aws` had no state file and no backend** — the root cause of (1),
+since `deploy.sh` reads the credentials from `terraform output`. A missing state
+file presented as a business-logic failure two systems away.
+
+**Terraform state is now remote for both clouds** (2026-08-12): a partial
+`backend "s3" {}` in each of `terraform/aws` and `terraform/gcp`, configured at
+init from a **gitignored `backend.hcl`** (template `backend.hcl.example`) so no
+bucket name is committed. GCP's local state was migrated; AWS had none, so the
+live deployment was adopted with **67 declarative `import` blocks** and now
+reports *"No changes"* across 87 resources. Four gotchas worth knowing, all in
+`step-functions/README.md`: an access key's **secret cannot be re-read**, so
+importing one yields an empty output that `deploy.sh` would write into the K8s
+Secret as an empty string (mint a fresh key instead); not everything in the
+config existed in AWS (`fixture_reader`, `books_corpus` had to be created); the
+Lambda layer scripts hardcoded `pip3` and now fall back to `uv`, whose rebuild
+forces 2 immutable layer replacements on a first apply from any new machine; and
+an interrupted apply leaves a lock needing `terraform force-unlock`.
+
+**`BAKEOFF_NS` is now applied to AWS** (2026-08-12), so DAG 3/4 write
+`stepfunctions_dag{3,4}` — verified: `PAY-NS-144256` and `ORD-NS-144256` landed
+in the namespaced schemas with **zero** rows leaking to `public.*`. Note the
+six-day gap where deployed code wrote `public.*` while the namespaced schemas sat
+empty: **auditing `stepfunctions_dag*` during that window showed zeros and read
+as "never run"** — always confirm which schema a tool's *deployed* code targets
+before drawing conclusions from row counts. `public.*` and `dag1_etl` are now
+historical and droppable. Expect the same class of breakage found in
 Prefect, Airflow, Dagster, Argo, Kestra, Hatchet, Flyte, Conductor, and Google
 Workflows (see their READMEs) — though Temporal shows it isn't inevitable. Two
 cautionary cases worth carrying into those two: Kestra is the

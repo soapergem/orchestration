@@ -27,6 +27,14 @@ export SHIPPING_SERVICE_URL=http://localhost:8092
 # pass `-p $DAGSTER_PORT` if you ever need to move it.
 export DAGSTER_PORT=3000
 
+# `dagster dev` binds 127.0.0.1 by default, which is unreachable from outside
+# the VM this runs in (WSL2 host browser, another machine on the LAN). Airflow
+# already defaults to 0.0.0.0 and Prefect takes PREFECT_SERVER_API_HOST; Dagster
+# has no env var for it, so this is passed through as `-h $DAGSTER_HOST`.
+# Neither this nor DAGSTER_PORT is read by `dagster dev` on its own -- you must
+# pass both flags, which is what `just py-up dagster` does.
+export DAGSTER_HOST=0.0.0.0
+
 # Shared with the sensors, which read these paths to bridge runs.
 export DAG2_CORRELATION_DIR=/tmp/dagster_dag2_correlations
 export DAG4_APPROVAL_DIR=/tmp/dagster_dag4_approvals

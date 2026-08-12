@@ -17,7 +17,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: {{ .Values.callbackFetch.name }}
+            name: {{ include "bakeoff.name" (dict "svc" .Values.callbackFetch "root" $) }}
             port:
               number: {{ .Values.callbackFetch.port }}
   - host: {{ .Values.approval.domain }}
@@ -27,7 +27,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: {{ .Values.approval.name }}
+            name: {{ include "bakeoff.name" (dict "svc" .Values.approval "root" $) }}
             port:
               number: {{ .Values.approval.port }}
   - host: {{ .Values.shipping.domain }}
@@ -37,7 +37,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: {{ .Values.shipping.name }}
+            name: {{ include "bakeoff.name" (dict "svc" .Values.shipping "root" $) }}
             port:
               number: {{ .Values.shipping.port }}
   - host: {{ .Values.fixture.domain }}
@@ -47,7 +47,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: {{ .Values.fixture.name }}
+            name: {{ include "bakeoff.name" (dict "svc" .Values.fixture "root" $) }}
             port:
               number: {{ .Values.fixture.port }}
   tls:

@@ -19,7 +19,7 @@ set -euo pipefail
 FLYTE_NS="${FLYTE_NS:-flyte}"
 : "${ECR:?set ECR to your registry, e.g. <account-id>.dkr.ecr.<region>.amazonaws.com (see .envrc.example)}"
 TASK_IMAGE="${TASK_IMAGE:-$ECR/orch-bakeoff-flyte:latest}"
-PROJECT="${PROJECT:-flytesnacks}"
+PROJECT="${PROJECT:-bakeoff}"
 DOMAIN="${DOMAIN:-development}"
 BAKEOFF_NS="${BAKEOFF_NS:-flyte}"
 DAG="${1:?usage: run.sh dag3 [id]}"
