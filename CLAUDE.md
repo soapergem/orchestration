@@ -22,7 +22,7 @@ point, since the code is evidence about the tool.
 |---|---|
 | `README.md` | The spec: evaluation criteria, the four DAG designs, shared-service API contracts. The source of truth for *what* each DAG must do. |
 | `comparison.md` | The comparison matrix, the 100-point scoring rubric, score breakdown, per-tool differentiators. Currently: Temporal 88, Argo 74, Flyte/Hatchet 70, Luigi 38. |
-| `RUNNING.md` | How to actually stand each orchestrator up locally (and Argo/Flyte on EKS). Container-networking rules, per-tool env vars, teardown. |
+| `RUNNING.md` | How to actually stand each orchestrator up locally (and Argo/Flyte on Kubernetes). Container-networking rules, per-tool env vars, teardown. |
 | `observability.md` | Deeper dive on audit trail / alerting / metrics / tracing for Temporal, Hatchet, Argo, Step Functions. |
 | `deployment.md` | How workflow code gets *installed* in each of the 12 — the four packaging models (folder scan / worker-registers / control-plane push / none), and what adding a workflow vs. adding a dependency costs. |
 | `terraform/aws/README.md` | Step Functions on real AWS (Lambdas + Neon Postgres + S3). |
@@ -70,8 +70,10 @@ test-data/                                    generators only; *.zip and books.j
   make-sample-data.py                         gitignored build artefacts, uploaded to S3 by terraform
 ```
 
-`presentation/` is currently **untracked** in git. `presentation/site/` is
-mkslides build output.
+`presentation/` **is** tracked in git; `presentation/site/` is mkslides build output.
+The deck is `presentation/slides/slides.md` (mkslides → reveal.js) and the spoken
+script is `SCRIPT.md` at the repo root. `OrchestRated.pptx` was a brief detour into
+PowerPoint and is superseded — its content is merged into `slides.md`.
 
 ## Commands
 
@@ -183,18 +185,35 @@ unique.
   database** — both need a publicly reachable Postgres, so the namespace is the
   only thing keeping `stepfunctions_dag3` and `google_workflows_dag3` apart.
   DAG 1 previously pinned a hardcoded `dag1_etl` schema, now
-  `stepfunctions_dag1`; the old schema is orphaned but harmless. DAG 3/4
-  previously wrote flat `public.*` tables in Neon.
+  `stepfunctions_dag1`. DAG 3/4 previously wrote flat `public.*` tables in Neon.
   **every implementation now does** — Luigi was the last holdout in code and
-  gained it 2026-08-06. The leftover `public.*` tables are **not dead yet**: the
-  *deployed* Step Functions state machines still read them until
-  `terraform -chdir=terraform/aws apply` lands its `BAKEOFF_NS` change. Once that
-  applies, nothing reads `public.*` and it can be dropped. Note `init-db.sql`
-  creates nothing there, so a fresh volume never had them. Pattern to
+  gained it 2026-08-06. **The pending `terraform apply` has landed** (verified
+  2026-08-13: every DB-touching `orch-bakeoff-*` Lambda reports
+  `BAKEOFF_NS=stepfunctions`; the ones without it are DAG 2, which uses no
+  database, and the two DAG 4 Lambdas that only call services). So nothing reads
+  `public.*` or `dag1_etl` any more. Both are gone as of 2026-08-13: the
+  `dag1_etl` schema was dropped, and the flat `public.*` tables were cleared.
+  **Do not drop the `public` schema itself** — `bootstrap_bakeoff()` lives there,
+  and every `seed`/`reset` calls it. Neon is now exactly
+  `stepfunctions_dag{1,3,4}`, `google_workflows_dag{1,3,4}` and an empty
+  `public`. Note `init-db.sql` creates no tables there, so a fresh volume never
+  had them.
+  Check the deployed Lambda env rather than this file before trusting either
+  claim again — it was stale for a day. Pattern to
   copy: DAG 1 self-creates its schema (tables come from CSVs); DAG 3/4 fail fast
   if the schema is missing, because they need seeded fixtures.
-  `init-db.sql`/`init-engines.sql` only run on a **fresh** `pgdata` volume — on
-  an existing one use `just seed <runner>`, which reloads the function first.
+  `init-db.sql`/`init-engines.sql`/`init-runners.sh` only run on a **fresh**
+  `pgdata` volume — on an existing one use `just seed <runner>`, which reloads
+  the function first.
+- **`init-db.sql` is deliberately side-effect-free** (since 2026-08-12) — it
+  defines `bootstrap_bakeoff(ns)` and onboards nobody. *Which* runners a database
+  hosts is an instance property, so it lives in `init-runners.sh` driven by
+  `$BAKEOFF_RUNNERS`: compose sets the 8 host-run tools, the chart's
+  `postgres.runners` sets `argo flyte` in-cluster. It used to end with
+  `bootstrap_bakeoff('temporal')` + `('prefect')`, and because **`seed` reloads
+  the whole file to refresh the function**, `just seed flyte` replanted both
+  schema sets on the *cluster* database every run — deleting them never stuck.
+  Keep this file inert; put anything with side effects in `init-runners.sh`.
 - **Re-running a DAG is not the same as resetting it.** DAG 1 and DAG 2 are
   genuinely idempotent (DAG 1 drops and rebuilds its tables and overwrites a
   fixed `{table}.parquet`; DAG 2 touches no database). **DAG 3 and DAG 4 are
@@ -225,6 +244,14 @@ unique.
   is a real cloud database — namespace isolation makes it safe between the two
   cloud runners, verified: resetting `stepfunctions` left `google_workflows_dag4`
   at 3 orders.
+- **`prune` removes a runner's schemas from a database that is NOT its home**
+  (`bakeoff-db.sh prune <runner> --from <local|cluster|neon>`, 2026-08-12) — the
+  cleanup counterpart to the routing fix. It is deliberately not `reset`:
+  naming the runner's *own* database is a hard error, and it refuses any schema
+  set holding run artifacts (transactions / orders / approvals / reservations)
+  unless `--force`. Seeded fixtures don't count as use. Cleared the cluster
+  database's empty `temporal_*`, `prefect_*` and `google_workflows_*` sets, which
+  now holds only `argo_*`, `flyte_*` and `public`.
 - **Python:** `requires-python >=3.14` at the root; some SDKs may lack 3.14
   wheels, so a throwaway 3.12 venv for workers is the documented workaround.
   `uv` for everything. Ruff config is global (`~/.config/ruff/ruff.toml`:
@@ -320,7 +347,7 @@ edges), **local paths don't survive a task boundary** (CSVs now travel as
 dataclass** from Promises (5 sites), **nested dataclass predicates break
 `conditional()`** (4 sites), and the resume-broker contract needs an explicit
 `provider`. The chart also configures a minio blob store it does **not** deploy —
-why the earlier amd64-cluster install sat healthy for 46 days with zero executions. Scripts:
+why an earlier install sat healthy for 46 days with zero executions. Scripts:
 `flyte/deploy-flyte.sh`, `register.sh`, `run.sh`. See `flyte/README.md`.
 
 **Kestra — all 4 DAGs verified** (2026-08-04, Kestra 1.3.30): native `Pause` +
@@ -481,8 +508,11 @@ in the namespaced schemas with **zero** rows leaking to `public.*`. Note the
 six-day gap where deployed code wrote `public.*` while the namespaced schemas sat
 empty: **auditing `stepfunctions_dag*` during that window showed zeros and read
 as "never run"** — always confirm which schema a tool's *deployed* code targets
-before drawing conclusions from row counts. `public.*` and `dag1_etl` are now
-historical and droppable. Expect the same class of breakage found in
+before drawing conclusions from row counts. Both leftovers were cleaned up
+2026-08-13 after confirming against the deployed Lambda env rather than the docs
+— this file carried both "not dead yet" and "droppable" for a day. The
+`dag1_etl` schema was dropped and the `public.*` tables cleared; the `public`
+schema itself stays, because `bootstrap_bakeoff()` lives in it. Expect the same class of breakage found in
 Prefect, Airflow, Dagster, Argo, Kestra, Hatchet, Flyte, Conductor, and Google
 Workflows (see their READMEs) — though Temporal shows it isn't inevitable. Two
 cautionary cases worth carrying into those two: Kestra is the
@@ -566,16 +596,16 @@ needs *shared* result storage because the resumed run gets a new container.
   is now deployed and verified (`RUNNING.md` §10). Argo and Flyte are
   Kubernetes-only (`RUNNING.md` §7–§9, cluster-agnostic: §7 is the shared setup —
   cluster variables, the arm64 rule, the in-cluster backbone — then §8 Argo, §9
-  Flyte). Two clusters are in play, distinguished by CPU architecture rather than
-  by name — an **amd64** EKS Fargate cluster and an **arm64** OCI cluster. Set
-  `KCTX` to whichever you are targeting (`.envrc.example`); no script assumes a
-  current-context. The arm64 one is where task images must be built for arm64;
-  the Fargate one has no dynamic provisioning, hence `STORAGE_CLASS=""`.
+  Flyte). **Exactly one cluster is in use: the `arm64` OCI one** (kube context
+  `oracle`). Set `KCTX` to it (`.envrc.example`); no script assumes a
+  current-context. Task images must be built for arm64.
+  **Do not go looking for a second cluster.** Other kube contexts on this machine
+  belong to unrelated work and are out of scope for this repo; never probe them.
   **Both now run on the arm64 cluster** — Argo DAG 3 + DAG 4 (2026-08-03, v4.0.8)
   and all four Flyte DAGs (2026-08-06, `flyte-core-v1.16.8`); see their status
   entries above for what is still unexercised (Argo DAG 1/2; Flyte's saga
   compensation, DAG 3 decline branch and re-runs). Getting there took `RUNNING.md`
-  §7c and §9b, which exist because of how the **amd64** cluster failed: Argo's
+  §7c and §9b, which exist because of how an earlier install failed: Argo's
   submissions had no in-cluster Postgres or mock services, and Flyte sat healthy
   for 46 days with zero executions because the chart configures a minio blob
   store it never deploys. Neither failure surfaced as an error — that is the

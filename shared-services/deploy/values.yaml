@@ -77,11 +77,20 @@ postgres:
   password: orchestration              # evaluation-grade; not a production pattern
   pvcName: bakeoff-pgdata
   storage: 5Gi
-  # null = use the cluster default class. "" = no dynamic provisioning (the
-  # Fargate cluster; STORAGE_CLASS="" in RUNNING.md 7).
+  # null = use the cluster default class. "" = no dynamic provisioning
+  # (STORAGE_CLASS="" in RUNNING.md 7).
   storageClass: null
-  # ConfigMap holding init-db.sql, applied only on a FRESH volume.
+  # ConfigMap holding init-db.sql + init-runners.sh, applied only on a FRESH
+  # volume.
   initDbConfigMap: bakeoff-init-db
+  # Runners onboarded on a fresh volume, space-separated -> $BAKEOFF_RUNNERS.
+  # This is an INSTANCE property: only name runners that actually execute
+  # against this database. The in-cluster one hosts argo and flyte
+  # (values-incluster.yaml); the 8 host-run tools belong to the local compose
+  # pod, and stepfunctions/google_workflows to Neon. Onboarding a runner where
+  # it will never run is how the stray schemas in RUNNING.md appeared.
+  # Empty is fine -- `just seed <runner>` works on a live database.
+  runners: ""
 
 # Per-service repositories come from `terraform output -json ecr_repository_urls`
 # (one repo per service). Fill in the full ECR repo URL for each.

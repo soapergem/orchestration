@@ -24,8 +24,8 @@ spec:
   {{- if .Values.postgres.storageClass }}
   storageClassName: {{ .Values.postgres.storageClass }}
   {{- else if eq .Values.postgres.storageClass "" }}
-  {{- /* Explicit empty string = the Fargate cluster, which has no dynamic
-         provisioner. Omitting the key entirely lets the default class apply. */}}
+  {{- /* Explicit empty string = a cluster with no dynamic provisioner.
+         Omitting the key entirely lets the default class apply. */}}
   {{- end }}
 ---
 apiVersion: v1
@@ -69,6 +69,10 @@ spec:
         - {name: POSTGRES_DB, value: {{ .Values.postgres.database | quote }}}
         - {name: POSTGRES_USER, value: {{ .Values.postgres.user | quote }}}
         - {name: POSTGRES_PASSWORD, value: {{ .Values.postgres.password | quote }}}
+        # Consumed by init-runners.sh on a FRESH volume only. Which runners this
+        # database hosts is an instance property -- keeping it out of the shared
+        # init-db.sql is what stops host-run tools being onboarded here.
+        - {name: BAKEOFF_RUNNERS, value: {{ .Values.postgres.runners | quote }}}
         # Subdirectory, not the mount root: a PVC's lost+found makes initdb
         # refuse to run on an otherwise empty volume.
         - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}

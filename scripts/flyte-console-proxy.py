@@ -41,6 +41,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -84,19 +85,69 @@ def wait_for_port(port: int, timeout: float = 30.0) -> bool:
     return False
 
 
-def start_port_forward(namespace: str, service: str, local: int, remote: int, context: str | None):
-    """Launch `kubectl port-forward` and return the Popen handle."""
-    cmd = ["kubectl"]
-    if context:
-        cmd += ["--context", context]
-    cmd += ["port-forward", "-n", namespace, f"svc/{service}", f"{local}:{remote}"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+class PortForward:
+    """A `kubectl port-forward` that restarts itself when it dies.
 
-    if not wait_for_port(local):
-        proc.terminate()
-        err = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
-        sys.exit(f"error: port-forward to {service} did not come up on :{local}\n{err}")
-    return proc
+    Not optional in practice: a port-forward left idle for hours goes away
+    silently, and the only symptom is the proxy answering 502 while its own
+    process is still healthy -- which reads as "the proxy broke" rather than
+    "one of its two tunnels did". Observed after ~10 hours idle.
+    """
+
+    def __init__(self, namespace, service, local, remote, context):
+        self.namespace, self.service = namespace, service
+        self.local, self.remote, self.context = local, remote, context
+        self.proc = None
+        self.start()
+
+    def _cmd(self):
+        cmd = ["kubectl"]
+        if self.context:
+            cmd += ["--context", self.context]
+        return cmd + ["port-forward", "-n", self.namespace,
+                      f"svc/{self.service}", f"{self.local}:{self.remote}"]
+
+    def start(self):
+        self.proc = subprocess.Popen(self._cmd(), stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE)
+        if not wait_for_port(self.local):
+            self.proc.terminate()
+            err = self.proc.stderr.read().decode(errors="replace").strip() if self.proc.stderr else ""
+            sys.exit(f"error: port-forward to {self.service} did not come up on :{self.local}\n{err}")
+
+    def ensure_alive(self):
+        """Restart if the process exited or the port stopped accepting."""
+        dead = self.proc.poll() is not None
+        if not dead:
+            with socket.socket() as s:
+                s.settimeout(1.0)
+                dead = s.connect_ex(("127.0.0.1", self.local)) != 0
+        if dead:
+            sys.stderr.write(f"  port-forward to {self.service} died; restarting\n")
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            self.start()
+
+    def terminate(self):
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+
+
+def watchdog(forwards, stop_after=None):
+    """Poll the forwards so a dead tunnel is repaired before the next request."""
+    while True:
+        time.sleep(15)
+        for f in forwards:
+            try:
+                f.ensure_alive()
+            except SystemExit:
+                raise
+            except Exception as e:  # never let the watchdog kill the proxy
+                sys.stderr.write(f"  watchdog error on {f.service}: {e}\n")
 
 
 def make_handler(console_url: str, admin_url: str):
@@ -169,9 +220,11 @@ def main() -> None:
     ctx = args.context or "(current context)"
     print(f"==> port-forwarding flyteconsole and flyteadmin from {ctx}, namespace {args.namespace}")
     forwards = [
-        start_port_forward(args.namespace, "flyteconsole", args.console_port, 80, args.context),
-        start_port_forward(args.namespace, "flyteadmin", args.admin_port, 80, args.context),
+        PortForward(args.namespace, "flyteconsole", args.console_port, 80, args.context),
+        PortForward(args.namespace, "flyteadmin", args.admin_port, 80, args.context),
     ]
+    # Repairs a tunnel that died while idle, before the next request hits it.
+    threading.Thread(target=watchdog, args=(forwards,), daemon=True).start()
 
     def shutdown(*_):
         print("\n==> stopping port-forwards")

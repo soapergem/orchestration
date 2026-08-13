@@ -92,6 +92,13 @@ def main():
     }
     json.dump(result, sys.stdout)
 
+    # Exit code 2 signals a non-retriable error -- same convention as
+    # process_payment.py. The failure is now recorded, so the workflow should
+    # fail rather than retry this step; the template's
+    # `retryStrategy.expression` keys on exactly this code. Exiting 1 here would
+    # be read as "transient, try again" and burn all the retries.
+    sys.exit(2)
+
 
 if __name__ == "__main__":
     main()

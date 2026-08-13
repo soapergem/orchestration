@@ -205,18 +205,33 @@ you PUT the state back to `ACTIVE`. Nothing warns you about this.
   Argo's DAG YAML hard-codes `PGHOST` as a literal env value, so it needs the
   namespace aliases. That difference is worth a line in `../comparison.md`.
 - **The nine were empty and free.** Each held only a ResourceQuota — no pods, no
-  cost. They were noise, not overhead; the amd64 cluster carried the same nine
+  cost. They were noise, not overhead; an earlier install carried the same nine
   unused for 46 days.
 - **They are not chart-managed.** `helm uninstall flyte` leaves project
   namespaces behind, which is why `../RUNNING.md`'s teardown deletes them
   explicitly. That list is now the three `bakeoff-*`.
-- **Renaming the project is not free.** Registrations are per project/domain, so
-  the four DAGs must be re-registered under `bakeoff`, and the two per-namespace
-  prerequisites from Launch above lived in `flytesnacks-development` and went
-  with it. Current state: the backbone aliases **have** been recreated in
-  `bakeoff-development`; the `ecr-bakeoff` pull secret has **not** — it was long
-  past its 12h validity anyway, so re-mint it (and re-patch the `default`
-  ServiceAccount's `imagePullSecrets`) before the first `register.sh`.
+- **Renaming the project is not free** — resolved 2026-08-13, but worth reading
+  before renaming anything again. Registrations are per project/domain, so the
+  four DAGs had to be re-registered under `bakeoff`, and the two per-namespace
+  prerequisites lived in `flytesnacks-development` and went with it.
+
+  The failure mode was ugly: the console showed the `bakeoff` project with **no
+  workflows**, while 74 registrations sat in `flytesnacks` — which had been
+  *archived*, and the UI lists only active projects. So the workflows had not
+  been lost, they were invisible. Meanwhile `register.sh` and `run.sh` already
+  defaulted to `PROJECT=bakeoff`, so nothing pointed at the discrepancy.
+
+  Then the first run failed with `ImagePullBackOff`, because **Flyte's
+  `clusterresource-template` provisions only a Namespace and a ResourceQuota —
+  never image-pull credentials.** A brand-new project namespace therefore cannot
+  pull the task image at all, and the launcher job in `flyte` succeeds while the
+  task pod hangs, which reads as "the run started" in the console. Pod specs are
+  immutable, so fixing the ServiceAccount afterwards does **not** rescue an
+  already-created pod: delete it and let Flyte recreate it.
+
+  Both are now handled — see Operational notes for the credential, and
+  `alias-backbone.sh` for the aliases. All four DAGs verified in
+  `bakeoff/development` on 2026-08-13.
 
 ---
 
@@ -435,7 +450,7 @@ at all**, and `--set minio.enabled=true` is silently ignored. Flyte stores every
 task input, output, and offloaded literal there, so the install comes up entirely
 "Running" while being unable to execute a single workflow.
 
-That is the exact state the amd64 cluster sat in for 46 days: flyteadmin healthy,
+That is the exact state an earlier install sat in for 46 days: flyteadmin healthy,
 storage endpoint dangling, `kubectl get flyteworkflows -A` returning
 `No resources found`. **Nothing had ever run.** Full write-up in `../RUNNING.md`
 §9b; `deploy-flyte.sh` fixes it.
@@ -521,10 +536,29 @@ Still true regardless of execution:
 
 ### Operational notes
 
-- **The ECR token expires after 12 hours** and task pods then fail to pull.
-  Re-mint into the `ecr-bakeoff` secret in both `flyte` and
-  `bakeoff-development`. Better fix: extend the cluster's
-  `k8s-ecr-login-renew` cronjob to cover the task namespace.
+- **ECR tokens expire after 12 hours** — this blocked Flyte twice in one day
+  before being fixed properly. **Now automated** (2026-08-13): the cluster's
+  `k8s-ecr-login-renew` cronjob runs every 6 hours and its `targetNamespace` was
+  widened from `default` to
+  `default,flyte,bakeoff-development,bakeoff-staging,bakeoff-production`. It
+  writes `k8s-ecr-login-renew-docker-secret` into each, and that is the secret
+  `register.sh`/`run.sh` reference and each project namespace's `default`
+  ServiceAccount carries. The hand-minted `ecr-bakeoff` secret is gone — one
+  source of truth, renewed on a schedule.
+
+  **Adding a new project/domain means adding its namespace to that list**, or
+  every task pod in it will `ImagePullBackOff`:
+
+  ```bash
+  helm upgrade k8s-ecr-login-renew -n default --reuse-values \
+    --repo https://nabsul.github.io/helm k8s-ecr-login-renew \
+    --set targetNamespace='default\,flyte\,<...>\,bakeoff-newdomain'
+  kubectl patch sa default -n bakeoff-newdomain \
+    -p '{"imagePullSecrets":[{"name":"k8s-ecr-login-renew-docker-secret"}]}'
+  ```
+
+  Task pods run as the namespace's `default` ServiceAccount, which is why
+  patching it covers every task without touching pod specs.
 - **Rebuild the task image after adding a dependency** — it is baked in, not
   resolved by `ImageSpec` at registration.
 - **Task pods are ~70s of overhead each**, so DAG 4's ~10 sequential nodes take

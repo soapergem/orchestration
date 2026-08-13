@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
-  generateName: order-fulfillment-
+  name: order-fulfillment
   labels:
     workflow: order-fulfillment
   annotations:
@@ -728,7 +728,8 @@ spec:
 ---
 # Separate Workflow for saga compensation, invoked by the exit handler.
 # In practice, the exit handler above handles the routing.
-# This companion CronWorkflow can be used for scheduled compensation checks.
+# A CronWorkflow could wrap this for scheduled compensation sweeps; this object
+# is a WorkflowTemplate, invoked on demand by the exit handler.
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:

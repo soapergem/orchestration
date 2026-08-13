@@ -129,9 +129,22 @@ publicly reachable Postgres. `stepfunctions_dag3.accounts` and
 `google_workflows_dag3.accounts` hold independent balances; before this change
 DAG 3/4 wrote flat `public.*` tables and the two would have debited the same rows.
 
-Two leftovers from the migration, both harmless: the old `dag1_etl` schema is now
-orphaned (DAG 1 uses `stepfunctions_dag1`), and the flat `public.*` tables DAG 3/4
-used are no longer read. Drop them when you are confident nothing else wants them.
+Two leftovers from the migration, both harmless: the old `dag1_etl` schema
+(DAG 1 uses `stepfunctions_dag1`) and the flat `public.*` tables DAG 3/4 used.
+Confirmed orphaned 2026-08-13 by reading the deployed Lambda environments rather
+than the code — every DB-touching `orch-bakeoff-*` function reports
+`BAKEOFF_NS=stepfunctions`:
+
+```bash
+aws lambda list-functions --region us-east-1 \
+  --query "Functions[?starts_with(FunctionName,'orch-bakeoff-')].{Name:FunctionName,NS:Environment.Variables.BAKEOFF_NS}" \
+  --output text
+```
+
+Both were cleaned up that day: `dag1_etl` dropped, the `public.*` tables cleared.
+**The `public` schema itself must stay** — `bootstrap_bakeoff()` is defined there
+and every seed/reset calls it, so `DROP SCHEMA public CASCADE` would take out the
+function `init-db.sql` exists to provide.
 
 The `transactions` table in `shared-services/init-db.sql` was also reconciled to
 match the DAG 3 code contract (`id`, `payment_id`, `from_account`/`to_account`,

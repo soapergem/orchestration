@@ -17,11 +17,10 @@
 # The kube context to target. Every script takes `--context "$KCTX"`; none of
 # them assume a current-context, so switching clusters is one variable.
 #
-# Two clusters were used while writing this, and the distinction is load-bearing
-# rather than cosmetic -- CPU ARCHITECTURE decides whether your task images run
-# at all (RUNNING.md §7):
-#   * an arm64 cluster  (OCI)          -- images must be built for arm64
-#   * an amd64 cluster  (EKS Fargate)  -- no persistent volumes, so STORAGE_CLASS=""
+# ONE cluster is in use: the arm64 OCI one. Task images must be built for arm64
+# (RUNNING.md §7) -- CPU architecture decides whether they run at all.
+#
+# Do not point KCTX at unrelated clusters on this machine.
 export KCTX=my-arm64-cluster
 
 # Kubernetes namespaces. Defaults in the scripts are fine for most setups.
@@ -30,7 +29,7 @@ export KCTX=my-arm64-cluster
 # export FLYTE_NS=flyte
 
 # Storage class for the in-cluster Postgres PVC. Set to the empty string on a
-# cluster with no dynamic provisioning (EKS Fargate), which drops the PV.
+# cluster with no dynamic provisioning, which drops the PV.
 # export STORAGE_CLASS=oci-bv
 # export PG_STORAGE=10Gi
 

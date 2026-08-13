@@ -116,10 +116,28 @@ BEGIN
 END;
 $fn$ LANGUAGE plpgsql;
 
--- Runners onboarded at init time (others added as they're tested:
--- SELECT bootstrap_bakeoff('<runner>');).
+-- NOTHING IS BOOTSTRAPPED HERE, DELIBERATELY. This file defines the function and
+-- stops.
 --
--- NOTE: this file runs ONLY on a fresh pgdata volume. To onboard a runner on an
--- existing volume, use `just seed <runner>` (or call the function by hand).
-SELECT bootstrap_bakeoff('temporal');
-SELECT bootstrap_bakeoff('prefect');
+-- It used to end with `SELECT bootstrap_bakeoff('temporal'); ... ('prefect');`,
+-- which was wrong twice over:
+--
+--   1. The same file is mounted into BOTH databases -- the local compose pod and
+--      the in-cluster bakeoff-postgres (as a ConfigMap, see
+--      deploy/templates/postgres.yaml). Two host-run runners were therefore
+--      onboarded onto the cluster database, where neither will ever run.
+--   2. Worse, and the reason the strays kept coming back: `bakeoff-db.sh seed`
+--      re-runs this whole file to refresh the function before bootstrapping the
+--      runner you asked for. So `just seed flyte` -- targeting the cluster --
+--      re-executed both lines there every single time. Deleting the schemas did
+--      not help; the next seed re-created them. (Measured 2026-08-12: one
+--      `seed flyte` recreated temporal_dag{1,3,4} and prefect_dag{1,3,4}.)
+--
+-- Which runners to onboard is a property of the DATABASE, not of this file, so
+-- it now lives in `init-runners.sh` driven by $BAKEOFF_RUNNERS -- set per
+-- instance by docker-compose.yml (the 8 host-run tools) and by the chart's
+-- postgres.runners value (argo, flyte). Keeping this file side-effect-free is
+-- what makes it safe for `seed` to reload.
+--
+-- To onboard a runner by hand on an existing volume: `just seed <runner>`,
+-- which routes to the right database. Or SELECT bootstrap_bakeoff('<ns>');

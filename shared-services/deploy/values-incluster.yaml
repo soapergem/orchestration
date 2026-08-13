@@ -23,10 +23,15 @@ image:
 
 postgres:
   enabled: true
-  # Cluster-specific. The OCI cluster provisions `oci-bv`; the Fargate cluster
-  # has no dynamic provisioning at all (STORAGE_CLASS="" in RUNNING.md 7).
+  # Cluster-specific. This cluster provisions `oci-bv`; on a cluster with no
+  # dynamic provisioning at all, set STORAGE_CLASS="" (RUNNING.md 7).
   storageClass: oci-bv
   storage: 50Gi
+  # Only Argo and Flyte execute against this database. Do NOT add the host-run
+  # tools here -- their data lives in the local compose pod, and onboarding them
+  # here is exactly the mistake that left empty temporal_*/prefect_* schemas in
+  # this cluster (see shared-services/init-db.sql).
+  runners: "argo flyte"
 
 # Both resume providers. Either may be left empty on a cluster that does not run
 # that cloud's DAGs -- the env vars and volumes are then omitted entirely rather

@@ -29,7 +29,8 @@ MAP="
 8888|Hatchet|engine REST API
 7233|Temporal|engine gRPC
 7077|Hatchet|engine gRPC (container 7070)
-2746|Argo|argo-server port-forward
+2746|Argo|argo-server port-forward (just port-forwards)
+54322|shared|in-cluster bakeoff-postgres port-forward (just port-forwards)
 8000|Conductor|server REST API (/api)
 8127|Conductor|UI (container listens on 5000)
 "
