@@ -21,7 +21,7 @@ commands are the ones in `RUNNING.md` and `terraform/aws/`.
 | **Hatchet** | same, via `worker.register_workflow()` | worker registers them at startup | edit worker, redeploy worker | worker redeploy |
 | **Luigi** | `Task` classes in a script | *nothing* — you run the script | write a file | whatever your venv has |
 | **Kestra** | flow YAML | `kestra flow namespace update` → engine DB | push YAML, no restart | per-task container image |
-| **Argo** | `Workflow` / `WorkflowTemplate` CRD | `kubectl apply` | apply YAML | per-step image (or runtime `pip install`) |
+| **Argo** | `WorkflowTemplate` CRD | `kubectl apply`, then submit a `workflowTemplateRef` stub | apply YAML | per-step image (or runtime `pip install`) |
 | **Flyte** | `@workflow` Python + built images | `pyflyte register` → versioned server-side | register a new version | rebuild that task's `ImageSpec` |
 | **Step Functions** | ASL JSON + Lambda zips | `terraform apply` | new `.tf` + state machine | new Lambda layer |
 | **Google Workflows** | workflow YAML | `gcloud workflows deploy` or `google_workflows_workflow` → versioned revision | one command | n/a in the engine — but every step body is a service you deploy yourself |
@@ -210,6 +210,49 @@ isolation unless you split task types across separate workers (routed with task
 authoritative — the engine's copy is derived and disposable. Models 3 gives the
 engine its own stored copy, which enables real versioning (Flyte, Step Functions)
 but also enables drift (Kestra's UI editor, a hand-edited state machine).
+
+**What the UI lists once you have deployed** (counted 2026-08-12, live, against
+the same four DAGs). "How many workflows do I see?" turns out to be a different
+question in each tool, and four of the twelve answer **zero**:
+
+| Tool | Lists | = | Why that number |
+|---|---|---|---|
+| **Airflow** | 4 | 4 DAGs | 1 file = 1 `dag_id`; DAG 4's saga is TaskGroups inside it. |
+| **Google Workflows** | 4 | 4 workflows | DAG 4's three sub-workflows are in-file subroutines, not separate deployables. |
+| **Kestra** | 7 | 4 + 3 subflows | Subflows are first-class flows, so they list alongside their parents. |
+| **Step Functions** | 7 | 4 + 3 sub-workflows | ASL cannot nest: a sub-workflow *must* be its own state machine. |
+| **Dagster** | 7 | 4 DAGs split into 7 jobs | Not sub-workflows — no native suspend, so DAG 2 → 2 jobs and DAG 4 → 3, bridged by sensors. The tool's *limitation* inflates the count. |
+| **Argo** | 8 | 4 + 4 templates | Only after 2026-08-12. The DAGs were `kind: Workflow`, submitted one-shot, so the engine never learned them and the tab showed only DAG 4's sub-workflow templates. |
+| **Conductor** | 10 | 4 + 6 sub-workflows | Includes the compensation and dead-letter workflows. |
+| **Hatchet** | 9 | 9 workflows | 4 DAGs decomposed into 9 registered workflow objects. |
+| **Temporal** | **0** | — | **No definition registry exists.** 7 `@workflow.defn` classes; the server learns a workflow *type* only when an execution of it appears. |
+| **Prefect** | **0** | — | Populated by deployments or past runs, not by scanning. `serve_all.py` must be running. |
+| **Flyte** | **0** | — | Registration is per project *and* domain; nothing is visible until `pyflyte register` targets the one you are looking at. |
+| **Luigi** | **0** | — | No registry at all. `luigid` lists only currently-referenced tasks, and `scheduler.remove_delay` drops them after **600s**. |
+
+Two things fall out of this that a capability matrix will not show:
+
+- **The counts are not comparable as "how much work is this."** Step Functions'
+  7 is a platform constraint (no nesting), Dagster's 7 is a workaround for a
+  missing feature, and Google Workflows' 4 hides three sub-workflows inside one
+  file. Only Airflow's 4 means what it looks like it means.
+- **"What is deployed here?" is unanswerable in four of the twelve** — including
+  Temporal, which scores highest overall. In Model 2 that is inherent: the
+  definition lives in a worker binary, and the control plane is a scheduler, not
+  a registry. It is a real operational cost (onboarding, audit, change review)
+  that no scored criterion captures.
+
+**Registration is durable server state, and nothing garbage-collects it.** In
+Model 3, what the engine holds is not a projection of your source tree — it is a
+copy that outlives whatever put it there. Both tools that were over-count on
+2026-08-12 were over-count for this reason, not because of anything in the repo:
+Hatchet showed **19** for 9 real workflows, because registrations are keyed by
+*name* and the name carries `HATCHET_CLIENT_NAMESPACE` — so one worker run
+without the namespace set leaves a complete orphan set behind, plus a debug
+workflow deleted from the repo months earlier. Kestra showed **13** for 7,
+because its image auto-loads six `tutorial.*` samples on first boot. Neither
+engine has a reaper; `scripts/prune-registrations.sh` (`just prune`) is the one
+this repo had to write. Budget for that job existing.
 
 **Blast radius of a dependency change.** This is the sharpest divider:
 

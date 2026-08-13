@@ -116,6 +116,15 @@ require_neon_url() {
 # --------------------------------------------------------------- validation
 
 validate_runner() {
+    validate_runner_name "${1:-}"
+    # A runner's HOME database must be reachable for seed/reset/status. prune is
+    # the exception -- it targets a database the runner does not live on, so it
+    # calls validate_runner_name directly and checks only the --from target.
+    [ "$(transport_for "$1")" = neon ] && require_neon_url
+    return 0
+}
+
+validate_runner_name() {
     local r="${1:-}"
     if [ -z "$r" ]; then
         echo "error: no runner given" >&2
@@ -132,7 +141,6 @@ validate_runner() {
         echo "  neon    $NEON_RUNNERS" >&2
         exit 2
     fi
-    [ "$(transport_for "$r")" = neon ] && require_neon_url
     return 0
 }
 
@@ -185,6 +193,88 @@ cmd_reset() {
     cmd_seed "$runner"
 }
 
+# Remove a runner's schemas from a database that is NOT that runner's home.
+#
+# Distinct from `reset`, and deliberately so: `reset temporal` drops
+# temporal_dag* on the LOCAL pod, which is Temporal's real data. This drops them
+# somewhere they should never have existed -- so the target is named explicitly
+# with --from, and naming the runner's own home is a hard error rather than a
+# silent `reset`.
+#
+# The guard matters more than the drop. Every mutable table must be empty; a
+# single transaction, order, approval or reservation means the schema is in use
+# and the drop is refused. Seeded fixtures (accounts, inventory, customers) are
+# expected and ignored -- bootstrap_bakeoff creates those, so their presence is
+# not evidence of anything.
+cmd_prune() {
+    local runner="${1:-}" from="" force=""
+    shift 2>/dev/null || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from) from="${2:-}"; shift 2 ;;
+            --force) force=1; shift ;;
+            *) echo "error: unexpected argument '$1'" >&2; usage; exit 2 ;;
+        esac
+    done
+
+    validate_runner_name "$runner"
+    local home; home="$(transport_for "$runner")"
+
+    case "$from" in
+        local|cluster|neon) ;;
+        "") echo "error: prune requires --from <local|cluster|neon>." >&2
+            echo "       '$runner' lives on '$home'; name the database to clean explicitly." >&2
+            exit 2 ;;
+        *)  echo "error: unknown --from '$from' (expected local, cluster or neon)" >&2; exit 2 ;;
+    esac
+
+    if [ "$from" = "$home" ]; then
+        echo "error: '$from' IS $runner's own database -- refusing." >&2
+        echo "       Dropping a runner's schemas where they belong is \`reset $runner\`," >&2
+        echo "       which re-seeds afterwards. prune is for strays only." >&2
+        exit 2
+    fi
+    [ "$from" = neon ] && require_neon_url
+
+    # Refuse if anything ever ran here. Missing tables count as empty: a schema
+    # with no transactions table cannot hold transactions.
+    if [ -z "$force" ]; then
+        local used
+        used=$(psql_run "$from" -tAq -c "
+            SELECT COALESCE(sum(n), 0) FROM (
+              SELECT (SELECT count(*) FROM \"${runner}_dag3\".transactions) AS n
+              WHERE to_regclass('\"${runner}_dag3\".transactions') IS NOT NULL
+              UNION ALL
+              SELECT (SELECT count(*) FROM \"${runner}_dag4\".orders)
+              WHERE to_regclass('\"${runner}_dag4\".orders') IS NOT NULL
+              UNION ALL
+              SELECT (SELECT count(*) FROM \"${runner}_dag4\".approval_requests)
+              WHERE to_regclass('\"${runner}_dag4\".approval_requests') IS NOT NULL
+              UNION ALL
+              SELECT (SELECT count(*) FROM \"${runner}_dag4\".inventory_reservations)
+              WHERE to_regclass('\"${runner}_dag4\".inventory_reservations') IS NOT NULL
+            ) t;" 2>/dev/null | tr -d '[:space:]')
+
+        if [ -z "$used" ]; then
+            echo "error: could not inspect ${runner}_dag* on '$from' -- refusing to drop blind." >&2
+            exit 1
+        fi
+        if [ "$used" != "0" ]; then
+            echo "error: ${runner}_dag* on '$from' holds $used run artifact(s) -- refusing." >&2
+            echo "       That is not a stray. Inspect it before dropping anything:" >&2
+            echo "         $(basename "$0") status $runner   # (routes to $home, not $from)" >&2
+            echo "       Pass --force only if you are certain." >&2
+            exit 1
+        fi
+    fi
+
+    echo "==> pruning ${runner}_dag{1,3,4} from '$from' (not $runner's home, which is '$home')"
+    psql_run "$from" -q -v ON_ERROR_STOP=1 \
+        -c "DROP SCHEMA IF EXISTS \"${runner}_dag1\", \"${runner}_dag3\", \"${runner}_dag4\" CASCADE" \
+        || exit 1
+    echo "    done -- no re-seed (that is the point)"
+}
+
 cmd_status() {
     local runner="$1" transport
     validate_runner "$runner"
@@ -204,6 +294,7 @@ cmd_status() {
 usage() {
     cat >&2 <<EOF
 usage: $(basename "$0") {status|seed|reset} <runner> [--yes]
+       $(basename "$0") prune <runner> --from <local|cluster|neon> [--force]
 
 runners, by the database they actually use:
   local    $LOCAL_RUNNERS
@@ -211,6 +302,9 @@ runners, by the database they actually use:
   neon     $NEON_RUNNERS
 
   --yes    skip the confirmation prompt on a Neon reset
+  prune    drop a runner's schemas from a database that is NOT its home --
+           for strays. Refuses the runner's own database (use reset), and
+           refuses any schema set holding run artifacts unless --force.
 EOF
 }
 
@@ -220,6 +314,7 @@ shift 2>/dev/null || true
 case "$action" in
     seed)   cmd_seed "${1:-}" ;;
     reset)  cmd_reset "${1:-}" "${2:-}" ;;
+    prune)  cmd_prune "$@" ;;
     status) cmd_status "${1:-}" ;;
     ""|-h|--help) usage; exit 2 ;;
     *) echo "error: unknown action '$action'" >&2; usage; exit 2 ;;

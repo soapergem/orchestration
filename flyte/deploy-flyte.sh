@@ -5,14 +5,14 @@
 # Three pieces the upstream chart does NOT give you, and which the original
 # RUNNING.md instructions omitted:
 #
-#  1. A metadata Postgres. `flyte-binary` bundles one as a sidecar but breaks on
-#     Fargate init-container ordering, so flyte-core + standalone Postgres it is.
+#  1. A metadata Postgres. `flyte-binary` bundles one as a sidecar, whose
+#     init-container ordering broke here, so flyte-core + standalone Postgres it is.
 #  2. A blob store. The chart's default `storage.type: sandbox` writes a config
 #     pointing at http://minio.<ns>.svc.cluster.local:9000 -- but the chart has no
 #     `minio` key at all and deploys nothing. `--set minio.enabled=true` is
 #     silently ignored. Flyte stores every task input/output there, so without it
 #     the install comes up "Running" and cannot execute a single workflow. That is
-#     exactly the state the amd64 EKS Fargate cluster was left in: flyteadmin healthy, storage
+#     exactly the state an earlier install was left in: flyteadmin healthy, storage
 #     endpoint dangling, `kubectl get flyteworkflows -A` empty.
 #  3. The bucket itself. minio starts empty; flyte does not create the container.
 #

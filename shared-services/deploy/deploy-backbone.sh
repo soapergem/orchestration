@@ -49,10 +49,17 @@ for svc in callback-fetch-service approval-service shipping-service fixture-serv
     --dry-run=client -o yaml | kubectl "${kube[@]}" apply -f - >/dev/null
 done
 
-# init-db.sql defines bootstrap_bakeoff(ns) and runs ONLY on a fresh volume. On
-# an existing one use `just seed <runner>` / `just reset <runner>`.
+# init-db.sql defines bootstrap_bakeoff(ns); init-runners.sh onboards the
+# runners named by $BAKEOFF_RUNNERS (postgres.runners in values-incluster.yaml --
+# argo and flyte, NOT the host-run tools). Both run ONLY on a fresh volume. On an
+# existing one use `just seed <runner>` / `just reset <runner>`.
+#
+# The keys are the filenames inside /docker-entrypoint-initdb.d and the
+# entrypoint runs them in lexical order, so the numeric prefixes are load-bearing:
+# init-runners.sh needs bootstrap_bakeoff() to exist already.
 kubectl "${kube[@]}" create configmap bakeoff-init-db -n "$NAMESPACE" \
-  --from-file=init-db.sql="$here/../init-db.sql" \
+  --from-file=00-init-db.sql="$here/../init-db.sql" \
+  --from-file=02-init-runners.sh="$here/../init-runners.sh" \
   --dry-run=client -o yaml | kubectl "${kube[@]}" apply -f - >/dev/null
 
 echo "==> helm upgrade --install $RELEASE -n $NAMESPACE"

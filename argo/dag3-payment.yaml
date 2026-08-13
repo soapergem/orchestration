@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
-  generateName: payment-processing-
+  name: payment-processing
   labels:
     workflow: payment-processing
   annotations:
@@ -241,6 +241,14 @@ spec:
       retryStrategy:
         limit: "5"
         retryPolicy: Always
+        # Exit code 2 == non-retriable, the convention argo/scripts/
+        # process_payment.py already documents. `retryPolicy: Always` cannot
+        # tell a declined card from a gateway 5xx -- both are just a failed
+        # pod -- so without this expression a decline burned all 5 attempts and
+        # DAG 3's whole retriable-vs-non-retriable requirement was untested.
+        # String compare, not asInt(): exitCode is "" on an Error (as opposed to
+        # Failed) node, and asInt("") errors out inside the predicate.
+        expression: 'lastRetry.exitCode != "2"'
         backoff:
           duration: "3s"
           factor: "2"
@@ -280,7 +288,9 @@ spec:
                           "decline_code": "insufficient_funds",
                       },
                   }, f)
-              sys.exit(1)
+              # Exit 2 == non-retriable. A declined card is a business decision,
+              # not a blip; retrying it is wrong and (at 5 attempts) slow.
+              sys.exit(2)
           elif roll < 0.20:
               print(f"PaymentGateway5xx: 500 error for payment {payment_id}", file=sys.stderr)
               sys.exit(1)
@@ -491,6 +501,13 @@ spec:
       retryStrategy:
         limit: "3"
         retryPolicy: Always
+        # This step's last act is a deliberate non-zero exit, to fail the
+        # workflow after the failure has been recorded. Without the predicate,
+        # `Always` retried that verdict 1 + 3 times on every invalid or
+        # duplicate payment -- backing off between each, and re-printing the
+        # notification -- before failing anyway. Exit 2 is the terminal marker;
+        # a real error while recording still exits 1 and still retries.
+        expression: 'lastRetry.exitCode != "2"'
         backoff:
           duration: "2s"
           factor: "2"
@@ -570,8 +587,11 @@ spec:
           print(f"NOTIFICATION: {subject}")
           print(f"BODY: {body}")
 
-          # Exit with error to mark the workflow as failed
-          sys.exit(1)
+          # Exit with error to mark the workflow as failed. Exit code 2, not 1:
+          # this is the deliberate terminal verdict, and the retryStrategy
+          # expression above keys on 2 so it is not retried. An unhandled
+          # exception above still exits 1 and still gets its retries.
+          sys.exit(2)
           PYEOF
         env:
           - name: BAKEOFF_NS

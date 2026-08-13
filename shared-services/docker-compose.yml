@@ -42,11 +42,20 @@ services:
       POSTGRES_DB: orchestration
       POSTGRES_USER: orchestration
       POSTGRES_PASSWORD: orchestration
+      # Which runners this instance onboards on a FRESH volume. This pod hosts
+      # the 8 host-run tools; argo/flyte live on the in-cluster postgres and
+      # stepfunctions/google_workflows on Neon, so none of those belong here.
+      # The list used to be hardcoded in init-db.sql, which both databases share
+      # -- see that file's tail comment for why that leaked across instances.
+      BAKEOFF_RUNNERS: "airflow dagster prefect luigi temporal hatchet kestra conductor"
     ports:
       - "54321:5432"          # non-standard host port to avoid conflicts with local Postgres
     volumes:
       - ./init-db.sql:/docker-entrypoint-initdb.d/00-init-db.sql:ro
       - ./init-engines.sql:/docker-entrypoint-initdb.d/01-init-engines.sql:ro
+      # Numeric prefix matters: the entrypoint runs this directory in lexical
+      # order and this needs bootstrap_bakeoff() to already exist.
+      - ./init-runners.sh:/docker-entrypoint-initdb.d/02-init-runners.sh:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U orchestration"]

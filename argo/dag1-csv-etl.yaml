@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
-kind: Workflow
+kind: WorkflowTemplate
 metadata:
-  generateName: csv-etl-pipeline-
+  name: csv-etl-pipeline
   labels:
     workflow: csv-etl-pipeline
   annotations:

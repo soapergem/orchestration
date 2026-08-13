@@ -183,6 +183,18 @@ namespace isolation.
 
 The `public.*` and `dag1_etl` schemas are historical: nothing writes them any
 more, and they can be dropped once you no longer want the July/August evidence.
+**Both were cleaned up 2026-08-13**: the `dag1_etl` schema dropped (its contents
+are recorded below — customers 5 / products 5 / orders 10 / `combined_report` 10)
+and the `public.*` tables cleared. The `public` *schema* stays: it holds
+`bootstrap_bakeoff()`, which every seed and reset calls, so dropping it would
+break seeding on Neon. Verify the claim the same way before dropping anything
+else — read the *deployed* Lambda environments, not the code:
+
+```bash
+aws lambda list-functions --region us-east-1 \
+  --query "Functions[?starts_with(FunctionName,'orch-bakeoff-')].{Name:FunctionName,NS:Environment.Variables.BAKEOFF_NS}" \
+  --output text
+```
 
 ### Terraform state was missing, and that was the root cause of the credentials gap
 

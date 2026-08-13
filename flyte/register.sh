@@ -63,7 +63,7 @@ spec:
     spec:
       restartPolicy: Never
       imagePullSecrets:
-      - name: ecr-bakeoff
+      - name: k8s-ecr-login-renew-docker-secret
       containers:
       - name: register
         image: $TASK_IMAGE

@@ -121,6 +121,15 @@ reset runner *args:
 db-status runner:
     CONTAINER_RUNNER="{{ container_runner }}" ./scripts/bakeoff-db.sh status {{ runner }}
 
+# For strays only: schemas on a database the runner never runs against, e.g.
+# `just db-prune temporal --from cluster`. Naming the runner's OWN database is a
+# hard error (that is `reset`, which re-seeds), and any schema set holding run
+# artifacts is refused unless --force. Seeded fixtures do not count as use.
+
+# Drop a runner's schemas from a database that is NOT its home.
+db-prune runner *args:
+    CONTAINER_RUNNER="{{ container_runner }}" ./scripts/bakeoff-db.sh prune {{ runner }} {{ args }}
+
 # Airflow, Dagster, Prefect and Luigi have **no engine container** -- they are
 # libraries executed in your own venv, so `just up-all` cannot start them and
 # RUNNING.md §0's port table shows 3000/4200/8080/8082 unowned until you do.
@@ -143,6 +152,16 @@ py-status:
 creds:
     ./scripts/creds.sh
 
+# Hatchet and Kestra keep registrations as durable SERVER state, not as a
+# projection of the source tree -- so a worker run with a different
+# HATCHET_CLIENT_NAMESPACE leaves a full orphan set behind, and Kestra's image
+# auto-loads six `tutorial.*` samples. Both make "what is deployed?"
+# unanswerable from the UI. Dry run unless you pass `--apply`.
+
+# Delete stale workflow registrations from Hatchet / Kestra (dry run by default).
+prune target="all" *args:
+    ./scripts/prune-registrations.sh {{ target }} {{ args }}
+
 # flyteconsole and flyteadmin are separate Services; port-forwarding the console
 # alone gives you a UI whose API calls land on its own HTML catch-all, so it
 # lists no projects and looks unauthenticated. An ingress normally merges them
@@ -152,6 +171,16 @@ creds:
 # Serve a working Flyte console (console + admin merged) on :8085.
 flyte-ui *args:
     ./scripts/flyte-console-proxy.py {{ args }}
+
+# `kubectl port-forward` blocks until killed, and just runs each recipe line as
+# its own shell in sequence -- so two of them on two lines hangs on the first and
+# never reaches the second. The script runs both at once and, because a forward
+# also dies silently on pod restart or laptop sleep, supervises and reconnects
+# each one. Honours KCTX like every other cluster script. Ctrl-C stops both.
+
+# Hold open the argo (:2746) and in-cluster postgres (:54322) port-forwards.
+port-forwards *targets:
+    ./scripts/port-forwards.sh {{ targets }}
 
 # Open a psql shell against the bake-off database.
 psql:

@@ -244,6 +244,108 @@ made tolerant of a missing order row, approval timeout enforced in the sensor,
 and the claimed-but-absent compensation trigger implemented as
 `shipping_failure_sensor`.
 
+## "Could not reach user code server" (2026-08-12, recurred 2026-08-13)
+
+The full error is:
+
+```
+dagster._core.errors.DagsterUserCodeUnreachableError:
+Could not reach user code server. gRPC Error code: UNKNOWN
+```
+
+**This is almost certainly not your code.** `dagster dev` runs as two processes:
+the webserver you look at, and a separate *code server* holding your jobs,
+sensors and assets. They talk over a gRPC unix socket. The error means the
+webserver called the code server and nothing answered — a stale connection, not
+a broken repository.
+
+**Fix it with a reload, not a restart.** The Deployment → Code locations page has
+a reload button; it re-establishes the connection and keeps run history and
+sensor cursors. Same thing from the CLI:
+
+```bash
+curl -s -X POST http://localhost:3000/graphql -H 'Content-Type: application/json' \
+  -d '{"query":"mutation { reloadRepositoryLocation(repositoryLocationName: \"dagster_bakeoff.repository\") { __typename ... on WorkspaceLocationEntry { loadStatus } } }"}'
+```
+
+Restarting (`just py-down dagster && just py-up dagster`) also works but is a
+bigger hammer.
+
+**Confirm it is not your code first** — this takes seconds and rules out the
+whole class:
+
+```bash
+source dagster_bakeoff/env.sh && uv run python -c "import dagster_bakeoff.repository"
+```
+
+**How to read the symptoms.** In the case observed, the webserver had been up
+**9h29m**; the first `LOCATION_ERROR` appeared in the log 15 minutes before the
+UI was opened, and there were **two** `dagster api grpc` child processes where
+there should be one — the code server had been silently respawning children the
+webserver never re-attached to. Two details make this confusing:
+
+- **The location still reports `LOADED`.** Status refers to registration, not
+  reachability, so the workspace looks healthy while every query fails.
+- **`--lazy-load-user-code` defers the check until something asks.** The
+  connection can be dead for hours and only surface the moment you open a page,
+  which makes it look sudden.
+
+Useful log filter (`.hostlogs/dagster.log` if started via `just py-up`):
+
+```bash
+grep -E 'LOCATION_ERROR|Error loading repository location' .hostlogs/dagster.log
+```
+
+**Cause, proven 2026-08-13: the code server exits on a missed heartbeat.** The
+log says so outright:
+
+```
+dagster.code_server - WARNING - No heartbeat received in 45 seconds, shutting down
+```
+
+`dagster dev` launches the code server with `--heartbeat --heartbeat-timeout 45`,
+so it deliberately kills itself when the parent stops pinging it. That is a
+safety feature — it stops orphaned code servers accumulating — but it means any
+stall longer than the timeout takes the code server with it.
+
+**What stalls it here is the host freezing, not load.** The decisive evidence is
+a line from the daemon in the same window:
+
+```
+The following threads have not sent heartbeats in more than 1800 seconds:
+['SENSOR', 'SCHEDULER', 'QUEUED_RUN_COORDINATOR', 'ASSET']
+```
+
+**Thirty minutes**, across all four daemon threads at once. That is not slowness;
+that is the whole VM suspended and resumed — a laptop sleeping, or WSL2 being
+paused. Two of the four recorded shutdowns landed at 02:57 and 03:00, which fits.
+
+This **corrects an earlier note in this file** that blamed memory pressure. That
+was a guess, and it was wrong: memory pressure does not stop four independent
+threads for exactly a half-hour block, and no OOM kill was ever found. The host
+was at ~10 of 15 GiB, which looks tight enough to be a tempting explanation and
+is not the mechanism.
+
+**Which gRPC code you get tells you which repair to use:**
+
+| Code | Means | Fix |
+|---|---|---|
+| `UNKNOWN` | code server was relaunched; the webserver holds a stale handle | **reload** the code location |
+| `UNAVAILABLE` | nothing is listening — the code server died and stayed dead | **restart** `just py-down dagster && just py-up dagster` |
+
+A reload cannot fix `UNAVAILABLE`; there is no server to re-attach to. Confirm
+which case you are in by checking whether the code server process still exists —
+a leftover `<defunct>` python child in the group is the giveaway that it died:
+
+```bash
+pgrep -g "$(cat .hostlogs/dagster.pid)" -a | grep -E 'code-server|defunct'
+```
+
+**Raising `--heartbeat-timeout` will not help.** The stall was 30 minutes against
+a 45-second timeout. If the machine sleeps, expect to restart Dagster afterwards;
+that is cheaper than fighting it. The same freeze is worth suspecting for any
+other long-lived host process that appears to have broken overnight.
+
 ## Gotchas
 
 - **`just seed dagster` before DAG 3 or DAG 4.** They need seeded fixtures; the

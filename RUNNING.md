@@ -55,7 +55,8 @@ port anywhere.**
 | 8888 | Hatchet | engine REST API + dashboard |
 | 7233 | Temporal | engine gRPC |
 | 7077 | Hatchet | engine gRPC (container listens on 7070) |
-| 2746 | Argo | `argo-server` port-forward |
+| 2746 | Argo | `argo-server` port-forward (`just port-forwards`) |
+| 54322 | shared | in-cluster `bakeoff-postgres` port-forward (`just port-forwards`) — the cluster twin of 54321 |
 | 8000 | Conductor | server REST API (`/api`) — workers and `register.py` talk here |
 | 8127 | Conductor | UI (nginx inside the same container, on :5000) |
 
@@ -820,7 +821,7 @@ the live clusters and the upstream registries: node
 architectures, available StorageClasses and ingress controllers, arm64 manifests
 for every image the stack pulls, flytekit's `ImageSpec` platform-resolution logic,
 Argo's failed-workflow history, and the absence of both a bake-off backbone and
-Flyte's configured minio on the amd64 cluster.
+Flyte's configured minio.
 
 **Verified by deploying it (2026-08-03):** the §7c backbone is **live on the
 arm64 cluster** in namespace `orchestrators` — Postgres (50 GiB `oci-bv` PVC,
@@ -877,35 +878,33 @@ green DAG are **now fixed and verified against the local Postgres** (2026-08-03)
 
 Argo and Flyte are the two Kubernetes-only orchestrators. §8–§9 are written
 against a handful of shell variables so the **same commands work on any
-cluster** — the original instructions were EKS/Fargate-specific and silently
-assumed amd64 nodes, no usable StorageClass, and no ingress controller.
+cluster** — an earlier draft was specific to one provider and silently assumed
+amd64 nodes, no usable StorageClass, and no ingress controller.
 
 ### 7a. Pick a cluster
 
 `kubectl ctx` (or `kubectl config get-contexts`) lists what you have.
 
-Two clusters were used while writing this. They are referred to throughout by
-**CPU architecture, not by name**, because the architecture is what actually
-changes the commands:
+**One cluster is in use, and `$KCTX` must point at it.** Node architecture is
+load-bearing rather than cosmetic: it decides whether your task images run at all.
 
-| | amd64 cluster | arm64 cluster |
-|---|---|---|
-| Platform | EKS, Fargate | OCI, 2 worker nodes, Oracle Linux 8.10, cri-o 1.36 |
-| Node arch | `amd64` | **`arm64`** (aarch64) |
-| Default StorageClass | none usable (Fargate) | `oci-bv` (`WaitForFirstConsumer`), plus `oci` |
-| Ingress | none — port-forward only | Traefik (default class) + cert-manager |
-| Installed at first survey | Argo `v4.0.6` (ns `argo`), flyte-core `v1.16.7` (ns `flyte`) | nothing |
+| | the cluster |
+|---|---|
+| Platform | OCI, 2 worker nodes, Oracle Linux 8.10, cri-o 1.36 |
+| Node arch | **`arm64`** (aarch64) |
+| Default StorageClass | `oci-bv` (`WaitForFirstConsumer`), plus `oci` |
+| Ingress | Traefik (default class) + cert-manager |
 
 Export once per shell — or better, put these in `.envrc` (see `.envrc.example`,
 which is the committed template; `.envrc` itself is gitignored). **Every command
 below passes `--context "$KCTX"` explicitly** — never rely on the current
-context, since the whole point is that two clusters are in play:
+context, since this machine has other kube contexts that are out of scope here:
 
 ```bash
 export KCTX=my-arm64-cluster          # your kube context name
 export ORCH_NS=orchestrators          # namespace holding the shared backbone (§7c)
-export TARGET_ARCH=arm64              # or: amd64 — MUST match the nodes
-export STORAGE_CLASS=oci-bv           # "" on Fargate (falls back to emptyDir)
+export TARGET_ARCH=arm64              # MUST match the nodes; arm64 is the only cluster in use
+export STORAGE_CLASS=oci-bv           # "" if no dynamic provisioning (falls back to emptyDir)
 export INGRESS_CLASS=traefik          # ingress controller class, if you have one
 export INGRESS_ENABLED=false          # true only if something OUTSIDE the cluster must call in
 export CLUSTER_ISSUER=letsencrypt-prod
@@ -913,9 +912,8 @@ export BASE_DOMAIN=example.com        # YOUR domain — DNS you control (§7d)
 export K8S_REGISTRY=...               # a registry BOTH your build host and the cluster can reach
 ```
 
-Both installs track **latest** — no version pinning. The two clusters may
-therefore end up on different versions, which is fine for a bake-off of *current*
-capability. The one obligation that follows: `comparison.md` cites version
+Both installs track **latest** — no version pinning, which is fine for a bake-off
+of *current* capability. The one obligation that follows: `comparison.md` cites version
 numbers, so **record what you actually got** after installing (§8, §9c each show
 the one-liner).
 
@@ -941,7 +939,7 @@ the stack already does; there is exactly **one** trap.
 | **Mock-service images** | **no — built by you** | **build for `$TARGET_ARCH`** |
 
 Every "yes" row was verified with `podman manifest inspect`, not assumed — at the
-tags the amd64 cluster currently runs (`argoproj` `v4.0.6`, `flyteorg` `v1.16.7`) plus the
+tags of the earlier install (`argoproj` `v4.0.6`, `flyteorg` `v1.16.7`) plus the
 base images above. Both projects publish arm64 consistently, so `latest` is
 expected to be fine; if a pull ever fails on arm64, re-run the check:
 
@@ -974,13 +972,13 @@ The `flyte/` DAG files do **not** do this yet — see "Status / caveats".
 
 **Mock services.** `terraform/aws/scripts/build-push-mock-services.sh`
 hard-codes `--platform linux/arm64` (it was written for the arm64 K3s cluster).
-That is correct for the arm64 cluster and wrong for the amd64 one; parameterise it on
+That is correct for this cluster and wrong for an amd64 one; parameterise it on
 `$TARGET_ARCH` before using it for both.
 
 ### 7c. The in-cluster backbone (the step that was missing)
 
 **Neither Argo nor Flyte can complete a DAG without this.** It is the reason the
-only three bake-off workflows ever submitted to the amd64 cluster all failed on 2026-06-18
+the only three bake-off workflows ever submitted to the earlier install all failed on 2026-06-18
 while `hello-world` succeeded:
 
 ```
@@ -1173,6 +1171,21 @@ Postgres, **runs only on a fresh volume**. `deploy-backbone.sh` therefore reload
 the file before seeding, so it works on an existing volume too — the in-cluster
 equivalent of `just seed <runner>`.
 
+*Which* runners get onboarded is separate, and instance-specific: `init-runners.sh`
+reads `$BAKEOFF_RUNNERS`, set here from `postgres.runners` in
+`values-incluster.yaml` (`argo flyte`) and in compose to the 8 host-run tools.
+
+**This used to be hardcoded in `init-db.sql`, and it leaked** (fixed 2026-08-12).
+That file ended with `SELECT bootstrap_bakeoff('temporal'); … ('prefect');`, and
+both databases mount the same file — so the cluster got two host-run runners it
+will never execute. The reload above is what made it stick: `bakeoff-db.sh seed`
+re-runs the whole file to refresh the function, so **`just seed flyte` replanted
+`temporal_dag*` and `prefect_dag*` on the cluster every single time** (measured:
+one seed, both schema sets back). Deleting them did nothing; the next seed
+restored them. `init-db.sql` is now side-effect-free, which is what makes
+reloading it safe. Clean up strays with
+`./scripts/bakeoff-db.sh prune <runner> --from <local|cluster|neon>`.
+
 Both K8s implementations now honour the namespace, so nothing further is needed:
 
 - **Argo** — the `bakeoff-ns` workflow parameter (default `argo`) flows into a
@@ -1211,7 +1224,7 @@ point will be a red herring.
 
 ## 8. Argo Workflows (Kubernetes)
 
-Installed from the upstream manifest, not Helm. the amd64 cluster runs `v4.0.6`; **the arm64 one
+Installed from the upstream manifest, not Helm. An earlier install ran `v4.0.6`; **this one
 runs `v4.0.8`, installed 2026-08-03 and verified by a green DAG 3** (see §8
 Notes). New installs take latest.
 
@@ -1303,25 +1316,49 @@ kubectl --context "$KCTX" port-forward -n argo svc/argo-server 2746:2746
 # http://localhost:2746
 ```
 
-### Submitting workflows
+### Registering and submitting workflows
+
+All four DAGs are **`WorkflowTemplate`s** (changed 2026-08-12 — they used to be
+`kind: Workflow` with a `generateName:`, submitted directly). Register once:
 
 ```bash
-kubectl --context "$KCTX" create -n argo -f argo/dag1-csv-etl.yaml
-kubectl --context "$KCTX" create -n argo -f argo/dag2-api-fanout.yaml
-kubectl --context "$KCTX" create -n argo -f argo/dag3-payment.yaml
-
-# DAG 4 needs its three sub-workflow templates registered first
-kubectl --context "$KCTX" apply -n argo -f argo/templates/
-kubectl --context "$KCTX" create -n argo -f argo/dag4-order-fulfillment.yaml
+kubectl --context "$KCTX" apply -n argo \
+  -f argo/templates/ \
+  -f argo/dag1-csv-etl.yaml -f argo/dag2-api-fanout.yaml \
+  -f argo/dag3-payment.yaml -f argo/dag4-order-fulfillment.yaml
 ```
 
-Submitted workflows appear in the **Workflows** tab, not Workflow Templates.
-Watch one with `kubectl --context "$KCTX" -n argo get wf -w`.
+That puts **eight** entries in the Workflow Templates tab: the four DAGs
+(`csv-etl-pipeline`, `api-fanout`, `payment-processing`, `order-fulfillment`) and
+DAG 4's four sub-workflow templates. Before the change the tab showed only the
+latter four, which is why it looked unrelated to the bake-off.
+
+Then submit a run. The upstream way is `argo submit --from
+workflowtemplate/NAME`, which needs the `argo` CLI; `argo/submit.sh` generates
+the equivalent stub with kubectl only, like the rest of this section:
+
+```bash
+KCTX=$KCTX ./argo/submit.sh payment-processing
+KCTX=$KCTX ./argo/submit.sh payment-processing -p bakeoff-ns=argo -p input='{...}'
+```
+
+Runs appear in the **Workflows** tab. Watch one with
+`kubectl --context "$KCTX" -n argo get wf -w`.
+
+**A template's `spec.arguments` defaults resolve, but are not recorded.** A stub
+that passes nothing still gets the right `{{workflow.parameters.*}}` values —
+verified — yet the submitted Workflow object's own `spec.arguments` comes back
+**empty**, so `kubectl get wf -o yaml` cannot tell you what a run actually used.
+Pass `-p` explicitly when that matters.
+
+This is the **opposite** of the `templateRef` rule two notes below: a spec-level
+`workflowTemplateRef` honours the template's defaults, while a task-level
+`templateRef` inside DAG 4 ignores them and resolves against the caller. Same
+syntax family, inverted rule.
 
 ### Notes
 
-- The default executor is emissary (the only option in Argo v4+), compatible
-  with Fargate.
+- The default executor is emissary (the only option in Argo v4+).
 - HTTPS is off for port-forward convenience. Do not expose this without TLS.
 - Each DAG takes a `bakeoff-ns` parameter (default `argo`) that drives schema
   isolation; override with `-p bakeoff-ns=<runner>`. The sub-workflow
@@ -1331,6 +1368,42 @@ Watch one with `kubectl --context "$KCTX" -n argo get wf -w`.
 - `argo/scripts/*.py` are standalone copies of the inline step logic and are
   **not referenced by any YAML** (the manifests carry their source inline). They
   are kept in sync deliberately, so a change to a step means editing both.
+- **`retryPolicy: Always` cannot classify errors** (found and fixed 2026-08-12).
+  Argo retries on *pod failure*, and a pod that failed on purpose looks exactly
+  like a pod that hit a blip. DAG 3 had this twice:
+  - `handle-payment-failure` records the failed transaction and then
+    `sys.exit(1)`s deliberately, to fail the workflow — and got retried 1 + 3
+    times with backoff, re-printing the notification each time, before failing
+    anyway.
+  - Worse, `process-payment` exited **1 for all three** simulated outcomes, so a
+    declined card (non-retriable, a business decision) burned all 5 attempts
+    exactly like a gateway 5xx. DAG 3's entire retriable-vs-non-retriable
+    requirement was therefore untested in Argo. Note
+    `argo/scripts/process_payment.py` had `sys.exit(2)` with a
+    "non-retriable" comment all along — the inline YAML copy had drifted from
+    it, which is the sync risk in the note above, realised.
+
+  Fixed with the exit-code convention the standalone scripts already used —
+  **2 == non-retriable/terminal, 1 == retry me** — plus a predicate on both
+  steps:
+
+  ```yaml
+  retryStrategy:
+    limit: "5"
+    retryPolicy: Always
+    expression: 'lastRetry.exitCode != "2"'
+  ```
+
+  Use a *string* compare, not `asInt(lastRetry.exitCode)`: `exitCode` is `""` on
+  an Error (as opposed to Failed) node and `asInt("")` throws inside the
+  predicate — which would fail the retry decision itself, the same shape as the
+  Google Workflows defect where a TypeError inside a retry predicate replaced the
+  original error. Verified: a duplicate payment now runs
+  `handle-validation-failure(0)` once and the workflow fails in 31s, where it
+  previously logged `(0)`, `(1)`, `(2)`, `(3)`. The decline branch is
+  inspection-only — it fires on a 5% random roll — but the predicate itself is
+  what was empirically confirmed, and the decline path differs only by the
+  literal exit code.
 
 #### Status on the arm64 cluster (2026-08-03)
 
@@ -1409,10 +1482,10 @@ touches the DB.
 
 ## 9. Flyte (Kubernetes)
 
-Helm, `flyte-core` chart. Installed on the amd64 cluster at `v1.16.7`; new installs
+Helm, `flyte-core` chart. An earlier install ran `v1.16.7`; new installs
 take latest.
 
-`flyte-binary` bundles Postgres as a sidecar, which does not work on Fargate due
+`flyte-binary` bundles Postgres as a sidecar, which broke on the earlier install due
 to init-container ordering — hence `flyte-core` plus a standalone Postgres. On a
 cluster with real storage either would work, but stay on `flyte-core` so the two
 installs stay comparable.
@@ -1427,8 +1500,8 @@ cd flyte
 ./deploy-flyte.sh
 ```
 
-Knobs: `FLYTE_NS` (default `flyte`), `STORAGE_CLASS` (`""` → `emptyDir`, for
-Fargate), `IMAGE_PREFIX`, `CHART_VERSION` (default: latest).
+Knobs: `FLYTE_NS` (default `flyte`), `STORAGE_CLASS` (`""` → `emptyDir`, for a
+cluster with no dynamic provisioning), `IMAGE_PREFIX`, `CHART_VERSION` (default: latest).
 
 **Verified on the arm64 cluster: chart `flyte-core-v1.16.8`, all nine pods Running
 (2026-08-03), and **all four DAGs execute green** (2026-08-06)** — DAG 1's
@@ -1443,7 +1516,7 @@ not survive a task boundary.
 The script does four things, three of which the upstream chart does not:
 
 1. **Metadata Postgres** — Flyte's own DB, separate from the bake-off DB in §7c.
-   `flyte-binary` bundles one as a sidecar but breaks on Fargate init-container
+   `flyte-binary` bundles one as a sidecar but broke on that install's init-container
    ordering, so it is `flyte-core` plus a standalone Postgres. It creates **two**
    databases (`flyteadmin` and `datacatalog`) because that is what the chart's
    defaults expect — the older recorded command pointed both at `flyteadmin`.
@@ -1491,7 +1564,7 @@ silently accepted and ignored, and `helm template` emits no minio resources. Fly
 stores every task input, output, and offloaded literal there, so the install comes
 up entirely "Running" while being unable to execute a single workflow.
 
-That is precisely the state the amd64 cluster was left in: flyteadmin healthy for 46 days, the
+That is precisely the state an earlier install was left in: flyteadmin healthy for 46 days, the
 endpoint above pointing at a Service that does not exist, and
 `kubectl get flyteworkflows -A` returning `No resources found`. Nothing ever ran.
 
@@ -1519,7 +1592,6 @@ helm --kube-context "$KCTX" list -n flyte
 
 | Cluster | Chart | Note |
 |---|---|---|
-| amd64 cluster | `flyte-core-v1.16.7` | blob store dangling — has never run a workflow |
 | arm64 cluster | `flyte-core-v1.16.8` | minio deployed, bucket created, healthy |
 ### 9d. Task images, registration, and running
 
@@ -1593,11 +1665,26 @@ and the delete sticks. There is no delete-project API; archive is the route.
 Done on the arm64 cluster 2026-08-12; the commands are in `flyte/README.md`
 §"Why are there so many Flyte namespaces?".
 
-Two things that go with it: archiving hides the project (and its execution
-history, which is *not* deleted) from the console until you PUT the state back to
-`ACTIVE`; and the per-namespace prerequisites — the `ecr-bakeoff` pull secret and
-the `alias-backbone.sh` ExternalName Services — live in the old task namespace
-and must be recreated in the new one.
+Two things that go with it. **Archiving hides the project** — and its execution
+history, which is *not* deleted — from the console until you PUT the state back
+to `ACTIVE`. That is how 74 registrations came to look like they had vanished:
+the console showed the new `bakeoff` project with no workflows while everything
+sat in the archived `flytesnacks`.
+
+And **the per-namespace prerequisites live in the task namespace**, so a new
+project starts without them:
+
+- the `alias-backbone.sh` ExternalName Services, and
+- an **image-pull secret**. Flyte's `clusterresource-template` provisions only a
+  Namespace and a ResourceQuota, never credentials, so a fresh project namespace
+  cannot pull the task image. The launcher job in `flyte` still succeeds, so the
+  console reports a started execution while the task pod sits in
+  `ImagePullBackOff`. Since 2026-08-13 the cluster's `k8s-ecr-login-renew`
+  cronjob writes `k8s-ecr-login-renew-docker-secret` into every listed namespace
+  every 6 hours — **add the new namespace to its `targetNamespace` list and patch
+  that namespace's `default` ServiceAccount**; see `flyte/README.md`
+  §Operational notes. Pod specs are immutable, so fixing this after a pod exists
+  requires deleting the pod, not just the ServiceAccount.
 
 ### Accessing the UI
 
@@ -1618,7 +1705,8 @@ So the console loads, renders *"Select a project to get started"*, and lists
 nothing — its `GET /api/v1/projects` receives flyteconsole's own catch-all HTML
 with a 200 rather than JSON. Nothing reports an error. The natural readings are
 both wrong: it is not an empty install (flyteadmin had `flytesnacks`,
-`flyteexamples`, `flytetester` and 5+ executions the whole time) and it is not an
+`flyteexamples`, `flytetester` and 5+ executions the whole time — those three
+have since been archived in favour of `bakeoff`, §9f) and it is not an
 auth prompt (`useAuth: false` in `flyte-admin-base-config`; the console renders
 its "Login" link unconditionally).
 
@@ -1635,7 +1723,6 @@ none of this.
 
 ### Notes
 
-- Estimated Fargate cost for the metadata Postgres pod on the amd64 Fargate cluster: ~$9/month.
 - Credentials are hardcoded throughout. Evaluation-grade only.
 - Flyte creates `<project>-<domain>` namespaces on install — one per pair, and
   the chart's three default projects × three domains is why a stock install lands
@@ -1662,6 +1749,14 @@ including the seven defect classes found by running it, is in
    psql "$NEON_DATABASE_URL" -f shared-services/init-db.sql
    psql "$NEON_DATABASE_URL" -c "SELECT bootstrap_bakeoff('google_workflows');"
    ```
+   `init-db.sql` is inert as of 2026-08-12 — it defines the function and
+   onboards nothing, so the first command is safe to re-run. **Before that date
+   it also bootstrapped `temporal` and `prefect`,** so a Neon database
+   initialised with the old file may be carrying two empty stray schema sets
+   from exactly this command. Check with
+   `psql "$NEON_DATABASE_URL" -c "\dn"`; remove with
+   `./scripts/bakeoff-db.sh prune temporal --from neon` (it refuses if anything
+   ever ran there).
 
 **Deploy** — three steps the first time, because of a genuine cycle: Cloud Run
 validates its image at create time, the image cannot be pushed until Artifact
