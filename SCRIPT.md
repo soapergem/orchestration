@@ -1198,22 +1198,10 @@ Thank you — happy to take questions.
 
 ---
 
-### [SLIDE 43] Who I am — engineering
-
-*(no time budget — leave this up for the whole Q&A)*
+### [SLIDE 43] Who I am
 
 *Advance to this and leave it. It keeps your name and contact details on screen while
 people are deciding whether to follow up, which is the one moment they actually need them.*
-
----
-
-### [SLIDE 44] Who I am — real estate
-
-*(not for this talk)*
-
-*The Century 21 / REALTOR® version of the identity slide — almost certainly for a different
-deck. A workflow-orchestration talk ending on a real-estate licence number will land oddly.
-Either delete it here, or keep it and stop advancing at 42.*
 
 ---
 
