@@ -4,7 +4,7 @@ Amazon States Language (ASL) JSON per DAG, with the step bodies as Lambda
 functions. DAG 4 composes three sub-workflows, each its own state machine.
 
 **Status: all four DAGs verified end-to-end on real AWS** (2026-08-12,
-`us-east-1`, account `602436928406`), against Neon Postgres and the mock
+`us-east-1`), against Neon Postgres and the mock
 services running on the arm64 OCI cluster. An earlier campaign on 2026-07-14 had
 run all four as well; this is the first one with its evidence written down,
 which is why this file exists. `CLAUDE.md` described Step Functions as "still
@@ -48,19 +48,26 @@ in the execution input.
 the state (see Findings). These commands read from AWS directly and need
 nothing but credentials:
 
+Nothing below hardcodes an account id or a domain — both come from the
+environment, so these are copy-pasteable on any account. `BASE_DOMAIN` is the
+public domain your mock services are exposed on; it lives in `.envrc`
+(gitignored, see `.envrc.example`).
+
 ```bash
 SM() { aws stepfunctions list-state-machines \
   --query "stateMachines[?name=='orch-bakeoff-$1'].stateMachineArn" --output text; }
+BUCKET=$(terraform -chdir=../terraform/aws output -raw dag1_bucket)
+FIXTURE="https://orch-fixture.${BASE_DOMAIN:?set BASE_DOMAIN, e.g. in .envrc}"
 
 # DAG 1 -- ZIP is already seeded in the bucket
 aws stepfunctions start-execution --state-machine-arn "$(SM dag1-csv-etl)" \
   --name "dag1-$(date +%s)" \
-  --input '{"s3_bucket":"orch-bakeoff-dag1-602436928406","zip_key":"input/sample-data.zip"}'
+  --input "{\"s3_bucket\":\"$BUCKET\",\"zip_key\":\"input/sample-data.zip\"}"
 
 # DAG 2 -- note BOTH the public host AND the base= override; see Findings
 aws stepfunctions start-execution --state-machine-arn "$(SM dag2-api-fanout)" \
   --name "dag2-$(date +%s)" \
-  --input '{"url":"https://orch-fixture.gemovationlabs.com/books?per_page=5&base=https://orch-fixture.gemovationlabs.com","request_config":{}}'
+  --input "{\"url\":\"$FIXTURE/books?per_page=5&base=$FIXTURE\",\"request_config\":{}}"
 
 # DAG 3 -- payment_id doubles as the idempotency key, so vary it per run
 aws stepfunctions start-execution --state-machine-arn "$(SM dag3-payment)" \
@@ -157,7 +164,7 @@ the cluster. Every one of the 5 map iterations died with:
 NameResolutionError: Failed to resolve 'fixture-service'
 ```
 
-The fix is `&base=https://orch-fixture.gemovationlabs.com` — the *public* host,
+The fix is `&base=https://orch-fixture.<your-domain>` — the *public* host,
 because the consumer is outside the cluster entirely. Same run went 5/5 with 0
 failures immediately after. Worth noting the rule generalises to "whatever can
 reach the detail URLs", not "wherever the collection was fetched".
@@ -261,7 +268,7 @@ Fresh runs, all four green:
 
 - **DAG 1** `dag1-fresh-130841` **SUCCEEDED** — 3 CSVs unzipped from S3 and
   loaded, joined into `dag1_etl.combined_report` (10 rows), Parquet written to
-  `s3://orch-bakeoff-dag1-602436928406/output/combined_report.parquet` (3,644 B,
+  `s3://<dag1-bucket>/output/combined_report.parquet` (3,644 B,
   timestamp confirms it was rewritten).
 - **DAG 2** `dag2-base-131934` **SUCCEEDED** — suspended on the task token,
   resumed by callback-fetch-service, fanned out 5 items, **5 successful / 0

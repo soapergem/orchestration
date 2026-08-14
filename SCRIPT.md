@@ -1,1226 +1,866 @@
 # Orchest-Rated — Presentation Script
 
-Spoken script for the deck. **The deck is `presentation/slides/slides.md`** (mkslides →
-reveal.js; `just slides-serve` on :8084, `just slides-build`). Slides stay minimal
-bullets; this file is the longer narration read alongside them. `[SLIDE n]` cues match
-the slide order in `slides.md` exactly.
+**This is the talk as actually delivered on 2026-08-13, cleaned up.** It replaces the
+pre-written script: where the live version was better — the ApartmentIQ anecdote, the
+assembly analogy, the Airflow rant — the live version won. Where delivery was loose or
+rushed, the wording is tightened using the old draft's precision.
 
-`OrchestRated.pptx` is **superseded** — its eight slides have been merged into
-`slides.md` and it is kept only as history.
+The deck is `presentation/slides/slides.md` (mkslides → reveal.js; `just slides-serve` on
+:8084). `[SLIDE n]` cues match its order exactly.
 
-## Time budget — 45 minutes total
+**Recorded timings are from `transcript.m4a`**, so they tell you your real pace rather than a
+target. The body ran **00:00–45:51**; Q&A was interleaved around 39:25–42:30 and then ran from
+46:55 to the end. Q&A is omitted here, except two answers good enough to fold into the body
+(flagged where they appear).
 
-| Part | Content | Target |
+| Part | Slides | Recorded |
 |---|---|---|
-| 1 | Concepts (slides 1–14) | **13.25 min** |
-| 2 | The twelve tools, in five families (slides 15–34) | **14.75 min** |
-| 3 | Scoring and results | **2.25 min** |
-| 4 | What we learned by running them | **2.25 min** |
-| 5 | Recommendation | **3 min** |
-| — | Q&A / slack | **9.5 min** |
+| 1 Concepts | 1–14 | 00:00 – 09:19 |
+| 2 The bake-off and the twelve | 15–34 | 09:19 – 35:10 |
+| 3 Scoring | 35–37 | 35:10 – 37:15 |
+| 4 What running them taught us | 38–39 | 37:15 – 39:25 |
+| 5 Recommendation | 40–44 | 42:30 – 45:51 |
 
-Speaking pace is roughly 140 words per minute, so the per-slide targets below are also
-word budgets. If a section runs long in rehearsal, cut sentences rather than speeding up.
-
-**28 of the 45 minutes are Parts 1 and 2.** That is the real shape of this talk: concepts
-and the survey. Parts 3–5 are deliberately lean because the per-tool cards now carry the
-scores, so Part 3 only has to do the side-by-side table and the movers.
-
-**If rehearsal runs long, cut in this order.** Each is self-contained; nothing downstream
-depends on it.
-
-| Cut | Saves | Why it's safe |
-|---|---|---|
-| **Slide 14** control plane / data plane | 0.5 | Fold two sentences into slide 29 (family 4) instead |
-| **Slide 13** what you can't do | 0.5 | The cycle point is a nice-to-have |
-| **Slide 10** pull the control flow out | 0.75 | Overlaps slide 3's six jobs |
-| **Slide 2** what is workflow orchestration | 0.75 | Overlaps slide 3 |
-| Compress **Luigi, Hatchet, Kestra, Step Functions** to ~30s each | 1.0 | The four least contested cards |
-
-That recovers 3.5 minutes. **Protect Temporal (24), Conductor (27), Flyte (31) and Google
-Workflows (34)** — they carry the findings that only exist because we ran the code.
-
-## Diagram assets
-
-Editable Excalidraw scenes in the **Workflow Orchestration Deck** collection, all four
-exported and in the deck. Labels use the bake-off's own workflows rather than A/B/C, so
-the shape slides double as a preview of the four DAGs.
-
-| Scene | Exported to | Slide |
-|---|---|---|
-| [Time and Prayers (problem)](https://app.excalidraw.com/s/AgOHaUIPH5l/9LF4rKU94mg) | `images/time-and-prayers.png` | 8 |
-| [One Edge Per Item (answer)](https://app.excalidraw.com/s/AgOHaUIPH5l/2qNWEzqG2ff) | `images/one-edge-per-item.png` | 11 |
-| [DAG Shapes — The Four Patterns](https://app.excalidraw.com/s/AgOHaUIPH5l/ARGsZHdIcFk) | `images/dag-shapes.png` | 12 |
-| [DAG Shapes — What You Can't Do](https://app.excalidraw.com/s/AgOHaUIPH5l/513390HyVjC) | `images/dag-invalid.png` | 13 |
-
-**Re-exporting after a scene edit** is automated — no manual clicking. Open the scene in
-Chrome, hide the UI with `.layer-ui__wrapper { display: none }`, press `Shift+1` to
-zoom-to-fit, screenshot to a file, then run
-`scratchpad/crop.py <raw> <dest> 265 1922 24` to strip the 265px workspace sidebar and
-trim white margins.
-
-**Caution: the Excalidraw MCP's own screenshot is not a faithful preview of text width.**
-It measures with different metrics than Excalifont, so text that looks fine there can
-render clipped mid-word in the real app. Give standalone text generous width.
-
-The problem/answer split is deliberate: slide 8 must not show slide 11's answer. A fifth
-scene, *Time and Prayers vs. One Graph*, holds both panels combined and is now redundant —
-delete it when convenient.
-
-The six original PNGs (`simple`, `parallel`, `list`, `choice`, `loopback`, `sneaky`) are
-superseded by the two composites and no longer referenced.
-
-## Deck conventions
-
-Per-tool cards (slides 19–34) all follow one shape, so the audience learns to read them
-once:
-
-1. **Metadata strip** — `Written in <engine language> · You write <authoring languages> ·
-   Score n / 100`
-2. **Syntax** — 5–8 real lines from this repo's implementation, chosen to show the
-   *authoring model*
-3. **Strengths / Weaknesses** — three bullets each, borderless two-column table
-
-Conductor (27) and Kestra (28) are the two exceptions: they carry **two** code blocks each,
-to show how Python hooks into a definition that isn't Python, so their tables are trimmed to
-two bullets a side to fit. The dropped points are in the narration.
-
-**Defect counts are deliberately absent from the cards.** They measure *our* implementation
-cost, not tool quality — Luigi produced 6 and scores lowest, Kestra 18 and scores 63,
-Temporal 0. Presented on a "Weaknesses" column they read as "this tool is buggy," which is
-indefensible. They belong in Part 4, where the caveat sits beside them.
+**One standing decision baked in:** the live version credited Claude eight separate times.
+That is consolidated into a single disclaimer on slide 1, and everything after it is stated in
+your own voice. The work is yours; the tooling note only needs saying once.
 
 ---
 
 ## Part 1 — Concepts
 
-*Target: 13.25 minutes. Slide numbers match `presentation/slides/slides.md`.*
+*Recorded 00:00 – 09:19 (~9 minutes)*
 
-### [SLIDE 1] Orchest-Rated — Comparing Modern Workflow Orchestration Engines
+### [SLIDE 1] Orchest-Rated
 
-*(0.75 min)*
+*(recorded 00:01 – 00:50)*
 
-We're looking at workflow orchestration today. Three things: what these tools actually
-do and how that's different from writing a script, a survey of twelve specific
-orchestrators, and a recommendation.
+Tonight we're looking at modern workflow orchestration. Quick show of hands — who already
+knows what workflow orchestration is? Good, most of the room.
 
-The survey isn't a documentation review. We built the same four workflows in all twelve
-tools, deployed them, and ran them until they passed. So the comparison is backed by
-code that actually executed, and I'll tell you where running them changed our minds.
+Two disclaimers before I start. First, I made heavy use of agentic tooling — Claude Code —
+while building and comparing these, because it accelerates this kind of research enormously.
+I'll not keep flagging it; assume it's there throughout. Second, I've been playing with these
+tools for weeks and I still wouldn't claim deep expertise in any one of them. So if you have a
+very specific question — "how do I do this particular thing in Prefect?" — the answer may well
+be "I don't know." Ask anyway.
 
 ---
 
 ### [SLIDE 2] What is workflow orchestration?
 
-*(0.75 min)*
+*(recorded 00:50 – 01:30)*
 
-Workflow orchestration is the automated coordination of interdependent tasks —
-enforcing the order they run in, holding the state between them, handling their
-failures, and recording what happened.
+I'd define it as the automated coordination of interdependent tasks.
 
-Most of these tools include a scheduler; cron-style, event, and API triggers are
-standard, and several are primarily used that way. But scheduling is about *starting*
-work. Orchestration is about everything that happens after it starts — which is the
-part you'd otherwise write yourself.
+Most of you have probably, in some role or another, written cron jobs to run something in the
+background, or used a tool like Celery for background work. This is the same territory, and
+it's particularly useful for data pipelines, ETL, and any repeatable flow where a predictable
+set of steps has to happen on some cadence.
 
-Workflows are usually modeled as a DAG, a directed acyclic graph. I'll come back to
-what that means — and to the fact that the highest-scoring tool here doesn't make you
-declare one at all.
+These things are generally modelled as a DAG — a directed acyclic graph. More on that shortly.
 
 ---
 
 ### [SLIDE 3] What does an orchestrator do?
 
-*(1.25 min — keep brisk; the next several slides make all six concrete)*
+*(recorded 01:30 – 02:04)*
 
-Whatever else they disagree about, all twelve do the same six things.
+Six things.
 
-**Enforce order** — you declare that C needs A and B; the engine works out what's
-runnable and when. You never write the sequencing.
+It **enforces order** — task A runs before task B, and you don't write the sequencing. It
+**remembers where each run got to**. It has **error handling and retry logic** built in. It
+handles **parallel branches**, so multiple tasks run concurrently. It **records history**, so
+you have an audit trail. And in most of the modern ones, it can **suspend and resume** — call
+out asynchronously to an external service and wait for that service to call back.
 
-**Remember where each run got to** — the engine persists that, and
-persistence is what makes everything else on this list possible.
-
-**Handle failures and retries** — backoff, jitter, timeouts, and error
-*classification*: a declined card should fail immediately, a gateway 503 should retry
-five times.
-
-**Coordinate concurrency** — run independent steps in parallel, fan out over a
-collection you can't size until runtime, and cap that fan-out.
-
-**Record history** — a graph of the run with per-step status, timings, and in the good
-ones the actual input and output of every step. It comes from the engine, so you get it
-on workflows you didn't write.
-
-**Suspend and resume** — hold a run while something outside it happens, without keeping
-a process open. Some of these can wait a year.
-
-Two of those six are where the twelve differ most: remembering where a run got to, and waiting.
+Not all of them do that last one. Many do, and it's one of the places they differ most.
 
 ---
 
 ### [SLIDE 4] Isn't that just programming?
 
-*(1.25 min)*
+*(recorded 02:04 – 02:40)*
 
-Let me put the hardest objection up front, because it's the one I'd raise.
+So you might reasonably ask: isn't that just programming? We have `if`/`else`. We have
+`try`/`except`. Install a library like `tenacity` and you have retries with exponential
+backoff in a decorator.
 
-> *"Isn't that just programming? My language already has `if`. It has `for`, it has
-> `try`/`except`. And retries are a decorator — `@retry(wait=wait_exponential(...))` and
-> I'm done. You've just described control flow. I already have control flow."*
-
-And the honest answer is: **yes. It is programming.** I'm not going to pretend
-otherwise, and the best tools here don't either — Temporal's entire pitch is "write
-ordinary code," and Prefect's is "your workflow should just be Python." The tools that
-score highest in this comparison are the ones that look *most* like plain programming,
-not least.
-
-The `tenacity` example is worth taking seriously, because it's the strongest form of the
-objection. That decorator genuinely gives you retries with exponential backoff in one
-line. What it gives you is retries *inside one process*: the attempt count lives in a
-local variable, nothing outside the process can see you're on attempt four, and if the
-process dies the attempts die with it. It also can't tell a declined card from a gateway
-503 unless you write that logic yourself. It's a real answer to "how do I retry," and no
-answer at all to "what is the state of this run."
+And yes. It is. But there's a lot that an orchestrator does on top of that, and by the end of
+tonight I hope to leave you convinced they're worth reaching for as you productionise code.
 
 ---
 
 ### [SLIDE 5] Yes, but…
 
-*(1.25 min)*
+*(recorded 02:40 – 03:11)*
 
-So the question isn't whether it's programming. It's what happens to your control flow
-in four specific situations.
+Because as you're writing tasks: what happens if the process dies halfway through? Do you
+start again from the beginning? Well — you could log things. How much depth do you want to go
+to with that? How do you know which step it's on, if it's a ten-step process?
 
-**One: the process dies.** Your `if` lives in a stack frame, on one machine, for as long
-as that process lives. Kill it and nothing knows which branch you took, how many retries
-you'd done, or which iteration you were on.
+There are always multiple ways to skin a cat. But here's the framing I'd offer.
 
-**Two: somebody else needs to see it.** Your `if` is invisible to anyone without a
-debugger attached to a live process. Three weeks later, "which path did order 12345
-take?" has no answer — and that's for *one* execution. Now make it ten thousand
-executions a night and ask which ones took the unusual branch.
-
-**Three: the wait is long.** You cannot hold a stack frame open for three days while a
-manager gets around to approving something.
-
-**Four — and this is the one I'd actually lead with: the steps depend on each other.** In
-a program, the connection between two steps is a side effect of the order you typed them
-in. `report = transform(rows)` creates a dependency purely because you happened to use
-`rows`. That edge is completely real, and it is written down *nowhere* — it exists as a
-variable in a stack frame and as an accident of line ordering. So nothing can draw it,
-nothing can resume into it, and nothing can tell you what else was waiting on it.
-
-With three steps in a line, that costs you nothing. With thirty, "what is allowed to run
-right now?" stops being obvious and becomes a computation — and when step twelve fails,
-"what is safe to re-run?" is a question about the *graph*, which your `try`/`except`
-cannot answer, because the exception has no idea the graph exists.
+**You could write all of your code in assembly. Why not just use Python?** Similarly, you
+could write plenty of code that does all of this task orchestration yourself — or you could
+use paradigms that other people have already put a great deal of thought into.
 
 ---
 
 ### [SLIDE 6] So what do people do? — one option: the "do everything" script
 
-*(1.25 min)*
+*(recorded 03:11 – 04:12)*
 
-In practice people build one of two things. Here's the first.
+There are really two things people build instead. Here's the first: a single lovely file named
+something like that, which you just run, and which transforms some data and lands it in S3 or
+a database.
 
-**The massive "do everything" script, on a schedule.** You know this file. It's called
-`etl - Copy (2).py`. Every step in one process, all the coupling implicit but real. Easy
-to read, everything in one place — genuinely a virtue. Then three things happen to it.
+The advantage is genuine — it's easy to read. It's easy to understand what it's doing.
 
-*Step three of ten fails.* The process dies, so you re-run from the top, and now you have
-to ask whether steps one and two are safe to run twice. If step two charged a card, they
-aren't. And the expensive version isn't a failure at all — it's step three *hanging*,
-because nothing had a timeout, and nobody noticing for six hours.
-
-*You need to scale it.* One process on one machine is your ceiling. To go wider you
-either thread it — and now you're writing coordination code — or you split the file, at
-which point you've stopped having a script and started having the second option.
-
-*You need a pause between steps six and seven.* Somebody has to approve something, or an
-external system has to call you back. There is no version of a single script that handles
-this well. You either block a process for three days, or you cut the file in half and glue
-the halves together with a database flag and a webhook — which, again, is the second
-option.
+But all the durability and auditing aspects are where an orchestrator becomes your best
+friend. What happens when you need to run this same script ten thousand times a day? What
+happens when you need to pause between two steps for an asynchronous process? How much of that
+do you want to roll yourself?
 
 ---
 
 ### [SLIDE 7] The do-it-yourself pitfall
 
-*(0.75 min)*
+*(recorded 04:12 – 04:35)*
 
-And notice where that script ends up. When it hurts, you fix it — and the fixes are
-always the same fixes. Backoff. Then jitter, because all your workers backed off in
-lockstep and hit the service again simultaneously. Then a table tracking which steps
-completed, so re-runs can skip them. Then timeouts. Then a concurrency cap. Then
-alerting. Then somebody builds a little admin page so whoever is on call at 3am isn't
-grepping logs.
+And the more you commit to doing it yourself, the more the list grows. Okay, I can do retries.
+I can add backoff. I can add exponential jitter. I can create a Postgres table and track where
+the state is. I can do all of these things.
 
-That list is a workflow orchestrator. You've built one — undocumented, coupled to your
-business logic, with exactly one user.
-
-The argument was never that scripts don't work. It's that the requirements which push you
-past a script are *generic* requirements, and generic requirements are worth buying
-rather than building.
+Congratulations — you've just built yourself an orchestrator.
 
 ---
 
 ### [SLIDE 8] Another option: scheduling independent tasks
 
-*(2 min)*
+*(recorded 04:35 – 06:00)*
 
-*Slide: `images/time-and-prayers.png`.*
+The second thing people build is one I've seen professionally, and I'll use a real example.
 
-So here's the second thing people build, and it's far more common — and far more
-interesting, because it *looks* like a decoupled architecture. **Separate tasks,
-connected by time and prayers.**
+I'm actually leaving a job this week. At the job I'm leaving, one of the things we do is scrape
+the web for US apartment data and transform that into a usable dataset. So there are processes
+that go out and scrape many thousands of sites, and those are scheduled in a background job
+runner to run at midnight. Then there's a processing job that has to act on that data, and
+that's all scheduled for 4am.
 
-Here's the pattern. Task A runs at midnight and fans out over ten thousand data points.
-Task B runs at 4am and fans out over the same ten thousand — one B for each A. B for item
-4,271 needs A for item 4,271 to have succeeded.
+Which is the caption on this slide: **they're connected by time and prayers.** We just trust
+that the data will show up at the right time, and then move on to the second thing.
 
-So there is not one dependency here. There are **ten thousand** of them, one per item. And
-every single one is expressed the same way: **4am.** Nobody wrote "B depends on A."
-Somebody wrote a timestamp and a four-hour buffer, and that buffer is a guess about how
-long A takes.
-
-Watch what that actually costs:
-
-- If A failed for some item, B for that item runs anyway, on missing or stale input. And
-  it doesn't necessarily crash — it quietly produces a wrong answer for that one item.
-- So you don't get a failure. You get nine thousand nine hundred and ninety-eight correct
-  rows and two wrong ones, sitting in the same table, with nothing marking which is which.
-- If A simply runs long, it's worse, because *which* items hadn't finished is arbitrary. A
-  different couple of hundred every night.
-- And at 9am, when the number is wrong: was it A, was it B, and **which of the ten
-  thousand?** Two job runs, two log streams, and no shared identifier per item.
-
-The fix everybody applies is to move B to 5am — buying correctness with wall-clock time.
-It works until it doesn't.
-
-And note precisely what a job queue does and doesn't give you here, because this is where
-Celery gets unfairly blamed. Celery is genuinely good at the fan-out: run Task A across
-ten thousand items with retries, backoff, and a concurrency cap. It has nothing whatsoever
-to say about the relationship between A-for-item-N and B-for-item-N. And ten thousand
-instances of that relationship were exactly the part you needed. They live in two crontab
-lines and an assumption. **A task queue is the data plane without the control plane.**
+In the happy path that's fine — data loads, and later it processes. But if the load fails, the
+processing runs on it anyway and doesn't work. And if the load is merely still *running*, same
+outcome. Nobody finds out until somebody looks at the result.
 
 ---
 
 ### [SLIDE 9] There's a better way
 
-*(0.5 min)*
+*(recorded 06:00 – 06:14)*
 
-So here's the framing, and it's the whole thesis of this section.
+Whereas with workflow orchestration, there's a better way.
 
-We all know how to write tasks. That was never the hard part, and nobody is selling you
-that. Reliably gluing them together is the hard part.
-
-**Your task code and your scripts are the nodes in the graph. Workflow orchestration
-provides the edges.** That's the product: somewhere for the edges to live — declared,
-persisted, and inspectable — instead of implied by statement order inside a process that
-may not survive the afternoon.
+Think of the actual code you're writing — the imperative commands that do something — as the
+**nodes** in the graph. The workflow orchestrator is what provides the **edges**. It's the glue
+between the tasks.
 
 ---
 
 ### [SLIDE 10] Pull the control flow out
 
-*(0.75 min)*
+*(recorded 06:14 – 06:50)*
 
-So what does *providing the edges* actually look like in practice? This.
+So what you do is pull the control flow out of your code. All the `if`/`else` logic, the `for`
+loops, everything else — those get expressed as workflow definitions instead. The syntax varies
+by tool, and we'll see a lot of syntax tonight.
 
-Your `if`/`else` becomes a **choice** state. Your threads become a **parallel** state.
-Your `for` loop over a collection becomes a **map** state. Your retry decorator becomes a
-**retry policy** attached to the step.
-
-The logic is identical. What changes is *who knows about it*. A choice state is a node in
-a graph that the engine can show you, resume into, and tell you which way it went at 3am
-three weeks ago. An `if` is a line of code that has already happened and left no trace.
-
-That's the actual trade. You give up a little expressiveness, and you get your control
-flow out of a single process and into something durable and inspectable.
-
-*Callback to plant here — it pays off twice later. In Part 2, Flyte is the tool where this
-intuition betrays you: a `@workflow` body looks like a program, but its edges come only
-from data dependencies, so statement order implies nothing. And Luigi is the same problem
-inverted — its branching and retries are real, but they live inside task bodies where the
-orchestrator cannot see them, so none of them appear in the graph.*
+Same logic you'd be writing in a script. The difference is that now the workflow engine can
+*see* what's happening, and coordinate the dependencies itself.
 
 ---
 
 ### [SLIDE 11] Fixing the previous example
 
-*(1 min)*
+*(recorded 06:50 – 07:14)*
 
-*Slide: `images/one-edge-per-item.png`.*
+Which fixes the example I just gave. Instead of running a batch of ten thousand jobs on a cron
+schedule, and then another batch later and hoping, you now have a workflow with two tasks — A
+and B, load and process — and you run ten thousand of *those*.
 
-So back to midnight and 4am, with the edges made explicit.
-
-An orchestrator makes each pairing an edge. B for an item cannot start until A for that
-item succeeded. So the failure of item 4,271 blocks exactly one thing, and it blocks it
-**visibly** — a task sitting in a blocked state with a name on it, instead of one silently
-corrupted row. Nothing wrong gets published. And you retry item 4,271 by itself, not the
-4am job.
-
-Now notice what an orchestrator does *not* do here, because I had this wrong myself at
-first: it does **not** make all ten thousand B's wait for the slowest A. There's no global
-barrier, because the dependency was never global — it was per item. Item 1 goes straight
-through while item 9,998 is still waiting. **That is where these tools stop being tidier
-and start being load-bearing.**
+You don't need to time them at all. Each pair runs as soon as it's able to.
 
 ---
 
 ### [SLIDE 12] Directed Acyclic Graphs
 
-*(0.75 min)*
+*(recorded 07:14 – 08:17)*
 
-*Slide: `images/dag-shapes.png`.*
+A little on directed acyclic graphs. The idea is simple: there's a single direction to the
+graph — I've drawn these all left to right — and it's acyclic, meaning the steps don't cycle
+back on each other. They can branch out and branch back in.
 
-Quick vocabulary, since I promised to come back to it. **Directed** means edges have a
-direction: A runs, then B. **Acyclic** means no cycles.
+Bottom left is the interesting one: you unzip an archive containing hundreds of CSV files, fan
+out to a hundred workers each processing one, and then coalesce at the end into a SQL command
+that transforms the result.
 
-Four shapes cover most of what you'll build, and you'll see all four again in the next
-section.
+And you can have **choice states** — the blue diamond. That's `if` logic. You're processing an
+online order, and if it's over a certain amount you pause for approval; if not you go straight
+through.
 
-A **straight line** — extract, transform, load.
-
-**Fan-out and fan-in** — validate an order, then reserve inventory and score fraud
-concurrently, and the step that confirms waits for both.
-
-**Fan-out over a list**, where the width is decided at runtime. You don't know if the ZIP
-has three CSVs or three hundred. A real dividing line: some of these tools can size a
-fan-out dynamically but can't introduce a new *kind* of step, and two can't do it at all.
-
-And a **conditional branch**. In our order workflow that's "is this over five hundred
-dollars, and does it therefore need a manager's approval."
+DAGs are a very expressive way of decomposing what you're already doing in code.
 
 ---
 
 ### [SLIDE 13] What you can't do
 
-*(0.5 min)*
+*(recorded 08:17 – 08:35)*
 
-*Slide: `images/dag-invalid.png`.*
+What you can't do is create cycles. Task B can't refer back to task A. And the second panel is
+the same thing, just sneakier — spread across four steps so it's harder to spot.
 
-What the graph can't contain is a cycle. The obvious version is two adjacent steps
-pointing at each other — load waits for validate, validate waits for load, so neither can
-ever start.
-
-The second panel is the same mistake and it's the one that actually happens: four steps in
-a line, a skip-ahead edge, and one edge running backwards. Publish depends on fetch, and
-fetch depends on publish. Nothing about that is visible from any single step — you only
-see it looking at the whole graph, which is one of the quieter arguments for having a tool
-that draws the graph for you.
-
-But "acyclic" doesn't mean you can't repeat work. Retries, `DO_WHILE` loops, and recursive
-sub-workflows all give you repetition without a cycle in the dependency graph. The
-constraint is on the graph, not on the behavior.
+Incidentally, you *can* have the end of one DAG launch another DAG, which breaks the spirit of
+it. But the DAG itself has to be acyclic.
 
 ---
 
 ### [SLIDE 14] Control plane / data plane
 
-*(0.5 min)*
+*(recorded 08:35 – 09:00)*
 
-One last piece of vocabulary, because it explains why the twelve differ as much as they
-do.
+And this separates two concepts that are worth naming, because they come up repeatedly tonight.
 
-Almost every one splits in two. The **control plane** — variously the scheduler, the
-coordinator, or the decider — holds workflow state, works out which steps are now
-eligible, and enqueues them. It does not run your code. The **data plane** is where your
-code runs: workers, containers, pods, Lambdas.
+The **control plane** is the edges of the graph — the thing describing the state and how work
+flows through the system. The **data plane** is your code: the thing actually running.
 
-The interesting variation is *how* those two connect. Some tools have long-lived workers
-that poll for work. Some spin up an ephemeral container per step. Two of them have no data
-plane at all, and just call HTTP services you deployed yourself. That single design choice
-drives dependency isolation, scaling, cost, and how hard the thing is to operate — which
-is most of what the next section is about.
-
+Most of these orchestrators have a centralised controller or scheduler plus a set of worker
+nodes. Not all, but most. And the question that follows is who hosts the controller and the
+workers — is it managed, are you paying a cloud subscription, or is it self-hosted? That single
+question sorts the twelve more than any feature does.
 ---
 
-## Part 2 — The Twelve Tools
+## Part 2 — The Bake-Off and the Twelve
 
-*Target: 14.75 minutes. Twelve tool cards at roughly 45 seconds each — read these as
-written; there is no room to elaborate. If you need to reclaim time, the four tools to
-compress are Luigi, Hatchet, Kestra and Step Functions; the four worth protecting are
-Temporal, Conductor, Flyte and Google Workflows.*
+*Recorded 09:19 – 35:10 (~26 minutes). This is the bulk of the talk. Live you said you'd
+"speed run" it and invited questions throughout, which worked — keep that.*
 
 ### [SLIDE 15] The 12-tool bake-off
 
-*(0.75 min)*
+*(recorded 08:50 – 09:30)*
 
-*Slide: the logo wall. Don't read twelve names aloud — the grid does that, and each gets
-its own slide in a moment.*
+I looked at twelve different workflow orchestrators for this, and I'll guarantee you up front
+this is not comprehensive. Every week I do a search and there's another one. So apologies if I
+haven't covered your favourite tonight.
 
-Here's the field. Twelve orchestrators, and we implemented the same four workflows in
-every one — independently, in each tool's own idiomatic style, no shared code — then
-deployed and ran them until they passed.
-
-That last part is what makes this worth your time. Documentation tells you what a tool
-claims; running the same four workflows tells you what it costs. Every single one of the
-twelve had defects in code that looked correct before it was executed.
+One other disclosure: I said *modern* workflow orchestrators, and that's a little bit of a lie
+in the case of Luigi. That one is in maintenance mode now, so it isn't really honest to call it
+modern — but I used it in a previous gig, so I've included it anyway.
 
 ---
 
 ### [SLIDE 16] The four benchmark DAGs
 
-*(1 min)*
+*(recorded 09:30 – 10:50)*
 
-**One — CSV ETL.** Unzip an archive, load each CSV into Postgres in parallel, SQL
-transform across the loaded tables, write Parquet. Dynamic fan-out, retries, database
-integration.
+To compare them, I came up with four toy-box DAGs that I could exercise across all twelve, and
+then found metrics to rank them on.
 
-**Two — API fan-out with async callback.** Hand a fetch to an external service, *suspend
-the workflow*, resume when that service calls back, branch on the results, fan out thirty
-detail requests, combine. Tests suspend and resume driven from outside.
+**The first is deliberately simple** — a zip file containing CSVs. Unzip it, load the contents
+into Postgres tables, run a transform, save the result as Parquet. A very classical data
+engineering workflow.
 
-**Three — payment processing.** Validate, call a deliberately flaky gateway with backoff
-and jitter, update the database idempotently, send a best-effort receipt. Tests
-retriable-versus-terminal classification: a decline must fail immediately, a timeout must
-retry, and a failed receipt email must not fail the payment.
+**The second is an API fan-out**, and this is where the suspend-and-resume story gets tested. I
+wrote a service you call out to with a token; the workflow then *pauses*; you trigger that
+service manually with the same token; and it calls back to the orchestrator to resume where it
+left off. Then it makes a batch of follow-up requests and combines them.
 
-**Four — order fulfillment with human approval and saga compensation.** Reserve inventory,
-suspend for a manager's approval, ship. And if the manager rejects, or never answers, or
-shipping fails — unwind it. Release the reservation, cancel the order, notify the
-customer. Three sub-workflows. This is the hard one, and it's where the tools separate.
+**The third is a bite-size payment processing workflow**, where I intentionally made the
+services flaky and full of failures, so I could exercise the retry logic properly — including
+telling the difference between a failure worth retrying and one that isn't.
+
+**And the fourth is order fulfillment** — another manual approval step, plus conditional
+branching, plus rolling back the work already done if the approval never comes.
+
+Everything I'm showing tonight, including these slides and all the scaffolding, is in a public
+GitHub repo. Do dig in. It's a little messy.
 
 ---
 
 ### [SLIDE 17] What it took to stand this up
 
-*(1 min)*
+*(recorded 10:50 – 12:30)*
 
-One thing worth saying before we get to the tools, because it is the part nobody budgets for.
+Testing this took a fair bit of infrastructure, and this is the part nobody budgets for.
 
-The four workflows don't just need an orchestrator. They need **an external service to call
-back into a suspended workflow**, a **human-approval service**, a **deliberately flaky
-shipping API** so retries have something to retry against, and a **fixture API** serving a
-real book catalogue for the fan-out. None of those come with any orchestrator. All four had to
-exist before a single workflow could run anywhere.
+There's a **400-line Docker Compose file** that covers eight of the orchestrators — you can run
+those locally under Docker or Podman. There are the **mock services** I mentioned, which are all
+FastAPI containers.
 
-Then it multiplies by where the orchestrator lives. Locally that's a four-hundred-line compose
-file: Postgres, those four services, and four engines. For Argo and Flyte it's a Kubernetes
-cluster, an in-cluster Postgres, and the *same* four mocks redeployed as a Helm chart, because
-a pod cannot reach my laptop. For the two cloud tools it's an AWS account and a GCP account
-under Terraform, plus a Neon Postgres that is publicly reachable — because a Lambda cannot
-reach my laptop either — and which those two share, kept apart only by a schema namespace.
+I needed a **Kubernetes cluster**, because some of these only run on Kubernetes. Interesting
+find there: Oracle Cloud, of all places, has a genuinely free tier for Kubernetes. Everywhere
+else — AWS, and I think GCP is similar — charges you a minimum of about $25 a month just for the
+control plane.
 
-And Google Workflows needed one more thing: a fourteen-route Cloud Run service, because that
-engine executes none of your code.
+I needed **AWS and GCP accounts**, because two of these are cloud-only.
 
-*The line to land: the mocks had to be reachable from three network positions at once — a host
-process, a pod in-cluster, and a Lambda in AWS. That sounds like a detail and it cost real
-time: fixture-service hands back detail URLs derived from the request, so a Lambda in AWS got
-`http://fixture-service:8099/...` and every map iteration died on DNS. Whatever runs the
-fan-out is what has to resolve the URL.*
+And I ended up with **three separate Postgres databases**: one inside the Kubernetes cluster,
+one in the Compose file, and one hosted — I found a service called Neon that gives you free
+hosted Postgres. Each one was needed for a different reason depending on where in the stack the
+orchestrator was running. The cloud tools can't reach a database on my laptop, so that one had
+to be publicly available.
 
 ---
 
 ### [SLIDE 18] Twelve tools, five families
 
-*(0.5 min)*
+*(recorded 12:30 – 13:28)*
 
-Twelve is too many to hold in your head, so I've grouped them by what actually determines
-fit — which is usually not the feature list, it's what the tool demands of your
-infrastructure.
+I'm going to speed-run the twelve, so save your questions or jump in as we go — either is fine.
 
-The data pipeline lineage. Durable execution engines. Server-side declarative engines.
-Kubernetes-native. And managed cloud serverless.
+They sort into five high-level families.
 
-Notice these don't sort by quality. They sort by *what infrastructure you already run* —
-which is most of the recommendation right there.
+**The data pipeline lineage** — Luigi, Airflow, Prefect and Dagster. **Durable execution
+engines** — Temporal and Hatchet. **Server-side declarative engines** — Conductor and Kestra.
+**Kubernetes-native** — Argo Workflows and Flyte. And **managed serverless** — Step Functions on
+AWS, Google Workflows on GCP.
 
 ---
 
 ### [SLIDE 19] Family 1 — The data pipeline lineage
 
-*(0.5 min)*
+*(recorded 13:28 – 15:00)*
 
-Luigi, Airflow, Prefect, Dagster. All Python, all authored as Python code, and all
-descended from the same problem: a data team with a growing pile of batch jobs and
-dependencies between them. These are the tools most people mean when they say
-"orchestrator."
+Those first four. All written in Python, and the code you write for them must also be Python.
 
-The family resemblance is strong and so are the family weaknesses. All four are
-Python-only. And all four, by default, run every task in the same Python environment as
-the worker — so two tasks needing conflicting library versions is something you solve by
-opting into something heavier.
+Before I start on them, a framing note. My intent tonight is not to tell you that some
+particular tool is the best and you should use it in every case. I'd rather spark enough
+interest that you go and look at these yourself, because different tools genuinely suit
+different circumstances. That said — there are one or two where I'll leave you with a clear
+personal bias of *don't use this*.
+
+These four all descend from the same problem: you had a lot of batch jobs or background tasks
+with dependencies between them, and you needed a repeatable, auditable way to tie them
+together.
+
+**The big shared defect is that the tasks are not independent.** In all four, every task in your
+DAG shares the same virtual environment. I ran into this professionally a couple of years ago
+on Airflow: if you have a data scientist working on one part of a pipeline and an engineer on
+another, and they need incompatible versions of pandas, that doesn't work. You have to resolve
+it up front or the workflow simply never runs. To my mind that's the sore thumb across this
+whole family.
 
 ---
 
 ### [SLIDE 20] Luigi
 
-*(0.75 min)*
+*(recorded 15:00 – 16:45)*
 
-From Spotify, the oldest tool here, and arguably the ancestor of the category.
+I'll start with the one in maintenance mode, which I therefore don't recommend — but which was
+genuinely nice to use. Call it the Judas of the twelve.
 
-Look at the syntax: the whole state model is the **Target**. If a task's output already
-exists — a file, an S3 object — the task is done and gets skipped. No engine, no database,
-no daemon. `python dag1.py` and you're running. It's the cheapest thing here to start.
+The distinctive thing about Luigi is the model. You define classes inheriting from
+`luigi.Task`, and each task optionally has a `requires` method that just references other
+tasks — that's how you link them. And every task has an **output target**, usually a flat file.
 
-The cost is that Luigi does almost nothing for you. No real retry policy, no suspend at
-all, no dependency isolation — every task runs in the process that launched it. Retries,
-branching, error classification and compensation all end up hand-written *inside* task
-bodies, so the orchestrator can't see any of them. Its audit trail scored one out of ten:
-ten-minute retention, and because Luigi's unit of state is a Target, the scheduler knows a
-task is done but not what it produced.
+So for each step you write out a file, typically to S3. You can write custom targets that look
+for a row in a database instead. Sometimes you're just writing an empty success marker at a
+deterministic path.
 
-Thirty-eight out of a hundred, and last place — but read that as a thin model rather than bad
-software. Every capability the rubric rewards is present in a Luigi pipeline, as hand-written
-application code the orchestrator never sees. Cheap to get running, expensive to own.
+And here's what that buys you: if you ran a pipeline and it failed thirty percent of the way
+through, the next run resumes from that point — because the targets for the earlier steps are
+already there. In some contexts that's genuinely lovely. Not all contexts.
+
+Because of that model, Luigi has **no backing database at all**. It's just looking at whether
+targets exist. So you can run it entirely locally, or host the scheduler if you want to.
 
 ---
 
 ### [SLIDE 21] Apache Airflow
 
-*(0.75 min)*
+*(recorded 16:45 – 19:50)*
 
-From Airbnb, now an Apache project, and the de facto industry standard for data
-engineering — thirty-five thousand stars, an enormous plugin ecosystem, managed offerings
-from Astronomer, AWS and Google, and a large pool of people who already know it.
+Airflow. Written in Python — and here's where my bias comes out. I've used Airflow
+professionally and I don't think I'll ever use it again.
 
-The syntax is the thing to notice: operators instantiated as objects, chained with the
-`>>` operator, and `.expand()` for fan-out. Declaring the edges is mandatory, which means
-the whole class of mistake we'll see in Flyte simply cannot happen here.
+It really feels like a couple of Java developers got together over a weekend and decided, hey,
+let's try this Python thing. Look at the class names: `PythonOperator`. `ExternalTaskMarker`.
+`TriggerDagRunOperator`. There's so much excessive object orientation that it's painful to read.
 
-Its standout is the audit trail — grid, graph and Gantt views, per-task logs, rendered
-templates, the code version each run used, unlimited retention. Best in the field.
+They have got better, I'll concede that. Versions 2 and 3 added the Task API, which lets you do
+things much more naturally with decorators. But classic Airflow style is defining all these
+verbose operators and then connecting them with **overridden bitwise shift operators**, which I
+always found deeply weird. And it works in either direction — you can flip the operator and
+reverse the dependency, because it's just an overridden dunder method.
 
-Against it: Python-only, shared worker environment, and only partly dynamic. The fan-out
-*width* is decided at runtime, but the *shape* is fixed when the file is parsed — you
-cannot decide at runtime that this run needs a different kind of step. Sixty-five.
+Then Airflow scans all the Python files in its DAGs folder looking for these bare
+module-level variables to work out what connects to what. It doesn't feel like Python to me.
+
+*(Live, this got the biggest reaction of the night — someone in the audience volunteered that
+they'd wasted months of their life debugging Airflow, particularly Airflow on Kubernetes. Leave
+room for that.)*
+
+It does have a nice UI, a real audit interface, and proper auth. And it is the de facto
+industry standard, to the point that most cloud providers now offer a managed version of it.
+But it is such a beast.
 
 ---
 
 ### [SLIDE 22] Prefect
 
-*(0.75 min)*
+*(recorded 19:50 – 21:00)*
 
-Founded by someone who'd worked on Airflow, and it reads as a direct response to it. The
-pitch: your workflow should just be Python.
+Prefect, also Python. It was written by someone who'd originally worked on Airflow, took some
+lessons from it, and tried to build something better — so take that for what it's worth.
 
-And look at the flow body — that's the whole point. It's ordinary, eagerly-executed
-Python. `if` is `if`, a loop is a loop, a value is a value. The graph is inferred from what
-actually happened.
+This has the far more Pythonic approach: you define a flow with a decorator, and the tasks it
+calls are decorated too. Look at the body on the slide — that's ordinary Python. `if` is `if`, a
+loop is a loop, and a value is a value.
 
-That buys two things. Migrating an existing script is nearly trivial — add decorators to
-what you already have. And, more importantly, **eager execution makes mistakes shallow.**
-Because the body really runs, sequential code is sequential and a whole class of bug is
-unwritable. Hold that thought for Flyte.
+**That's worth more than it sounds like.** Because the flow body genuinely executes, sequential
+code really is sequential — which rules out an entire class of bug we'll see later with Flyte,
+where code that looks correct runs in parallel.
 
-It also has genuine native suspend, including a mode that tears down the infrastructure
-and rebuilds it on resume. Limits: Python-only, isolation is per flow run rather than per
-task, and SSO is gated behind paid Cloud tiers. Sixty-seven.
+Prefect also has real suspend and resume, including a mode that tears the infrastructure down
+and rebuilds it when the run continues.
+
+There's a self-hosted version and a paid tier, and the paid tier is where the enterprise
+niceties live — single sign-on and so on. The one thing that caught me out is the **task
+registry**: nothing shows up in the UI until you explicitly register a deployment or run
+something. Which brings me to a theme I'll come back to.
 
 ---
 
 ### [SLIDE 23] Dagster
 
-*(0.75 min)*
+*(recorded 21:00 – 22:20)*
 
-The most conceptually distinctive of the four. Its central abstraction isn't a task, it's
-an **asset**. You don't declare "run this job" — you declare "this table exists, here's
-how it's produced, and here's what from."
+Dagster, again Python, again decorator style for chaining tasks together.
 
-So the engine knows your data lineage, not just your execution order. Built-in data
-quality checks, and "re-materialize this table and everything downstream" is a first-class
-operation. For a data platform team that's a better mental model than a pile of scheduled
-jobs. `dagster dev` gives a full local UI in one command, and its audit trail scores as
-high as Airflow's — nine out of ten, joint best alongside Temporal — but earns it
-differently: a structured event log with asset lineage, so "which run produced this table,
-and what did it read" is a question you can actually ask.
+This one is genuinely different in that it's **asset-centric**. You're not just declaring the
+imperative jobs — you're declaring the tables and artefacts you expect them to produce. So the
+tool understands your data, not just your execution order.
 
-Two caveats. The asset model has a real learning curve and the ecosystem is smaller. And a
-structural gap: **no native suspend.** Both waiting workflows had to be split into separate
-jobs bridged by a sensor that polls — which is why four workflows show up as seven.
-Sixty-eight, the best of this family.
+It borrows heavily from what Airflow did well on auditing, and its audit trail is excellent —
+per-step inputs and outputs, asset lineage, and it keeps them.
+
+**What it does not have is the ability to suspend.** So if you want an async callback, you have
+to write a task that sits there polling, which is pretty obnoxious. That's a demerit for
+Dagster, and it's the reason my four workflows show up as seven in its UI — the ones that wait
+had to be split in half and bridged by a sensor.
 
 ---
 
 ### [SLIDE 24] Family 2 — Durable execution engines
 
-*(0.5 min)*
+*(recorded 22:20 – 22:50)*
 
-Different family, different problem. Temporal and Hatchet aren't aimed at data pipelines
-at all — they're aimed at application and microservice workflows. Long-running business
-processes, things that run for days, things where "the process died halfway through" has to
-be a non-event.
+Second family: Temporal and Hatchet.
 
-The defining idea is the one everybody calls **durable execution**, which is a terrible name,
-so here is what it means. Every tool in this comparison persists *something* — nine of the
-twelve record which tasks finished and what they returned, so a crash resumes you at the last
-completed step and the task that was in flight starts over.
+What "durable" means here is that these are extremely resilient to an error or a crash at any
+point. They're more imperative than the declarative style of something like Dagster — you write
+ordinary code rather than a graph — and Temporal in particular is battle-tested for high-volume
+workflows where getting *through* errors, or at minimum recording them properly, is the whole
+job.
 
-These two go further: the workflow function itself survives. You write ordinary code — loops,
-conditionals, local variables, a three-day wait — and when the machine dies, a fresh process
-picks up on the same line with the same variables. Not "restart from the last checkpoint."
-Continue mid-function.
-
-One thing to be precise about, because it's easy to overstate: both of these schedule
-perfectly well. Temporal has first-class Schedules with cron, calendar and interval specs,
-pause, overlap policies and backfill; Hatchet has cron triggers and scheduled runs. What
-they lack isn't the trigger, it's *data-awareness* around it. Three things, concretely:
-nothing that waits for a file to land or an upstream table to be rebuilt — that's a
-**sensor**, and Airflow ships a dozen of them. Nothing that knows a run represents Tuesday's
-slice of data, so nothing can show you which days are filled and which are missing — those
-are **partitions**. And nothing that knows which tables a run produced, so no dependency
-graph between the datasets themselves — that's **lineage**, and it's Dagster's whole
-premise.
-
-You can hand-write all three, and Temporal is genuinely good at that: a durable-timer poll
-loop survives restarts better than a sensor does. But it's your application code, not
-something the engine understands or can show you.
+To be precise about the difference, since every tool here persists something: the other ten
+record which tasks finished, so a crash resumes you at the last completed step and the task
+that was in flight starts over. These two go further — the workflow *function* itself survives,
+and a fresh process picks up where the old one was.
 
 ---
 
 ### [SLIDE 25] Temporal
 
-*(1.25 min — the one to spend on)*
+*(recorded 22:50 – 24:00)*
 
-The lineage is worth knowing: its founders built AWS Simple Workflow, then went to Uber
-and built Cadence, then forked that into Temporal. Third generation of the same idea by
-the same people.
+Temporal is written in Go, so I'm stepping outside the Python space here. But it has SDKs for
+almost everything, so you can write your workflows in Python or a good half-dozen other
+languages.
 
-Look at the code. There's no DAG and no YAML. The workflow is a function; it `await`s
-activities, and it `await`s a *signal* when it needs a human. That `wait_condition` is a
-genuine suspend — the workflow is not running, not polling, and not consuming a worker.
+And it delivers on the durability claim. While testing, I killed processes in the *middle* of a
+step and then came back to it, and it resumed from exactly where things left off. It is very,
+very good at that.
 
-Event sourcing is what makes it work. Every activity result is persisted, so if the worker
-dies a new worker replays the history to reconstruct the workflow's exact state — local
-variables included — and continues from the precise point of failure.
+Two caveats worth knowing.
 
-We didn't take that on faith. We `kill -9`'d the worker mid-workflow while it waited on an
-approval, decided the approval *while the worker was dead*, left it down over a minute,
-then started a completely fresh process. It picked the workflow up and finished it. No lost
-work, no duplicated side effects.
+**It doesn't really have a task registry.** If I open the UI I can schedule things, but a
+workflow won't appear until I've actually run it. Its executions are fully visible; its
+catalogue of what *could* run isn't a concept.
 
-Highest score of the twelve, at eighty-eight, and the widest language support here — seven
-native SDKs off a Go engine.
-
-The honest weaknesses: it isn't a data pipeline tool — Schedules and backfill are there, but
-sensors, partitions and lineage are not. The determinism constraint is real —
-no clock reads, no randomness, no direct I/O in the workflow function, because it has to
-replay identically. And one gap that surprised us: Temporal cannot tell you what workflows
-are deployed. There is no definition registry; the server learns a workflow type exists
-only when something runs one.
+**And workflow code has to be deterministic**, because recovery works by re-executing your
+function and feeding back the recorded results. That sounds like it would rule out dynamic
+workflows, and this is worth stating clearly because it's a common misconception: **it doesn't.**
+You can write a `while` loop in the body of a Temporal workflow and it works fine, as long as
+you advance through the loop deterministically. The shape of a given run has to be reproducible;
+it doesn't have to be static.
 
 ---
 
 ### [SLIDE 26] Hatchet
 
-*(0.75 min)*
+*(recorded 24:00 – 25:00)*
 
-The newest thing here by a wide margin — created December 2023, a Y Combinator company.
-Same durable-execution family, aimed at background tasks, AI agent orchestration, and
-long-running jobs.
+Hatchet is in the same family and is much newer. They pitch themselves as agentic-first — very
+rich documentation, and they actively encourage you to point your coding tools at it. I'm not
+sure that's a real differentiator anymore, since these tools are good at parsing anyone's
+documentation, but good for them.
 
-Its architectural argument is simplicity: Hatchet runs on **PostgreSQL and nothing else.**
-No Cassandra, no Redis, no Kafka. If you already operate Postgres you can self-host this,
-and that's a much smaller commitment than most engines in this space. MIT licensed.
+Architecturally there's a lot to like: it runs on **PostgreSQL and nothing else** — no Kafka, no
+Redis, no Cassandra to operate. If you already run Postgres, self-hosting this is a small ask.
 
-The syntax shows the one real ergonomic wrinkle: the wait has to be expressed as an
-`OrGroup` of an event condition and a sleep, because `aio_wait_for_event` takes no
-timeout. Once you know that, it works.
+**What I really didn't like is that it's trying to do too much.** This is running entirely
+self-hosted in my local Compose file, and the very first thing it does on load is tell me to
+create an account. Why? Don't reimplement an auth system inside your workflow orchestrator —
+focus on the thing you're supposed to be good at. And as of now there's no way to replace that
+auth database with your own identity provider. You just have to live with it.
 
-Seventy. Held back by being very young and pre-1.0, a small community, and the worst auth
-story of all twelve — a built-in user database that *cannot* be replaced by an external
-identity provider. We scored that below tools with no auth at all, because "none" you can
-front with your own SSO proxy.
-
-And a warning if you try it: three separate engine defaults each cause a **silent infinite
-hang**, with nothing in any log. Durable tasks are never dispatched unless the workflows are
-passed to the worker at construction; `durable_task` caps a suspended wait at a one-minute
-timeout; and a `SIGKILL`ed worker stays registered as active, keeps being handed durable
-work, and survives an engine restart. Always stop workers with `SIGTERM`.
+So that's the one where I thought: I'm not going to take this entirely seriously yet. Maybe
+they'll fix it in a future release.
 
 ---
 
 ### [SLIDE 27] Family 3 — Server-side declarative engines
 
-*(0.5 min)*
+*(recorded 25:00 – 25:15)*
 
-The unifying idea for Conductor and Kestra: **the workflow definition is data, not code** —
-and it lives on the server rather than in your repository.
+Conductor and Kestra. Here the **workflow definition is data, not code.**
 
-Both have a JVM engine and are language-agnostic about tasks. And both let you change the
-shape of a workflow without redeploying the code that executes it, which is a genuinely
-different operational model from everything else here. The flip side is that your repo
-stops being the source of truth, and nothing detects drift.
+Both are Java programs, and both have SDKs for other languages so your tasks aren't stuck on
+the JVM. And both let you change the graph *without redeploying anything*, which is a genuinely
+different operational model from everything else tonight.
 
 ---
 
 ### [SLIDE 28] Conductor
 
-*(1 min)*
+*(recorded 25:15 – 26:30)*
 
-Out of Netflix, in production there and at Tesla, LinkedIn and J.P. Morgan. Thirty-two
-thousand stars — second only to Airflow in this comparison. Netflix has since stepped back
-to an internal fork; a company called Orkes is now the steward.
+Conductor came out of Netflix. You express your DAGs as JSON, which you load onto the server —
+and you can swap that definition out on the server dynamically. Your workers are written in
+whatever language you like and registered separately.
 
-Look at the two halves on this slide, because the seam between them is the whole idea.
+Look at the two halves on the slide, because the seam between them is the whole idea. The top is
+the graph: JSON, with a task type and a name, and no code in it at all. The bottom is an
+ordinary Python function. The *only* thing connecting them is the string — the task name matches
+the name in the JSON. There's no import and nothing compile-time.
 
-The top half is the graph: JSON, with a task type and a name. You don't deploy that as a
-file — you POST it to the server, which stores and versions it. There is no code in it at
-all.
+**The open source version has no authentication whatsoever, which I actually like** — because it
+means you can handle auth orthogonally, with something you already trust. There's a paid version
+with the full enterprise single sign-on story if you want it. And the async resume endpoint
+needs no authentication either: it's one HTTP POST, no SDK and no token.
 
-The bottom half is the work: an ordinary Python function. And the *only* thing connecting
-it to the graph is the string — `task_definition_name="load_csv_to_postgres"` matches the
-`"name"` field above. There's no import, no reference, nothing compile-time. The worker is
-a separate process that starts up, tells the server "I can do `load_csv_to_postgres`," and
-polls for it. One call to `TaskHandler` discovers every decorated function in the process.
-
-Two consequences. Because workers *poll*, they need no inbound port and work behind NAT.
-And because the graph is server-side data, you can rewire a workflow through an API call
-without redeploying a single worker, and in-flight executions stay pinned to the version
-they started on. Notice also what is *not* in that Python: no retry policy. Retries,
-timeouts and concurrency caps live on the task *definition*, so every workflow referencing
-that task inherits one policy.
-
-Note the `WAIT` task. It suspends at zero cost and resumes via a single HTTP POST — no SDK,
-no token, no relay process. It was the only tool here that needed *no new infrastructure*
-for the callback workflows. And it has the easiest local start of the twelve: one
-container, SQLite, zero external dependencies.
-
-Seventy-five — second place. Held back by three things: **no authentication whatsoever** in
-open source, so a network boundary is mandatory rather than optional; an expression language
-that only substitutes values, so every branch condition has to be precomputed by a worker;
-and timeouts that fire late, because nothing sets a timer per task — a background process
-sweeps periodically and expires whatever is overdue. So a timeout is a floor, not a
-deadline: we measured a sixty-second one firing at a hundred and three seconds.
+Now, if you're running this in production you obviously want it locked down — an
+identity-aware proxy, or castle-and-moat networking around it. But I think it's a virtue when a
+tool stays focused on the thing it's meant to do rather than worrying about everything else
+under the sun.
 
 ---
 
 ### [SLIDE 29] Kestra
 
-*(0.75 min)*
+*(recorded 26:30 – 28:00)*
 
-The younger take on the same idea, with YAML instead of JSON. Twelve thousand stars, seven
-hundred contributors, six hundred plugins.
+Kestra took a while to get working right. It expresses DAGs as **YAML** rather than JSON, and
+the tasks can be in *any* language at all, because each one is just a Docker container that
+runs.
 
-Here the Python lives *inside* the YAML. The task declares a type of
-`scripts.python.Script`, a Docker task runner, and then an indented block of ordinary
-Python. That's Kestra's answer to language-agnosticism: your code is a string in the flow
-definition, and it runs in its own container.
+So it has most of what I want. Callback-based resume works. And that container-per-task model
+means dependency isolation comes free — which, notably, none of the four Python-native tools
+manage.
 
-Two things worth pointing at. The `taskRunner` line means **a container per script task**,
-so Kestra gets dependency isolation essentially for free — which none of the Python-native
-four manage. And the handoff back out is explicit: `Kestra.outputs()` is how values re-enter
-the flow, and downstream tasks read them as `outputs.<task-id>.vars.<key>`.
+Auth is the same story as Hatchet's: one shared account in the open source version, fancier
+options in the paid tier.
 
-That `pip install kestra` line is not boilerplate — it's a fix. The `kestra` package is
-preinstalled only in the *server's* own virtualenv, not in the task containers, so every one
-of our thirty script tasks crashed on `from kestra import Kestra` until we installed it
-per-task. The one flow that worked was the one using a process runner instead of Docker.
+**What you cannot do is modify the DAG on the fly**, and let me be precise about what I mean,
+because there are two different things here.
 
-Native `Pause` with `onResume` handled both waiting workflows, and the timeout on that Pause
-is what drives the saga path.
+You can always **fan out to N tasks where you don't know N in advance**. Unzip an archive with
+some unknown number of CSVs in it, and run one task per file — that's fine, every tool here
+expresses that.
 
-Sixty-three. Docked for two things: **no dynamic task creation at all** — the loops iterate
-over runtime data, but every task is fixed in the YAML before the run starts. And the same
-auth problem as Hatchet: one shared admin account in open source, SSO and service accounts
-behind Enterprise.
-
-One documentation caution worth carrying: `execution.resumeUrl`, which the callback pattern
-appears to depend on, **does not exist in any Kestra version.** The docs were confidently
-specific and wrong.
+What you can't do is **programmatically add a different *kind* of step** at runtime — decide
+mid-run that this particular execution also needs a validation step it didn't have before. You
+can't do that in Kestra, and you can't do it in Airflow either. Some of the others can.
 
 ---
 
 ### [SLIDE 30] Family 4 — Kubernetes-native
 
-*(0.5 min)*
+*(recorded 28:00 – 29:10)*
 
-Argo and Flyte are grouped because **they require a Kubernetes cluster.** Not "can run on
-Kubernetes" — most of this list can. These two *are* Kubernetes applications. Without a
-cluster there is no product.
+These next two require a Kubernetes cluster. Quick show of hands — who's used Kubernetes? About
+half the room.
 
-What that buys is significant. **Dependency isolation, inherent and complete** — every step
-is its own pod with its own image, so conflicting library versions aren't a problem you
-solve, they're a problem that doesn't exist. Both scored a perfect ten there, alongside only
-the two cloud services. Plus scaling with no workers to manage, and steps in any language,
-because the unit of work is a container.
+I'm a huge fan of Kubernetes. I use it constantly, I think it's great. **But if you're not
+already familiar with it, I'd steer you clear of these two.** It's a steep learning curve, as
+are several of these orchestrators, and you don't want to bite off both at once. If you're
+already running Kubernetes, absolutely look at these. If not, look at the other options — it
+depends on your comfort level.
 
-The cost is the prerequisite. If you already run Kubernetes you get things the other tools
-have to work for. If you don't, nothing else about these two matters.
+What the model buys you is that **dependency isolation is inherent**, because every task runs as
+its own pod. That means it's just a container: it can be Python, it can be Fortran, it doesn't
+matter. And two tasks can be Python with mutually incompatible dependencies, because they're
+fully isolated.
 
 ---
 
 ### [SLIDE 31] Argo Workflows
 
-*(0.75 min)*
+*(recorded 29:10 – 30:50)*
 
-A CNCF graduated project, fifteen thousand stars. Workflows are YAML — Kubernetes custom
-resources — and each step names a container image and a command. If you already run Argo CD,
-adding Argo Workflows is a small step.
+A note on naming: Argo CD is the larger platform, aimed at Kubernetes deployment and CI/CD. Argo
+*Workflows* is the orchestrator inside that family, and it's pretty robust. If you've heard of
+Kubeflow, for ML pipelines — that's actually running Argo Workflows underneath.
 
-The thing I most want to highlight, because we didn't expect it: **Argo validates the entire
-call tree at submission.** An unresolvable parameter three templates deep is rejected before
-a single pod starts, and the error names the exact path. Of the twelve, only Argo and
-Conductor catch structural errors before burning compute — and on Kubernetes each failed
-iteration costs minutes of pod scheduling.
+You express workflows as YAML. And Argo has **no state database of its own** — the state
+database *is* Kubernetes. It registers a set of custom resource definitions and tracks
+everything there.
 
-Seventy-four, with free OIDC SSO and group-based RBAC, better than most paid tiers here.
+Which leads to the important limitation. Every task is its own container, plus more custom
+resources to track state, and Kubernetes has a hard ceiling in the region of 300,000 containers
+running at once. **So if you need to run millions of jobs, neither of these two is the right
+choice.** You'd be scaling your cluster enormously for something the model isn't built for.
 
-Its sharp weakness is the audit trail: **pod logs don't survive pod deletion.** We confirmed
-that on a live cluster, repeatedly — completed step pods were garbage-collected before we
-could read them. You can find *which* step failed; reading *why* needs external log
-aggregation you set up yourself.
+With that said — I've used Argo before and I think it's incredibly expressive and easy to work
+with once it's set up. I'm a big fan.
 
-One more, because it silently defeated the thing DAG 3 exists to test: `retryPolicy: Always`
-cannot classify errors. Argo retries on *pod* failure, and a pod that failed on purpose is
-indistinguishable from one that hit a blip — so a declined credit card got retried all five
-times, exactly like a gateway 5xx. The workflow still reached the right final state, just
-slowly and after four wrong attempts, which is why nobody noticed.
+One weakness to budget for: **you lose the logs as soon as the pods disappear.** That's fixable
+with a log aggregation pipeline into Logstash or Datadog or similar, but setting that up is on
+you.
 
 ---
 
 ### [SLIDE 32] Flyte
 
-*(1 min)*
+*(recorded 30:50 – 32:10)*
 
-Out of Lyft, aimed at machine learning and data workflows at scale. You author in Python,
-but it's Kubernetes-native underneath — one pod per task. Strong typing, built-in caching,
-and real multi-tenancy: a project-and-domain pair materializes as an actual namespace with
-its own resource quota.
+Flyte went a different direction. It **does** have a state database — just Postgres — rather than
+tracking everything in custom resources. And each task persists its inputs and outputs as
+objects in blob storage, which helps a great deal with auditing, and mitigates that log-loss
+problem the Kubernetes model otherwise has.
 
-Three things we verified that are genuinely good. One pod per task, including every element
-of a dynamic fan-out. Typed inputs and outputs persisted to blob storage, so a finished
-run's outputs are readable through the API long after its pods are gone — materially better
-forensics than Argo. And configuration travels as *data*: the database settings are a typed
-workflow input, so a run can be retargeted without touching workflow code.
+But you have to write your code carefully, and there are two traps I hit.
 
-Now look at that last line of the code, because this is the biggest trap we found anywhere
-in the evaluation. **A Flyte `@workflow` body looks like Python and is not.** It builds a
-graph, and Flyte derives edges *only* from data dependencies. Two statements in order, where
-the second doesn't consume the first's output, run **in parallel.** In our code a SQL
-transform ran concurrently with the unzip that was supposed to precede it, and died on a
-missing table. Nothing warns you — not the type checker, not the linter, not registration.
-That `>>` is mandatory.
+**Statement order means nothing.** Flyte derives the graph from data flow only, so two lines
+that don't share data will run in parallel regardless of the order you wrote them. In my code a
+SQL transform ran alongside the unzip that was supposed to precede it, and died on a table that
+didn't exist yet. That `>>` on the slide isn't stylistic — it's required.
 
-Airflow and Argo make you declare edges, so the mistake is unexpressible. Prefect and
-Temporal execute eagerly, so sequential code *is* sequential. Flyte is the only tool we
-tested where correct-looking code is silently concurrent. Seventy.
+**And retries are conditional on your exception type.** If your code throws something that
+doesn't subclass `FlyteRecoverableException`, it doesn't qualify for the retries at all. Declare
+`retries=5` on a task whose exceptions inherit plain `Exception` and you silently get zero.
+
+One nice bit of history: Luigi — the first tool I mentioned, now in maintenance mode — was built
+by Spotify. They stopped maintaining it and **switched to Flyte** instead.
 
 ---
 
 ### [SLIDE 33] Family 5 — Managed cloud serverless
 
-*(0.5 min)*
+*(recorded 32:10 – 33:15)*
 
-Step Functions and Google Workflows, grouped for three reasons that all matter more than
-their feature lists.
+The last family is the managed services from the big cloud providers. I only looked at two: Step
+Functions on AWS and Google Workflows on GCP.
 
-They require an account with **one specific cloud**, and can't run anywhere else. No
-self-hosted option, and — we verified this — no usable local path for workflows of this
-complexity.
+These are fundamentally different from everything else tonight. With any other orchestrator you
+have to run the scheduler or controller somehow — you can pay for a managed version, or host it
+on an EC2 instance or in your cluster, but either way you're paying for that compute.
 
-**The billing model is different.** Everything else here is free software where you pay for
-machines. These two bill per state transition or per step. It's the only category where a
-chattier workflow has a line item.
+The serverless ones have **no compute for you to manage at all.** And so both AWS and Google
+came up with a distinctive billing model: instead of billing for uptime or compute, they bill
+you **per state transition.** Every time you move from task A to task B, that's a fraction of a
+penny.
 
-And **the engine executes none of your code.** Every step calls out to something you
-deployed separately. The upside is real — isolation is inherent, scaling is somebody else's
-problem, both scored a perfect ten, and there's no infrastructure to operate. The downside
-is that you build a service for every step body before you can run anything at all.
+Both have a free tier, so under some thousands of transitions a month you pay nothing. But I
+implemented a Step Functions job at work that we call **literally a million times every night**,
+and at that volume you notice the bills.
 
 ---
 
 ### [SLIDE 34] AWS Step Functions
 
-*(0.75 min)*
+*(recorded 33:15 – 34:30)*
 
-Launched in 2016 as the successor to AWS Simple Workflow — which, as I mentioned, is where
-the Temporal founders came from.
+Step Functions expresses workflows in JSON. You'll almost never write that by hand — partly
+because tooling can generate it, but mostly because there's a genuinely nice **visual editor**
+where you drag and drop the states. I've used it extensively.
 
-Workflows are Amazon States Language: JSON, with a visual Workflow Studio. Notice that the
-retry policy is declarative, attached to the state — that part is genuinely nice. The killer
-integration story is calling two hundred and twenty AWS services directly without writing a
-Lambda, and Distributed Map fanning out to ten thousand concurrent executions, more
-parallelism out of the box than anything else here. Auth is IAM, already solved if you're an
-AWS shop.
+The thing to understand is that **Step Functions doesn't run anything itself.** It is purely the
+edges. Every task is "invoke this Lambda", or "spin up this Fargate container", or some other
+call into the AWS ecosystem. What it gives you is all the expressiveness around those calls —
+retries, timeouts, catch clauses, and so on, declared rather than coded.
 
-Sixty, held down by two structural things. **Vendor independence: zero.** And **no dynamic
-task creation** — the state machine is immutable at runtime; a Map iterates over data but
-cannot introduce a new *kind* of step. Also, ASL can't nest, so every sub-workflow is its own
-state machine: our four workflows became seven deployed machines.
+Two costs. You're **locking yourself into that vendor** — though maybe that doesn't matter to
+you. And at genuinely high scale **the cost can balloon**, if you're doing millions of
+executions. Though on the other hand you may not have a choice, because as we just saw, the
+Kubernetes-based ones can't keep up at that volume either.
 
 ---
 
 ### [SLIDE 35] Google Workflows
 
-*(0.75 min)*
+*(recorded 34:30 – 35:20)*
 
-The GCP equivalent. YAML, fully managed, pay per step.
+Google Workflows is the same shape. Workflows are defined in **YAML**, billing is per
+transition, and the engine doesn't run anything itself — your tasks are Cloud Run containers or
+Cloud Functions.
 
-And that one call is the headline: `events.await_callback` holds a genuinely suspended
-execution — no worker, no poller, no billed step — for up to a **year.** That's the best
-suspend/resume of anything we tested. Only Temporal matches it, and Temporal needs a worker
-fleet running to do so.
-
-Seventy, which is up eleven points from what we'd scored on documentation alone — the largest
-movement in the comparison, and all of it in Google's favour. That's the single best argument
-for actually running these things rather than reading about them.
-
-Two costs that only appear on contact. First, "the engine runs no code" taken to its
-conclusion: to run these four workflows we had to build and deploy a **fourteen-route Cloud
-Run service** first. Deploying Google Workflows is one command; *building* something for it
-is not. Second, the expression language is small with sharp edges — seven distinct defect
-classes. Four fail at deploy time, which is the good news. Three fail at runtime pointing
-somewhere other than the cause.
+Where both of these are genuinely excellent is **asynchronous suspend and resume.** Both let you
+suspend an execution for **up to a year**, which is faintly nuts, and it costs you nothing while
+it waits. There's no worker sitting there and no billed step. If you have a workflow that needs
+to wait on a human for a week, this family does that better than anything else here.
 
 ---
 
-## Part 3 — Scoring and Results
+## Part 3 — Scoring
 
-*Target: 2.25 minutes. The per-tool cards already gave you each score, so this section's job
-is the shape of the field — not a re-reading of the numbers.*
+*Recorded 35:10 – 37:15 (~2 minutes)*
 
 ### [SLIDE 36] The scoring rubric
 
-*(0.75 min)*
+*(recorded 35:10 – 35:45)*
 
-A hundred points across twelve weighted categories. Eight are worth ten points each and
-four are worth five, and the weighting is the argument.
+So, how I scored these.
 
-The ten-pointers are the things that change what you can *build*: how many languages you can
-write in, whether you can create tasks at runtime, whether tasks can have conflicting
-dependencies, how durable execution is, whether you can resume from failure, what the audit
-trail gives you, how it scales, and whether you're locked to one vendor.
-
-The five-pointers are things you can usually work around: authentication, community size,
-local development, and suspend-resume. Suspend at five points is arguable — for our DAG 2
-and DAG 4 it was the whole ballgame — but a tool that can't suspend can poll, and several
-did exactly that.
+I built a point system across twelve categories that sums to 100 — language flexibility, how
+well a tool survives a crash, auditability, the auth story, and so on. The weighting is the
+argument: eight categories are worth ten points each because they change what you can *build*,
+and four are worth five because you can usually work around them.
 
 ---
 
 ### [SLIDE 37] The scoreboard
 
-*(1.5 min)*
+*(recorded 35:45 – 37:00)*
 
-Here's the whole field. Three things to notice about the *shape* rather than the order.
+And this was the result, based on actually building and running those four workflows in all
+twelve and scoring across every category.
 
-**First, Temporal at eighty-eight is alone.** Thirteen points clear of second place, and the
-gap is almost entirely one category — what survives a crash, where Temporal scores ten and
-nothing else scores above eight.
+**Temporal came out on top.** I think Temporal is great — maybe perfect for some situations, and
+not for others.
 
-**Second, the middle is a cluster, not a ranking.** Conductor seventy-five, Argo
-seventy-four, then three tools tied at seventy, then sixty-eight, sixty-seven, sixty-five,
-sixty-three, sixty. That is eight tools inside fifteen points. Any difference of two or three
-points here is noise relative to what your existing infrastructure will decide for you — and
-the three tied at seventy, Flyte, Hatchet and Google Workflows, are so unalike that the tie
-is proof the total is a summary, not a verdict.
+**Luigi did the poorest**, which isn't surprising for something in maintenance mode. Read that
+as a thin model rather than bad software: every capability this rubric rewards does exist in a
+Luigi pipeline, as hand-written code the orchestrator never sees. Cheap to get running,
+expensive to own.
 
-**Third, Luigi at thirty-eight is also alone**, twenty-two points below the next tool. That
-number is real, and I'll defend it in a moment — but not as "bad software."
+**Conductor and Argo are both well up there.** Hatchet is up there too, and I still wouldn't use
+it, because the auth situation is that bad.
 
-The honest reading of this chart: the top and bottom are meaningful, the middle is a field.
+But look at the shape rather than the order. Apart from the top and the bottom, **the
+distribution is fairly uniform — we're basically hovering in the seventies.** So all of these
+tools have different strengths and weaknesses, and the total is a summary rather than a verdict.
 
 ---
 
-## Part 4 — What We Learned by Running Them
+## Part 4 — What Running Them Taught Us
 
-*Target: 2.25 minutes. This section only exists because we ran the code.*
+*Recorded 37:15 – 39:25, and the payoff at 42:30 (~2 minutes)*
 
 ### [SLIDE 38] Where a tool catches your mistake
 
-*(1.25 min)*
+*(recorded 37:00 – 37:30)*
 
-We wrote the same four workflows twelve times, and every one of the twelve had defects in
-code that looked correct before it executed. The useful question turned out not to be how
-many, but **when you find out**.
+Something else worth paying attention to: **where** a tool catches your mistake.
 
-**At submission.** Argo and Conductor reject a structurally invalid graph before a single pod
-starts. Argo validates the entire call tree — an unresolvable parameter three templates deep
-comes back naming the exact path through the templates. Those mistakes cost you seconds.
+It's a bit like the interpreted-versus-compiled distinction. With some of these you can't even
+*submit* a workflow if there's a problem with it. That's true of Argo, because Kubernetes has to
+validate the spec, and Conductor does the same thing. Those mistakes cost you seconds.
 
-**At run time, one failed task at a time.** Every Python-native tool. You submit, a task
-fails, you fix it, you submit again. And on Kubernetes each of those iterations costs minutes
-of pod scheduling — Flyte's task pods carry about seventy seconds of setup each, so a
-ten-node workflow is a ten-minute round trip.
+With others you submit it, run it, and *that's* when the failure happens. On Kubernetes each of
+those iterations costs minutes of pod scheduling.
 
-**Or never.** Flyte's missing `>>` edges were not errors at all. They were a *race*. The
-workflow ran, and whether it worked depended on which task happened to finish first. We found
-four more assigned-but-unused task results elsewhere in the same codebase that were latent
-races of exactly the same kind.
+And with Flyte, the missing `>>` I mentioned wasn't an error at all — it was a race. The
+workflow ran, and whether it worked depended on which task happened to finish first.
 
-Two things follow from that, and the second is why this slide is still here.
-
-First, **eager execution is worth a lot.** Temporal's zero defects and Prefect's relatively
-shallow ones share one cause — the workflow body runs as ordinary code, so sequential code
-*is* sequential and a value *is* a value. Flyte's hardest defects come from the opposite
-model: a body that looks imperative but is a graph builder.
-
-Second — and this is the part that has changed since we started this evaluation — **all of
-this matters more when the code is generated, not less.** If a model writes your workflow,
-you are reviewing something you did not author, and the failure mode you are least equipped
-to catch by reading is the one that looks completely correct. Flyte's silently-concurrent
-body is exactly the shape of thing a confident model hands you. So a tool that validates the
-whole call tree at submission is worth more now than it was two years ago, and a tool that
-turns your mistake into a race is worth considerably less.
+*Worth adding, and it wasn't in the live version: this matters more now, not less. If a model
+writes your workflow, you're reviewing code you didn't author — and the failure you're least
+able to catch by reading is the one that looks completely correct.*
 
 ---
 
-### [SLIDE 39] "What is deployed here?"
+### [SLIDE 39] What can you see before it runs?
 
-*(1 min)*
+*(recorded 37:30 – 38:30, payoff at 42:30)*
 
-Here's a question we didn't plan to ask. We deployed the same four workflows everywhere, then
-opened each UI and counted what it showed. **The answers ranged from zero to nineteen.**
+The other thing is whether a tool has a proper workflow registry — the ability to see what's
+queued up and available in there before you run anything.
 
-First, be precise about what this counts, because it is *not* observability. Every one of the
-twelve shows you running and past executions perfectly well. The question is narrower:
-**before you run anything, what does the tool list as deployable?**
+Here's Dagster. I said I have four workflows, and it's showing seven, because the ones that
+needed to wait got split into sub-workflows. But I can come in and look at past runs.
 
-**Temporal lists none, by design.** There is no definition registry — the server learns that a
-workflow *type* exists only when an execution of it appears. Its executions are fully visible;
-its catalogue simply isn't a concept.
+Step Functions had to split things up as well, and has a genuinely nice interface for it.
+Google Workflows groups it better — it has sub-steps, but you only see the top-level workflows
+in the list, which is nicer.
 
-**Prefect and Flyte list none until you register.** Both can answer the question, but only
-after an explicit deploy or `pyflyte register` — and Flyte's registry is scoped per project
-*and* domain, so you can be looking at the wrong one. Easy to skip, silent when skipped.
+**And then there's Temporal.** Earlier I kicked off DAG 1 from the command line while we were
+talking. Now that it's run, there it is — I can click in and examine every step that executed.
+But **it wasn't there until I ran it.** Its executions are perfectly visible; the catalogue of
+what could run simply doesn't exist.
 
-**Luigi lists none, ever** — no registry at all, and `luigid` drops a task from state after ten
-minutes.
-
-**A high count is not richness either.** Step Functions shows seven because ASL cannot nest;
-Dagster shows seven because it has no native suspend. Both are workarounds inflating a count.
-Only Airflow's four means what it appears to mean.
-
-**And registration is durable server state that nothing garbage-collects.** Hatchet showed
-**nineteen definitions for nine workflows**, because registrations are keyed by a name that
-embeds a namespace — one worker run with the wrong namespace leaves a full orphan set behind.
-Kestra showed **thirteen for seven**. Neither ships a reaper. Adopting one of those means
-owning that cleanup.
-
-This moves no score, because the rubric weights capability rather than introspectability. But
-turn it into the onboarding question: **a new engineer opens the UI — can they discover what
-this deployment is even capable of running?** For four of the twelve, no. They see what
-happens to be running right now and nothing about what else exists. One of those four is the
-tool I'm about to recommend, which is worth saying out loud.
+Which is the honest counterweight to the tool I'm about to recommend.
 
 ---
 
 ## Part 5 — Recommendation
 
-*Target: 3 minutes.*
+*Recorded 42:30 – 45:51 (~3 minutes)*
 
-### [SLIDE 40] What we would recommend
+### [SLIDE 40] What I would recommend
 
-*(1.5 min)*
+*(recorded 42:45 – 43:50)*
 
-So, a recommendation — and it's conditional, because these families sort by what
-infrastructure you already run.
+So, recommendations.
 
-**For long-running service and business-process workflows: Temporal.** Highest score, widest
-language support here, and it is the only one that resumes *inside* a function rather than at
-the last finished step — which nothing else on this list can do. It also produced zero defects across four workflows, which after doing this
-eleven other times I can tell you is remarkable.
+**For long-running service workflows, Temporal is a solid choice.** It's the only one here that
+resumes inside a function rather than at the last finished step.
 
-**For data pipelines: Dagster.** The asset model means you declare the tables and their
-lineage rather than a pile of jobs, its audit trail is the best in the field, and it has the
-data-awareness Temporal doesn't — sensors, partitions, lineage. Don't reach for Temporal for
-ETL just because it scored highest overall.
+**If you're doing pure data pipelines, Dagster.** Very robust audit trail, and that data
+awareness — it understands your tables, not just your jobs.
 
-**If you already run Kubernetes: Argo Workflows.** Perfect dependency isolation,
-submission-time validation that catches structural mistakes for free, and free SSO with
-group-based RBAC. Budget for external log aggregation on day one, because pod logs do not
-survive pod deletion. And note the qualifier — *at modest volume*. Pod-per-task is the thing
-that caps throughput, and it's the same property that earns it a perfect ten on isolation.
+**If you're already deep in Kubernetes, check out Argo** — and probably not Flyte, unless you
+particularly want to.
 
-**If you're all-in on one cloud and want zero operations: that cloud's tool.** Both are
-genuinely good at what they do. Take the lock-in and the per-step billing as deliberate
-decisions rather than surprises, and remember the engine runs none of your code, so you're
-committing to building and operating every step body too.
+**And if you don't want to deal with hosting any of this yourself, use Step Functions or Google
+Workflows**, depending on which cloud you're in. They're genuinely nice. They're expressive and
+they work well. Just know that when you run them a lot, they can start to cost real money.
 
 ---
 
 ### [SLIDE 41] Three things to take away
 
-*(1.5 min)*
+*(recorded 43:50 – 45:51)*
 
-If you forget the scores, these three are the ones that generalise.
+**One. The task code you write is the nodes; orchestration is the edges.** I think there's real
+value in decomposing the processes you've been writing so that each piece focuses only on the
+job it's doing, and stops worrying about how it interconnects.
 
-**One. Your task code is the nodes; orchestration is the edges.** You were always going to
-write the nodes — nobody is selling you those. What you're buying is somewhere for the edges
-to live: declared, persisted, and inspectable, rather than implied by a timestamp and a
-four-hour buffer.
+**Two. Those five families sort by the infrastructure you already run.** So as you consider
+options, look at what you're already doing and what you're comfortable with — that will inform
+the decision more than any row in my matrix.
 
-**Two. The families sort by what infrastructure you already run — not by quality.** Eight of
-these twelve sit inside fifteen points of each other, so if you already run Kubernetes, or
-you're already committed to one cloud, that decides more than any row in my matrix does.
+**Three, and this is the one that's changed.** In the past there were people whose entire job
+was maintaining Apache Airflow, because the learning curve on these things was steep. A lot of
+that has been mitigated — you can now say "write me this DAG in Dagster" and get something
+workable. **The barrier to entry is much lower.**
 
-I've narrowed that deliberately to *infrastructure*. It used to be fair to say "what you
-already have" and mean your team's skills as much as your platform — which brings me to the
-third one.
+But there are things it can't decide for you. If you need to run at a scale of millions of
+tasks, you probably don't want one of the Kubernetes-based ones, because there are hard limits
+on how many containers you can run. If you're worried about the cost of per-transition billing
+at that volume, you may want to self-host something like Conductor instead.
 
-**Three, and this is the one I'd actually leave you with. The learning curve used to decide
-this, and it doesn't any more.** Picking Airflow used to mean months of a team absorbing
-Airflow's idioms, and switching later was close to unthinkable — so "what do we already know"
-and "how big is the ecosystem" outweighed technical fit. AI collapses most of that. Writing
-idiomatic ASL, or Argo YAML, or a Temporal workflow is no longer the expensive part.
-
-Which means the decision moves to the constraints that don't care how fast you can learn.
-Take a concrete one. Say you need a million workflow runs a day at ten steps each. On Argo
-that's ten million *pods* a day — about a hundred and sixteen pods a second, sustained.
-Kubernetes pod-per-task is not built for that, and Flyte measured roughly seventy seconds of
-setup per task pod. So the isolation that earns those two a perfect ten out of ten is exactly
-what disqualifies them at that volume.
-
-Now run the same numbers through the cloud tools. At published rates, Step Functions Standard
-is about seven and a half thousand dollars a month; Google Workflows about three thousand —
-and that is for *coordination alone*, before the Lambdas or Cloud Run services that do the
-actual work. Express Workflows cut it substantially and trade away the audit trail, which was
-seven of Step Functions' points. At that volume a worker pool with no per-execution fee —
-Temporal, Hatchet, Conductor on Postgres — stops looking like more work and starts looking
-like the only economical option.
-
-So: **pod-per-task caps your throughput, per-step billing caps your volume, and worker pools
-trade both for operational ownership.** That's arithmetic you can do before you pick.
-
-One honest caveat, because it's the first thing someone will say. AI collapses the cost of
-learning the *syntax*. It does not collapse the cost of *operating* the thing — nothing is
-going to own your Kubernetes cluster or Temporal's determinism constraints for you — and it
-does not collapse the cost of getting the semantics right. Every one of the twelve had defects
-in code that looked correct, and Flyte's silently-concurrent workflow body is precisely what a
-confident language model will hand you. Which is really the argument for this whole exercise:
-what's left once AI removes the learning curve is exactly the stuff we just spent forty
-minutes measuring.
-
+And one escape hatch worth knowing: **not everything has to be a task run by the orchestrator
+itself.** If one step fans out to ten thousand workers, you can submit that to an external job
+queue — AWS Batch or similar — and have the orchestrator simply watch for it to finish and then
+resume. That gets you around several of these limits at once.
 
 ---
 
 ### [SLIDE 42] Thank you
 
-*(no time budget)*
+*(recorded 45:51)*
 
-Thank you — happy to take questions.
-
----
-
-### [SLIDE 43] Who I am
-
-*Advance to this and leave it. It keeps your name and contact details on screen while
-people are deciding whether to follow up, which is the one moment they actually need them.*
-
----
-
-## Appendix — Facts to spot-check before presenting
-
-Dates and provenance come from my own knowledge rather than from this repo's docs.
-Worth verifying, since they'll be said out loud. I've kept most of them vague in
-the script above (no years except where load-bearing) so they're cheap to cut.
-
-- Luigi open-sourced by Spotify, ~2012
-- Airflow started at Airbnb 2014; Apache top-level project 2019
-- Prefect founded 2018 by Jeremiah Lowin, former Airflow PMC member
-- Dagster founded by Nick Schrock, GraphQL co-creator
-- Temporal forked from Uber Cadence 2019; founders previously built AWS SWF
-- Conductor open-sourced by Netflix 2016; Orkes now sole steward
-- Argo originally from Applatix, acquired by Intuit; CNCF graduated
-- Flyte open-sourced by Lyft 2020; Linux Foundation governance, Union.ai commercial
-- Step Functions launched re:Invent 2016
-- Google Workflows GA 2021
-
-Everything else — scores, defect counts, measured behaviors, star counts — comes
-from `comparison.md` and the per-tool READMEs.
+That's everything I had. These slides and all the scaffolding are on my GitHub — the repo is on
+screen, do dig in.

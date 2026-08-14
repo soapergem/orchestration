@@ -72,8 +72,7 @@ test-data/                                    generators only; *.zip and books.j
 
 `presentation/` **is** tracked in git; `presentation/site/` is mkslides build output.
 The deck is `presentation/slides/slides.md` (mkslides → reveal.js) and the spoken
-script is `SCRIPT.md` at the repo root. `OrchestRated.pptx` was a brief detour into
-PowerPoint and is superseded — its content is merged into `slides.md`.
+script is `SCRIPT.md` at the repo root.
 
 ## Commands
 

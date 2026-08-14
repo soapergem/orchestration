@@ -46,8 +46,14 @@ fixture:
   # replaced used presigned URLs with X-Amz-Expires=604800 -- a 7-day fuse that
   # would have silently expired and taken DAG 2's corpus with it. These come
   # from `terraform -chdir=terraform/aws output`.
-  booksUrl: s3://orch-bakeoff-dag1-602436928406/input/books.json.gz
-  sampleZipUrl: s3://orch-bakeoff-dag1-602436928406/input/sample-data.zip
+  # Deliberately EMPTY here: the bucket name embeds an AWS account id, which does
+  # not belong in git. deploy-backbone.sh fills both from $DAG1_BUCKET, which it
+  # reads from `terraform -chdir=terraform/aws output -raw dag1_bucket` when that
+  # state is reachable. Leaving them unset is safe and loud rather than silent:
+  # fixture-service reports 503 on /health until the corpus loads, so readiness
+  # fails visibly.
+  booksUrl: ""
+  sampleZipUrl: ""
   s3SecretName: fixture-s3-creds
   # Deliberately EMPTY. Setting it pins the per-item detail URLs to one host,
   # and the previous deployment pinned them to `http://fixture-service:8099` --

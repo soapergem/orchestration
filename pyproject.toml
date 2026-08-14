@@ -24,4 +24,5 @@ dependencies = [
     "prefect-docker>=0.7.3",
     "conductor-python>=2.0.0",
     "mkslides>=2.0.19",
+    "faster-whisper>=1.2.1",
 ]

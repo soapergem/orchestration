@@ -62,6 +62,25 @@ kubectl "${kube[@]}" create configmap bakeoff-init-db -n "$NAMESPACE" \
   --from-file=02-init-runners.sh="$here/../init-runners.sh" \
   --dry-run=client -o yaml | kubectl "${kube[@]}" apply -f - >/dev/null
 
+# DAG 1's ZIP and DAG 2's corpus live in an S3 bucket whose name embeds the AWS
+# account id, so it is not committed. Prefer the Terraform output; fall back to
+# $DAG1_BUCKET if that state is not reachable from here.
+if [[ -z "${DAG1_BUCKET:-}" ]]; then
+  DAG1_BUCKET="$(terraform -chdir="$here/../../terraform/aws" output -raw dag1_bucket 2>/dev/null || true)"
+fi
+fixture_args=()
+if [[ -n "$DAG1_BUCKET" ]]; then
+  fixture_args=(
+    --set "fixture.booksUrl=s3://${DAG1_BUCKET}/input/books.json.gz"
+    --set "fixture.sampleZipUrl=s3://${DAG1_BUCKET}/input/sample-data.zip"
+  )
+  echo "==> fixture data from s3://${DAG1_BUCKET}"
+else
+  echo "==> WARNING: no DAG1_BUCKET and no terraform output; fixture-service will"
+  echo "    stay unready (503 on /health) until booksUrl is supplied. Set"
+  echo "    DAG1_BUCKET=<bucket> or run from a machine with the AWS state."
+fi
+
 echo "==> helm upgrade --install $RELEASE -n $NAMESPACE"
 # --take-ownership adopts resources created before this chart existed. Harmless
 # once adopted; required the first time on a cluster that ran the old script.
@@ -69,6 +88,7 @@ helm upgrade --install "$RELEASE" "$here" -n "$NAMESPACE" "${kube[@]}" \
   --create-namespace \
   -f "$here/values-incluster.yaml" \
   --take-ownership --wait --timeout 9m \
+  "${fixture_args[@]}" \
   --set "callbackFetch.domain=${PREFIX}callback-fetch.${BASE_DOMAIN}" \
   --set "approval.domain=${PREFIX}approval.${BASE_DOMAIN}" \
   --set "shipping.domain=${PREFIX}shipping.${BASE_DOMAIN}" \
