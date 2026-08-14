@@ -87,7 +87,7 @@ So you might reasonably ask: isn't that just programming? We have `if`/`else`. W
 backoff in a decorator.
 
 And yes. It is. But there's a lot that an orchestrator does on top of that, and by the end of
-tonight I hope to leave you convinced they're worth reaching for as you productionise code.
+tonight I hope to leave you convinced they're worth reaching for as you productionalize code.
 
 ---
 
