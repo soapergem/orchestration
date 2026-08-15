@@ -1,0 +1,273 @@
+# DAG 3 — Payment Processing (Kruxia Flow)
+#
+# Tool idioms demonstrated:
+#   * `postgres_query` / `postgres_transaction` as first-class activities, so
+#     ALL of this DAG's database work is declarative -- no code, no ORM, no
+#     custom worker. Of the YAML-defined tools here (Kestra, Argo, Google
+#     Workflows, Conductor) this is the only one that can say that.
+#   * `isolation_level: serializable` on the money movement.
+#   * Condition-gated `depends_on` for the validation branch.
+#   * `{{dep.status == 'failed'}}` conditions for the failure path -- dependents
+#     of a FAILED activity do run, which is what makes error handling
+#     expressible at all.
+#   * Worker-side error classification: retriability lives in
+#     `worker.py::payment_gateway`, NOT in the `retry:` block below, because
+#     Kruxia Flow's RetryPolicy has no error predicate.
+#
+# Deviations from the spec, both forced by the engine and both findings:
+#
+#   1. NO JITTER. The spec asks for "exponential backoff + jitter + max delay
+#      cap". RetryPolicy (core/src/workflow/definition.rs:874) offers
+#      max_attempts / strategy / base_seconds / factor / max_seconds and has no
+#      jitter option at all. Backoff is therefore deterministic 3s, 6s, 12s,
+#      24s, capped at 30s -- a thundering-herd risk the other tools avoid.
+#      Luigi, by contrast, hand-rolls FULL jitter in application code.
+#   2. EVERY MONEY AND TIMESTAMP COLUMN IS CAST. `postgres_query` silently
+#      serializes NUMERIC and TIMESTAMPTZ as `null` (see README finding 4), so
+#      `balance` is read as `balance::float8` and every timestamp as `::text`.
+#      Comparisons and arithmetic are done server-side in SQL where the real
+#      NUMERIC type is intact -- floats never touch a stored balance.
+#
+# Run:
+#   source kruxiaflow_bakeoff/env.sh
+#   ./kruxiaflow_bakeoff/deploy.sh dag3_payment
+#   ./kruxiaflow_bakeoff/start_workflow.py dag3
+#   ./kruxiaflow_bakeoff/start_workflow.py dag3 --force-outcome decline
+
+name: kruxiaflow_dag3_payment
+
+activities:
+  # ---- 1. ValidatePayment + 2. CheckValidation -----------------------------
+  # Both spec steps collapse into one query. Account existence, active status,
+  # sufficient balance, destination validity and the idempotency-key duplicate
+  # check are five reads that the other implementations do as five round trips
+  # in Python; here they are one CASE expression evaluated in the database, and
+  # the branch below reads its boolean. This is the single nicest thing about
+  # Kruxia Flow's DB story and it is worth showing rather than describing.
+  - key: validate_payment
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      # The schema is templated, not parameterised: $n binds VALUES, never
+      # identifiers. Every YAML-defined tool here has the same property.
+      query: |
+        WITH src AS (
+          SELECT account_id, status, balance
+          FROM {{INPUT.schema}}.accounts WHERE account_id = $1
+        ), dst AS (
+          SELECT account_id, status
+          FROM {{INPUT.schema}}.accounts WHERE account_id = $2
+        ), dup AS (
+          SELECT status FROM {{INPUT.schema}}.transactions WHERE idempotency_key = $3
+        )
+        SELECT
+          CASE
+            WHEN NOT EXISTS (SELECT 1 FROM src)                        THEN false
+            WHEN (SELECT status FROM src) <> 'active'                  THEN false
+            WHEN (SELECT balance FROM src) < $4::numeric               THEN false
+            WHEN NOT EXISTS (SELECT 1 FROM dst)                        THEN false
+            WHEN (SELECT status FROM dst) <> 'active'                  THEN false
+            WHEN EXISTS (SELECT 1 FROM dup)                            THEN false
+            ELSE true
+          END AS is_valid,
+          CASE
+            WHEN NOT EXISTS (SELECT 1 FROM src)
+              THEN 'Source account ' || $1 || ' not found'
+            WHEN (SELECT status FROM src) <> 'active'
+              THEN 'Source account ' || $1 || ' is ' || (SELECT status FROM src)
+            WHEN (SELECT balance FROM src) < $4::numeric
+              THEN 'Insufficient balance: ' || (SELECT balance FROM src)::text
+                   || ' < ' || $4
+            WHEN NOT EXISTS (SELECT 1 FROM dst)
+              THEN 'Destination account ' || $2 || ' not found'
+            WHEN (SELECT status FROM dst) <> 'active'
+              THEN 'Destination account ' || $2 || ' is ' || (SELECT status FROM dst)
+            WHEN EXISTS (SELECT 1 FROM dup)
+              THEN 'Duplicate payment: existing transaction with status '
+                   || (SELECT status FROM dup)
+            ELSE 'ok'
+          END AS reason,
+          -- ::float8 because a bare NUMERIC arrives as null. Reported, not read.
+          COALESCE((SELECT balance FROM src), 0)::float8 AS source_balance
+      params:
+        - "{{INPUT.from_account}}"
+        - "{{INPUT.to_account}}"
+        - "{{INPUT.idempotency_key}}"
+        - "{{INPUT.amount}}"
+
+  # ---- 3. ProcessPayment ---------------------------------------------------
+  # The one activity that genuinely needs code. Retriability is decided inside
+  # it; this retry block only says how often and how long to wait.
+  - key: process_payment
+    worker: py-bakeoff
+    activity_name: payment_gateway
+    parameters:
+      payment_id: "{{INPUT.payment_id}}"
+      amount: "{{INPUT.amount}}"
+      currency: "{{INPUT.currency}}"
+      from_account: "{{INPUT.from_account}}"
+      to_account: "{{INPUT.to_account}}"
+      idempotency_key: "{{INPUT.idempotency_key}}"
+      force_outcome: "{{INPUT.force_outcome}}"
+    settings:
+      timeout_seconds: 30
+      retry:
+        max_attempts: 5
+        strategy: exponential
+        base_seconds: 3
+        factor: 2.0
+        max_seconds: 30      # cap; no jitter option exists -- see header
+    depends_on:
+      - activity_key: validate_payment
+        conditions:
+          - "{{validate_payment.result.rows[0].is_valid == true}}"
+
+  # ---- 4. UpdateDatabase ---------------------------------------------------
+  # Idempotent by construction, in ONE statement. The INSERT claims the
+  # idempotency key; the two balance updates are gated on that INSERT having
+  # actually happened, so replaying this activity after a crash cannot double
+  # debit. Serializable because it is money.
+  #
+  # Note the arithmetic is `balance - $3::numeric` server-side: the float8 cast
+  # in validate_payment is for *reporting* only and never round-trips a balance.
+  - key: update_database
+    worker: std
+    activity_name: postgres_transaction
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      isolation_level: serializable
+      statements:
+        - query: |
+            WITH ins AS (
+              INSERT INTO {{INPUT.schema}}.transactions
+                (payment_id, idempotency_key, from_account, to_account,
+                 amount, currency, status, gateway_transaction_id)
+              VALUES ($1, $2, $3, $4, $5::numeric, $6, 'completed', $7)
+              ON CONFLICT (idempotency_key) DO NOTHING
+              RETURNING id
+            ), deb AS (
+              UPDATE {{INPUT.schema}}.accounts
+                 SET balance = balance - $5::numeric, updated_at = NOW()
+               WHERE account_id = $3 AND EXISTS (SELECT 1 FROM ins)
+              RETURNING account_id
+            ), cred AS (
+              UPDATE {{INPUT.schema}}.accounts
+                 SET balance = balance + $5::numeric, updated_at = NOW()
+               WHERE account_id = $4 AND EXISTS (SELECT 1 FROM ins)
+              RETURNING account_id
+            )
+            SELECT
+              (SELECT count(*) FROM ins)::int  AS inserted,
+              (SELECT count(*) FROM deb)::int  AS debited,
+              (SELECT count(*) FROM cred)::int AS credited
+          params:
+            - "{{INPUT.payment_id}}"
+            - "{{INPUT.idempotency_key}}"
+            - "{{INPUT.from_account}}"
+            - "{{INPUT.to_account}}"
+            - "{{INPUT.amount}}"
+            - "{{INPUT.currency}}"
+            - "{{process_payment.result.gateway_transaction_id}}"
+    depends_on:
+      - process_payment
+
+  # ---- 5. SendNotification (best effort) -----------------------------------
+  # Graceful degradation is implemented INSIDE the activity (it returns a value
+  # saying delivery failed rather than failing), because Kruxia Flow has no
+  # per-activity "optional"/"allowFailure" setting. See worker.py::notify.
+  - key: send_receipt
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.payment_id}}"
+      subject: "Payment Successful: {{INPUT.payment_id}}"
+      body: >
+        Payment {{INPUT.payment_id}} for {{INPUT.amount}} {{INPUT.currency}} was
+        processed successfully. Gateway transaction:
+        {{process_payment.result.gateway_transaction_id}}
+      force_failure: "{{INPUT.force_notification_failure}}"
+    depends_on:
+      - update_database
+
+  # ---- 6a. HandlePaymentFailure — validation rejected ----------------------
+  - key: record_validation_failure
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        INSERT INTO {{INPUT.schema}}.transactions
+          (payment_id, idempotency_key, from_account, to_account,
+           amount, currency, status, error_message)
+        VALUES ($1, $2, $3, $4, $5::numeric, $6, 'failed', $7)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING id
+      params:
+        - "{{INPUT.payment_id}}"
+        - "{{INPUT.idempotency_key}}"
+        - "{{INPUT.from_account}}"
+        - "{{INPUT.to_account}}"
+        - "{{INPUT.amount}}"
+        - "{{INPUT.currency}}"
+        - "validation failed: {{validate_payment.result.rows[0].reason}}"
+    depends_on:
+      - activity_key: validate_payment
+        conditions:
+          - "{{validate_payment.result.rows[0].is_valid == false}}"
+
+  - key: notify_validation_failure
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.payment_id}}"
+      subject: "Payment Failed: {{INPUT.payment_id}}"
+      body: "Payment rejected before processing: {{validate_payment.result.rows[0].reason}}"
+    depends_on:
+      - record_validation_failure
+
+  # ---- 6b. HandlePaymentFailure — gateway failed ---------------------------
+  # Reached when process_payment goes terminal: either a non-retriable
+  # PaymentDeclined on attempt 1, or a retriable error that exhausted all 5
+  # attempts. Both land here, which is correct -- the distinction that matters
+  # is how MANY attempts it took, and that is visible in the activity history.
+  #
+  # There is deliberately no single shared "notify failure" activity joining
+  # this branch and the validation branch: multiple `depends_on` entries are
+  # ANDed, and Kruxia Flow has no OR-join, so a shared successor of two
+  # mutually exclusive paths would wait forever. Duplicating the notify
+  # activity is the honest workaround. Recorded as a finding.
+  - key: record_payment_failure
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        INSERT INTO {{INPUT.schema}}.transactions
+          (payment_id, idempotency_key, from_account, to_account,
+           amount, currency, status, error_message)
+        VALUES ($1, $2, $3, $4, $5::numeric, $6, 'failed', $7)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING id
+      params:
+        - "{{INPUT.payment_id}}"
+        - "{{INPUT.idempotency_key}}"
+        - "{{INPUT.from_account}}"
+        - "{{INPUT.to_account}}"
+        - "{{INPUT.amount}}"
+        - "{{INPUT.currency}}"
+        - "gateway failure"
+    depends_on:
+      - activity_key: process_payment
+        conditions:
+          - "{{process_payment.status == 'failed'}}"
+
+  - key: notify_payment_failure
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.payment_id}}"
+      subject: "Payment Failed: {{INPUT.payment_id}}"
+      body: "Payment {{INPUT.payment_id}} failed at the gateway after retries."
+    depends_on:
+      - record_payment_failure

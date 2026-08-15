@@ -59,6 +59,8 @@ port anywhere.**
 | 54322 | shared | in-cluster `bakeoff-postgres` port-forward (`just port-forwards`) — the cluster twin of 54321 |
 | 8000 | Conductor | server REST API (`/api`) — workers and `register.py` talk here |
 | 8127 | Conductor | UI (nginx inside the same container, on :5000) |
+| 8100 | Kruxia Flow | engine REST API + `/dashboard` — **not** its own default of 8080, which is Airflow's here |
+| 8101 | Kruxia Flow | MCP server (disabled in this repo; port reserved so it cannot collide with Kestra's 8081) |
 
 ### Logins — `just creds`
 
@@ -74,7 +76,12 @@ that have no auth. Where each one comes from, since they differ in kind:
 | Postgres :54321 | `orchestration` / `orchestration` | `docker-compose.yml`. |
 
 **No auth at all:** Conductor (:8127), Temporal UI (:8233), Dagster (:3000),
-Prefect (:4200), luigid (:8082). Conductor's is a finding rather than a
+Prefect (:4200), luigid (:8082). **Kruxia Flow (:8100) is a deliberate opt-out
+rather than an absence** — it requires OAuth2 on every request by default, and
+this repo runs it with `KRUXIAFLOW_INSECURE_DEV=true` so the mock services can
+resume a workflow with one unauthenticated POST. Note the flag governs *request*
+auth only: `serve` still refuses to boot without an RSA keypair and a client
+secret, which is why the profile carries a `keygen` one-shot. Conductor's is a finding rather than a
 convenience — OSS has no authentication whatsoever, so anyone who can reach the
 API can read every execution, complete any task and rewrite every definition.
 It scores 3/5 on auth for exactly this.

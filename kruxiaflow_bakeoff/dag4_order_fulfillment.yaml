@@ -1,0 +1,464 @@
+# DAG 4 — Order Fulfillment with Human Approval and Saga Compensation
+#                                                    (Kruxia Flow, CHAINED shape)
+#
+# This is the composed version: three real sub-workflow definitions in
+# subflows/, started over HTTP and awaited by signal. `dag4_order_fulfillment_flat.yaml`
+# is the same behaviour in ONE definition with the children inlined, so the two
+# can be compared directly -- that comparison is the measurement of what Kruxia
+# Flow's missing sub-workflow construct actually costs.
+#
+# HOW COMPOSITION IS FAKED
+#
+# Kruxia Flow has no sub-workflow construct; chaining is Deferred upstream
+# (kruxiaflow-internal/docs/features/2026-01-08-workflow-chaining.md) and the
+# sanctioned pattern is a fire-and-forget POST. Waiting for a child therefore
+# takes a pair of activities:
+#
+#   start_X   http_request POST /api/v1/workflows, passing {{WORKFLOW.id}} so
+#             the child knows who to answer
+#   await_X   wait_for_signal -- parks in `waiting`, holding no worker
+#
+# and the child ends with a `signal_workflow` activity. Four things a native
+# construct gives you for free are missing: the parent cannot see the child's
+# status, cannot cancel it, gets no cascading failure, and must be told where
+# to signal. Conductor's SUB_WORKFLOW and Temporal's child workflows have all
+# four.
+#
+# THE SAGA
+#
+# Three trigger paths, exactly as the spec requires, and all three converge by
+# *condition* rather than by a shared join -- because multiple `depends_on`
+# entries are ANDed and there is no OR-join. That is why `compensate_*` appears
+# once per trigger rather than once.
+#
+#   rejection        approval signal says decision != approved
+#   timeout          approval sub-workflow's wait was skipped -> decision=timeout
+#   shipping failure shipping signal says ok=false
+#
+# Run:
+#   source kruxiaflow_bakeoff/env.sh
+#   ./kruxiaflow_bakeoff/deploy.sh
+#   ./kruxiaflow_bakeoff/start_workflow.py dag4
+#   AUTO_DECIDE_ACTION=rejected  (recreate approval-service) for the saga path
+
+name: kruxiaflow_dag4_order_fulfillment
+
+activities:
+  # ---- 1. ValidateOrder ----------------------------------------------------
+  # Customer active, SKU exists, enough stock, and the order total computed
+  # server-side. No mutation, so no compensation is owed if this fails.
+  # unit_price is NUMERIC -> ::float8 or it arrives as null (finding 4).
+  - key: validate_order
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        WITH cust AS (
+          SELECT customer_id, status FROM {{INPUT.schema}}.customers WHERE customer_id = $1
+        ), item AS (
+          SELECT sku, available_quantity, unit_price
+            FROM {{INPUT.schema}}.inventory WHERE sku = $2
+        )
+        SELECT
+          CASE
+            WHEN NOT EXISTS (SELECT 1 FROM cust)                          THEN false
+            WHEN (SELECT status FROM cust) <> 'active'                    THEN false
+            WHEN NOT EXISTS (SELECT 1 FROM item)                          THEN false
+            WHEN (SELECT available_quantity FROM item) < $3               THEN false
+            ELSE true
+          END AS is_valid,
+          CASE
+            WHEN NOT EXISTS (SELECT 1 FROM cust)       THEN 'Customer ' || $1 || ' not found'
+            WHEN (SELECT status FROM cust) <> 'active' THEN 'Customer ' || $1 || ' is inactive'
+            WHEN NOT EXISTS (SELECT 1 FROM item)       THEN 'SKU ' || $2 || ' not found'
+            WHEN (SELECT available_quantity FROM item) < $3
+              THEN 'Insufficient stock for ' || $2
+            ELSE 'ok'
+          END AS reason,
+          COALESCE((SELECT unit_price FROM item), 0)::float8 * $3        AS total_amount,
+          (COALESCE((SELECT unit_price FROM item), 0) * $3 >= $4::numeric) AS needs_approval
+      params:
+        - "{{INPUT.customer_id}}"
+        - "{{INPUT.sku}}"
+        - "{{INPUT.quantity}}"
+        - "{{INPUT.approval_threshold}}"
+
+  # ---- 2. Create the order row --------------------------------------------
+  # Must exist before any reservation: inventory_reservations.order_id is an FK
+  # to orders. This is the same FK-ordering bug Prefect, Argo, Flyte and Luigi
+  # all shipped -- writing the reservation first. Doing it here, in order, on
+  # purpose.
+  - key: create_order
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        INSERT INTO {{INPUT.schema}}.orders
+          (order_id, customer_id, total_amount, status)
+        VALUES ($1, $2, $3::numeric, 'pending')
+        ON CONFLICT (order_id) DO NOTHING
+        RETURNING order_id
+      params:
+        - "{{INPUT.order_id}}"
+        - "{{INPUT.customer_id}}"
+        - "{{validate_order.result.rows[0].total_amount}}"
+    depends_on:
+      - activity_key: validate_order
+        conditions:
+          - "{{validate_order.result.rows[0].is_valid == true}}"
+
+  # ---- 3. ReserveInventory (sub-workflow) ---------------------------------
+  - key: start_reserve_inventory
+    worker: std
+    activity_name: http_request
+    parameters:
+      method: POST
+      url: "{{INPUT.api_internal_url}}/api/v1/workflows"
+      body:
+        definition_name: kruxiaflow_dag4_sub_inventory_reservation
+        input:
+          schema: "{{INPUT.schema}}"
+          db_url: "{{INPUT.db_url}}"
+          api_url: "{{INPUT.api_internal_url}}"
+          order_id: "{{INPUT.order_id}}"
+          sku: "{{INPUT.sku}}"
+          quantity: "{{INPUT.quantity}}"
+          reservation_id: "{{INPUT.reservation_id}}"
+          parent_workflow_id: "{{WORKFLOW.id}}"
+          parent_activity_key: await_reserve_inventory
+          parent_event_name: inventory_reserved
+    depends_on:
+      - create_order
+
+  - key: await_reserve_inventory
+    worker: std
+    activity_name: echo
+    parameters:
+      message: "inventory reservation returned for {{INPUT.order_id}}"
+    settings:
+      wait_for_signal:
+        event_name: inventory_reserved
+        timeout_seconds: 120
+        on_timeout: skip
+    depends_on:
+      - start_reserve_inventory
+
+  # ---- 4. CheckApprovalRequired + ManagerApproval (sub-workflow) -----------
+  # Approval is required only above the threshold. Below it the order goes
+  # straight to shipping -- the spec's "low-value order skips approval" case.
+  - key: start_manager_approval
+    worker: std
+    activity_name: http_request
+    parameters:
+      method: POST
+      url: "{{INPUT.api_internal_url}}/api/v1/workflows"
+      body:
+        definition_name: kruxiaflow_dag4_sub_manager_approval
+        input:
+          schema: "{{INPUT.schema}}"
+          db_url: "{{INPUT.db_url}}"
+          api_url: "{{INPUT.api_internal_url}}"
+          engine_internal_url: "{{INPUT.engine_internal_url}}"
+          approval_service_url: "{{INPUT.approval_service_url}}"
+          approval_request_id: "{{INPUT.approval_request_id}}"
+          order_id: "{{INPUT.order_id}}"
+          customer_id: "{{INPUT.customer_id}}"
+          total_amount: "{{validate_order.result.rows[0].total_amount}}"
+          items_summary: "{{INPUT.quantity}} x {{INPUT.sku}}"
+          parent_workflow_id: "{{WORKFLOW.id}}"
+          parent_activity_key: await_manager_approval
+          parent_event_name: approval_returned
+    depends_on:
+      - activity_key: await_reserve_inventory
+        conditions:
+          - "{{await_reserve_inventory.status == 'completed'}}"
+          - "{{SIGNAL.ok == true}}"
+          - "{{validate_order.result.rows[0].needs_approval == true}}"
+
+  - key: await_manager_approval
+    worker: std
+    activity_name: echo
+    parameters:
+      message: "approval returned for {{INPUT.order_id}}"
+    settings:
+      wait_for_signal:
+        event_name: approval_returned
+        # Longer than the child's own 120s wait, so the child always answers
+        # first. Two nested waits means two timeouts to keep ordered -- another
+        # cost of faking composition.
+        timeout_seconds: 240
+        on_timeout: skip
+    depends_on:
+      - start_manager_approval
+
+  # ---- 5. CallShippingAPI (sub-workflow) ----------------------------------
+  # Two ways in, so two start activities (no OR-join): approved, or the
+  # low-value path that skipped approval entirely.
+  - key: start_shipping_approved
+    worker: std
+    activity_name: http_request
+    parameters:
+      method: POST
+      url: "{{INPUT.api_internal_url}}/api/v1/workflows"
+      body:
+        definition_name: kruxiaflow_dag4_sub_shipping
+        input:
+          api_url: "{{INPUT.api_internal_url}}"
+          shipping_service_url: "{{INPUT.shipping_service_url}}"
+          order_id: "{{INPUT.order_id}}"
+          items:
+            - sku: "{{INPUT.sku}}"
+              quantity: "{{INPUT.quantity}}"
+          shipping_address: "{{INPUT.shipping_address}}"
+          parent_workflow_id: "{{WORKFLOW.id}}"
+          parent_activity_key: await_shipping
+          parent_event_name: shipping_returned
+    depends_on:
+      - activity_key: await_manager_approval
+        conditions:
+          - "{{await_manager_approval.status == 'completed'}}"
+          - "{{SIGNAL.decision == 'approved'}}"
+
+  - key: start_shipping_no_approval
+    worker: std
+    activity_name: http_request
+    parameters:
+      method: POST
+      url: "{{INPUT.api_internal_url}}/api/v1/workflows"
+      body:
+        definition_name: kruxiaflow_dag4_sub_shipping
+        input:
+          api_url: "{{INPUT.api_internal_url}}"
+          shipping_service_url: "{{INPUT.shipping_service_url}}"
+          order_id: "{{INPUT.order_id}}"
+          items:
+            - sku: "{{INPUT.sku}}"
+              quantity: "{{INPUT.quantity}}"
+          shipping_address: "{{INPUT.shipping_address}}"
+          parent_workflow_id: "{{WORKFLOW.id}}"
+          parent_activity_key: await_shipping
+          parent_event_name: shipping_returned
+    depends_on:
+      - activity_key: await_reserve_inventory
+        conditions:
+          - "{{await_reserve_inventory.status == 'completed'}}"
+          - "{{SIGNAL.ok == true}}"
+          - "{{validate_order.result.rows[0].needs_approval == false}}"
+
+  - key: await_shipping
+    worker: std
+    activity_name: echo
+    parameters:
+      message: "shipping returned for {{INPUT.order_id}}"
+    settings:
+      wait_for_signal:
+        event_name: shipping_returned
+        timeout_seconds: 240
+        on_timeout: skip
+    # Only ONE of the two start activities ever runs, and an ANDed dependency on
+    # both would deadlock. Depending on neither is the workaround: this activity
+    # is reachable because the engine schedules activities whose dependencies
+    # are satisfied, and an activity with no `depends_on` is ready immediately
+    # -- so instead it hangs off the reservation, which both paths share.
+    depends_on:
+      - activity_key: await_reserve_inventory
+        conditions:
+          - "{{await_reserve_inventory.status == 'completed'}}"
+          - "{{SIGNAL.ok == true}}"
+
+  # ---- 6 + 7. Happy ending -------------------------------------------------
+  - key: update_order_shipped
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        UPDATE {{INPUT.schema}}.orders
+           SET status = 'shipped', shipment_id = $2, tracking_number = $3,
+               updated_at = NOW()
+         WHERE order_id = $1
+        RETURNING order_id, status, tracking_number
+      params:
+        - "{{INPUT.order_id}}"
+        - "{{SIGNAL.shipment_id}}"
+        - "{{SIGNAL.tracking_number}}"
+    depends_on:
+      - activity_key: await_shipping
+        conditions:
+          - "{{await_shipping.status == 'completed'}}"
+          - "{{SIGNAL.ok == true}}"
+
+  - key: notify_shipped
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.order_id}}"
+      subject: "Order {{INPUT.order_id}} shipped"
+      body: "Tracking {{update_order_shipped.result.rows[0].tracking_number}}"
+    depends_on:
+      - update_order_shipped
+
+  # ---- SAGA COMPENSATION ---------------------------------------------------
+  # Three triggers, three entry activities, all doing the same thing, because
+  # there is no OR-join. Each releases inventory idempotently and cancels the
+  # order; the shared tail (`notify_cancelled`) cannot be shared either, so it
+  # is folded into each.
+  #
+  # `released_at IS NULL` makes the release idempotent -- double compensation is
+  # a no-op, which the spec requires.
+  - key: compensate_rejected
+    worker: std
+    activity_name: postgres_transaction
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      isolation_level: serializable
+      statements:
+        - query: |
+            WITH rel AS (
+              UPDATE {{INPUT.schema}}.inventory_reservations
+                 SET status = 'released', released_at = NOW()
+               WHERE order_id = $1 AND released_at IS NULL
+              RETURNING sku, quantity
+            ), restock AS (
+              UPDATE {{INPUT.schema}}.inventory i
+                 SET available_quantity = i.available_quantity + r.quantity,
+                     reserved_quantity  = GREATEST(i.reserved_quantity - r.quantity, 0)
+                FROM rel r WHERE i.sku = r.sku
+              RETURNING i.sku
+            ), ord AS (
+              UPDATE {{INPUT.schema}}.orders
+                 SET status = 'cancelled', failure_reason = $2, updated_at = NOW()
+               WHERE order_id = $1
+              RETURNING order_id
+            )
+            SELECT (SELECT count(*) FROM rel)::int     AS released,
+                   (SELECT count(*) FROM restock)::int AS restocked,
+                   (SELECT count(*) FROM ord)::int     AS cancelled
+          params:
+            - "{{INPUT.order_id}}"
+            - "approval rejected or timed out: {{SIGNAL.reason}}"
+    depends_on:
+      - activity_key: await_manager_approval
+        conditions:
+          - "{{await_manager_approval.status == 'completed'}}"
+          - "{{SIGNAL.decision != 'approved'}}"
+
+  - key: notify_cancelled_rejected
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.order_id}}"
+      subject: "Order {{INPUT.order_id}} cancelled"
+      body: "Inventory released; order cancelled after approval was not granted."
+    depends_on:
+      - compensate_rejected
+
+  # Trigger 2: the approval sub-workflow never answered at all, so the parent's
+  # own wait was skipped. Distinct from "the child reported a timeout decision".
+  - key: compensate_approval_lost
+    worker: std
+    activity_name: postgres_transaction
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      isolation_level: serializable
+      statements:
+        - query: |
+            WITH rel AS (
+              UPDATE {{INPUT.schema}}.inventory_reservations
+                 SET status = 'released', released_at = NOW()
+               WHERE order_id = $1 AND released_at IS NULL
+              RETURNING sku, quantity
+            ), restock AS (
+              UPDATE {{INPUT.schema}}.inventory i
+                 SET available_quantity = i.available_quantity + r.quantity,
+                     reserved_quantity  = GREATEST(i.reserved_quantity - r.quantity, 0)
+                FROM rel r WHERE i.sku = r.sku
+              RETURNING i.sku
+            ), ord AS (
+              UPDATE {{INPUT.schema}}.orders
+                 SET status = 'cancelled',
+                     failure_reason = 'approval sub-workflow never returned',
+                     updated_at = NOW()
+               WHERE order_id = $1
+              RETURNING order_id
+            )
+            SELECT (SELECT count(*) FROM rel)::int AS released,
+                   (SELECT count(*) FROM ord)::int AS cancelled
+          params:
+            - "{{INPUT.order_id}}"
+    depends_on:
+      - activity_key: await_manager_approval
+        conditions:
+          - "{{await_manager_approval.status == 'skipped'}}"
+
+  - key: notify_cancelled_approval_lost
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.order_id}}"
+      subject: "Order {{INPUT.order_id}} cancelled"
+      body: "Inventory released; the approval step never returned."
+    depends_on:
+      - compensate_approval_lost
+
+  # Trigger 3: shipping failed after retries, or InvalidAddress immediately.
+  - key: compensate_shipping_failed
+    worker: std
+    activity_name: postgres_transaction
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      isolation_level: serializable
+      statements:
+        - query: |
+            WITH rel AS (
+              UPDATE {{INPUT.schema}}.inventory_reservations
+                 SET status = 'released', released_at = NOW()
+               WHERE order_id = $1 AND released_at IS NULL
+              RETURNING sku, quantity
+            ), restock AS (
+              UPDATE {{INPUT.schema}}.inventory i
+                 SET available_quantity = i.available_quantity + r.quantity,
+                     reserved_quantity  = GREATEST(i.reserved_quantity - r.quantity, 0)
+                FROM rel r WHERE i.sku = r.sku
+              RETURNING i.sku
+            ), ord AS (
+              UPDATE {{INPUT.schema}}.orders
+                 SET status = 'failed', failure_reason = $2, updated_at = NOW()
+               WHERE order_id = $1
+              RETURNING order_id
+            )
+            SELECT (SELECT count(*) FROM rel)::int AS released,
+                   (SELECT count(*) FROM ord)::int AS cancelled
+          params:
+            - "{{INPUT.order_id}}"
+            - "shipping failed: {{SIGNAL.reason}}"
+    depends_on:
+      - activity_key: await_shipping
+        conditions:
+          - "{{await_shipping.status == 'completed'}}"
+          - "{{SIGNAL.ok == false}}"
+
+  - key: notify_cancelled_shipping
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.order_id}}"
+      subject: "Order {{INPUT.order_id}} failed"
+      body: "Inventory released; shipping could not be completed."
+    depends_on:
+      - compensate_shipping_failed
+
+  # ---- validation rejection (no compensation owed) -------------------------
+  - key: reject_invalid_order
+    worker: py-bakeoff
+    activity_name: notify
+    parameters:
+      reference: "{{INPUT.order_id}}"
+      subject: "Order {{INPUT.order_id}} rejected"
+      body: "Validation failed: {{validate_order.result.rows[0].reason}}"
+    depends_on:
+      - activity_key: validate_order
+        conditions:
+          - "{{validate_order.result.rows[0].is_valid == false}}"

@@ -47,7 +47,7 @@ services:
       # stepfunctions/google_workflows on Neon, so none of those belong here.
       # The list used to be hardcoded in init-db.sql, which both databases share
       # -- see that file's tail comment for why that leaked across instances.
-      BAKEOFF_RUNNERS: "airflow dagster prefect luigi temporal hatchet kestra conductor"
+      BAKEOFF_RUNNERS: "airflow dagster prefect luigi temporal hatchet kestra conductor kruxiaflow"
     ports:
       - "54321:5432"          # non-standard host port to avoid conflicts with local Postgres
     volumes:
@@ -394,6 +394,127 @@ services:
       retries: 12
       start_period: 60s
 
+  # ---------------------------------------------------------------- kruxiaflow
+  # One Rust binary + Postgres, and that really is the whole engine: API server,
+  # orchestrator, built-in `std` worker pool and cost tracker are all threads in
+  # the same process. Nothing else to run.
+  #
+  # THE TWO ONE-SHOTS ARE NOT OPTIONAL. `--insecure-dev` governs *request*
+  # authentication only; `serve` still hard-fails at boot without an OAuth RSA
+  # private key and a client secret (kruxiaflow/src/commands/serve.rs:298-306),
+  # so keygen must have run first. And the image's default command is
+  # `serve --migrate --seed-client --seed-llm /config/llm_models.yaml`, which
+  # needs the pricing catalog on disk -- hence the catalog fetch. Both exit
+  # immediately and are gated by `service_completed_successfully`.
+  kruxiaflow-keygen:
+    image: postgres:16
+    profiles: ["kruxiaflow"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /keys/private.pem ]; then
+          openssl genrsa -out /keys/private.pem 2048 &&
+          openssl rsa -in /keys/private.pem -pubout -out /keys/public.pem &&
+          chmod 644 /keys/private.pem /keys/public.pem &&
+          echo "Generated local RSA keypair for JWT signing"
+        else
+          echo "Keypair exists"
+        fi
+    volumes:
+      - kruxiaflow-keys:/keys
+
+  # The LLM pricing catalog drives budget enforcement and cost estimation. None
+  # of the four bake-off DAGs has an LLM step, so nothing here reads it -- but
+  # the image's default command does, so it has to exist. Fetching it is also
+  # the only network dependency in this profile; a previously fetched copy is
+  # reused if the fetch fails.
+  kruxiaflow-catalog:
+    image: curlimages/curl:latest
+    profiles: ["kruxiaflow"]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        url=https://raw.githubusercontent.com/kruxia/kruxiaflow/main/config/llm_models.yaml
+        if curl -fsSL "$$url" -o /config/llm_models.yaml.new; then
+          mv /config/llm_models.yaml.new /config/llm_models.yaml
+          echo "Fetched LLM pricing catalog"
+        elif [ -f /config/llm_models.yaml ]; then
+          echo "Catalog fetch failed; using previously fetched copy"
+        else
+          echo "ERROR: could not fetch the LLM pricing catalog and no copy exists" >&2
+          exit 1
+        fi
+    volumes:
+      - kruxiaflow-config:/config
+
+  kruxiaflow:
+    # PINNED, and not to :latest -- that tag is stale. On 2026-08-14 Docker Hub's
+    # kruxia/kruxiaflow:latest resolved to **0.3.0, built 2026-02-07**, six months
+    # and five minor releases behind the 0.8.3 source tree. That matters more than
+    # the usual "pin your images" advice, because 0.3.0 predates `--insecure-dev`
+    # entirely (it is absent from `serve --help`), so it silently ignores
+    # KRUXIAFLOW_INSECURE_DEV and 401s every API call -- which makes the project
+    # README's own five-minute quickstart, and the compose file it tells you to
+    # curl, non-functional. 0.3.0 is also amd64-only; 0.8.3 is a proper
+    # multi-arch index (arm64 + amd64), so an Apple Silicon host runs it native.
+    image: docker.io/kruxia/kruxiaflow:0.8.3
+    profiles: ["kruxiaflow"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kruxiaflow-keygen:
+        condition: service_completed_successfully
+      kruxiaflow-catalog:
+        condition: service_completed_successfully
+    ports:
+      # 8100/8101, NOT the upstream defaults of 8080/8081 -- those belong to
+      # Airflow and Kestra here (RUNNING.md §0). Getting this wrong is the same
+      # class of bug as Hatchet's minted token pointing its SDK at Airflow.
+      #
+      # The 127.0.0.1 binding is load-bearing, not caution: --insecure-dev
+      # refuses to start on a non-loopback bind unless
+      # INSECURE_DEV_ALLOW_NONLOOPBACK is also set, and the supported shape for
+      # containers is "bind 0.0.0.0 inside, publish to loopback outside".
+      - "127.0.0.1:8100:8080"      # REST API + dashboard -> http://localhost:8100
+      - "127.0.0.1:8101:8081"      # MCP server (unused by the bake-off)
+    environment:
+      DATABASE_URL: postgres://orchestration:orchestration@postgres:5432/kruxiaflow
+      # Local-evaluation credentials only. Real deployments must set these.
+      KRUXIAFLOW_CLIENT_ID: kruxiaflow-bakeoff
+      KRUXIAFLOW_CLIENT_SECRET: kruxiaflow-bakeoff-dev-secret
+      KRUXIAFLOW_OAUTH_TOKEN_ISSUER: http://localhost:8100
+      KRUXIAFLOW_OAUTH_TOKEN_AUDIENCE: kruxiaflow-api
+      KRUXIAFLOW_OAUTH_RSA_PRIVATE_KEY_PEM_FILE: /secrets/private.pem
+      KRUXIAFLOW_OAUTH_RSA_PUBLIC_KEY_PEM_FILE: /secrets/public.pem
+      # Unauthenticated requests execute as a synthetic 'insecure-dev'
+      # principal. This is what lets the mock services resume a suspended
+      # workflow with one plain POST -- no token, no relay process. It is also
+      # the honest way to run it here: every other engine in this file is
+      # equally open on localhost.
+      KRUXIAFLOW_INSECURE_DEV: "true"
+      KRUXIAFLOW_INSECURE_DEV_ALLOW_NONLOOPBACK: "true"
+      KRUXIAFLOW_MCP_ENABLED: "false"
+      KRUXIAFLOW_WORKER_COUNT: "20"
+      KRUXIAFLOW_CACHE_PROVIDER: noop
+      KRUXIAFLOW_LOG_LEVEL: info
+    volumes:
+      - kruxiaflow-keys:/secrets:ro
+      - kruxiaflow-config:/config:ro
+    healthcheck:
+      # The image is distroless -- no shell, no curl. `health` is a subcommand
+      # of the binary itself, and its verdict folds in orchestrator
+      # event-consumption freshness, so a wedged orchestrator loop shows up here
+      # even while the API still answers.
+      test: ["CMD", "/kruxiaflow", "health", "--timeout", "5"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
 volumes:
   pgdata:
   kestra-data:
+  kruxiaflow-keys:
+  kruxiaflow-config:

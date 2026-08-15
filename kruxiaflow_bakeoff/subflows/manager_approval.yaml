@@ -1,0 +1,198 @@
+# DAG 4 sub-workflow — ManagerApprovalWorkflow (Kruxia Flow)
+#
+# The suspend/resume showcase, and the strongest primitive Kruxia Flow brings to
+# this bake-off -- with one third of it broken.
+#
+# `settings.wait_for_signal` parks `await_decision` in `waiting`, holding no
+# worker slot and no thread, until the approval service POSTs one
+# unauthenticated signal. The wait is rows in Postgres, so it survives an engine
+# restart and costs nothing while idle. Compare:
+#
+#   Conductor  WAIT task, resumed by one unauthenticated POST -- equally simple,
+#              but its timeouts are sweeper-enforced and fire LATE (60s measured
+#              at 103s in this repo) and there is no declarative timeout action.
+#   Temporal   condition + timer in workflow code: exact, but it is code, and a
+#              worker fleet must be alive to hold the workflow.
+#   Kruxia     one declarative block, server-side.
+#
+# WHY on_timeout IS `skip` AND NOT `continue`
+#
+# `continue` is the documented way to make a timeout a *branch* -- "continue
+# with the activity, with null signal data" -- and it is BROKEN in 0.8.3.
+# Reproduced deterministically: the activity fails with `Failed to create
+# signal subscription: Subscription already exists`. See README finding 10.
+#
+# `skip` works, so the timeout branch is expressed as a downstream condition on
+# `{{await_decision.status == 'skipped'}}` instead. The cost is real but modest:
+# the decided and timed-out paths must be written as separate activities rather
+# than one activity inspecting null signal data, which -- with no OR-join --
+# means the "tell the parent" step exists twice.
+#
+# One upside falls out of it: because a skip is not a failure, the timeout path
+# ends the workflow `completed`, so "the manager did not answer in time" is not
+# reported as an engine error.
+
+name: kruxiaflow_dag4_sub_manager_approval
+
+activities:
+  # Record the request in our own schema FIRST, so the approval exists in the
+  # database even if the mock service never answers. Argo was caught not
+  # persisting approvals at all; this makes the DB the source of truth.
+  - key: record_request
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        INSERT INTO {{INPUT.schema}}.approval_requests
+          (approval_request_id, order_id, total_amount, status)
+        VALUES ($1, $2, $3::numeric, 'pending')
+        ON CONFLICT (approval_request_id) DO NOTHING
+        RETURNING approval_request_id
+      params:
+        - "{{INPUT.approval_request_id}}"
+        - "{{INPUT.order_id}}"
+        - "{{INPUT.total_amount}}"
+
+  # Register the approval AND the resume handle in one call. `resume_data` is
+  # the provider-shaped blob the service stores verbatim and interprets only at
+  # resume time; `kruxiaflow` is a provider added to the mock services for this
+  # implementation (shared-services/approval-service/app.py::_resume_kruxiaflow).
+  #
+  # It points at THIS workflow, not the parent: the child suspends, and the
+  # parent is separately suspended waiting on the child. Two levels of waiting,
+  # because there is no native composition.
+  - key: request_approval
+    worker: std
+    activity_name: http_request
+    parameters:
+      method: POST
+      url: "{{INPUT.approval_service_url}}/approval-requests"
+      body:
+        approval_request_id: "{{INPUT.approval_request_id}}"
+        order_id: "{{INPUT.order_id}}"
+        total_amount: "{{INPUT.total_amount}}"
+        customer_id: "{{INPUT.customer_id}}"
+        items_summary: "{{INPUT.items_summary}}"
+        provider: kruxiaflow
+        resume_data:
+          base_url: "{{INPUT.engine_internal_url}}"
+          workflow_id: "{{WORKFLOW.id}}"
+          activity_key: await_decision
+          event_name: approval_decision
+    depends_on:
+      - record_request
+
+  # ---- THE SUSPEND --------------------------------------------------------
+  # No worker held, no polling, no billed step. `echo` is a placeholder body:
+  # `wait_for_signal` runs BEFORE the activity body, so the activity's own work
+  # is irrelevant -- its job is to be the thing that waits.
+  - key: await_decision
+    worker: std
+    activity_name: echo
+    parameters:
+      message: "approval wait released for order {{INPUT.order_id}}"
+    settings:
+      wait_for_signal:
+        event_name: approval_decision
+        timeout_seconds: 120
+        on_timeout: skip      # `continue` is broken -- see header + finding 10
+    depends_on:
+      - request_approval
+
+  # ---- decided path (approved OR rejected) --------------------------------
+  # Reached only when a signal actually arrived, so {{SIGNAL.*}} is guaranteed
+  # to be defined here. That is the other reason to prefer this shape over
+  # `continue`: SIGNAL is only injected into the template context when signal
+  # data exists (core/src/workflow/template.rs:324), so a single activity
+  # handling both paths would have to defend against an undefined variable.
+  - key: record_decision
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        UPDATE {{INPUT.schema}}.approval_requests
+           SET status = $2, approver = $3, reason = $4, decided_at = NOW()
+         WHERE approval_request_id = $1
+        RETURNING approval_request_id, status
+      params:
+        - "{{INPUT.approval_request_id}}"
+        - "{{SIGNAL.decision}}"
+        - "{{SIGNAL.approver}}"
+        - "{{SIGNAL.reason}}"
+    depends_on:
+      - activity_key: await_decision
+        conditions:
+          - "{{await_decision.status == 'completed'}}"
+
+  - key: signal_parent_decided
+    worker: py-bakeoff
+    activity_name: signal_workflow
+    parameters:
+      api_url: "{{INPUT.api_url}}"
+      workflow_id: "{{INPUT.parent_workflow_id}}"
+      activity_key: "{{INPUT.parent_activity_key}}"
+      event_name: "{{INPUT.parent_event_name}}"
+      data:
+        approval_request_id: "{{INPUT.approval_request_id}}"
+        decision: "{{SIGNAL.decision}}"
+        approver: "{{SIGNAL.approver}}"
+        reason: "{{SIGNAL.reason}}"
+    settings:
+      retry:
+        max_attempts: 8
+        strategy: exponential
+        base_seconds: 1
+        factor: 2.0
+        max_seconds: 15
+    depends_on:
+      - record_decision
+
+  # ---- timeout path -------------------------------------------------------
+  # Nobody decided within timeout_seconds. Per the spec this is a compensation
+  # trigger, identical in effect to a rejection.
+  - key: record_timeout
+    worker: std
+    activity_name: postgres_query
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      query: |
+        UPDATE {{INPUT.schema}}.approval_requests
+           SET status = 'timeout',
+               reason = 'no decision within timeout',
+               decided_at = NOW()
+         WHERE approval_request_id = $1
+        RETURNING approval_request_id, status
+      params:
+        - "{{INPUT.approval_request_id}}"
+    depends_on:
+      - activity_key: await_decision
+        conditions:
+          - "{{await_decision.status == 'skipped'}}"
+
+  # Duplicated rather than shared with signal_parent_decided: multiple
+  # `depends_on` entries are ANDed and Kruxia Flow has no OR-join, so one
+  # shared successor of two mutually exclusive branches would wait forever.
+  - key: signal_parent_timeout
+    worker: py-bakeoff
+    activity_name: signal_workflow
+    parameters:
+      api_url: "{{INPUT.api_url}}"
+      workflow_id: "{{INPUT.parent_workflow_id}}"
+      activity_key: "{{INPUT.parent_activity_key}}"
+      event_name: "{{INPUT.parent_event_name}}"
+      data:
+        approval_request_id: "{{INPUT.approval_request_id}}"
+        decision: timeout
+        approver: ""
+        reason: "no decision within timeout"
+    settings:
+      retry:
+        max_attempts: 8
+        strategy: exponential
+        base_seconds: 1
+        factor: 2.0
+        max_seconds: 15
+    depends_on:
+      - record_timeout

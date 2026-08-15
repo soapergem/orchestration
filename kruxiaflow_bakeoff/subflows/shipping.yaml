@@ -1,0 +1,97 @@
+# DAG 4 sub-workflow — ShippingWorkflow (Kruxia Flow)
+#
+# Retry with error classification, against a service that fails three different
+# ways: 200 success, 503/504 transient, 422 InvalidAddress permanent.
+#
+# The interesting part is what is NOT here: a built-in `http_request` activity.
+# It cannot be used for this at all, because it does not fail on a non-2xx --
+# it returns `{status, success, body}` as a SUCCESSFUL output
+# (worker/src/activities/http.rs:307). A 503 therefore "completes", and
+# `settings.retry` never fires. So the retry policy below governs a CUSTOM
+# worker activity (worker.py::shipping_call) that re-raises the HTTP result as
+# a classified failure.
+#
+# That is the mirror image of the database story. Kruxia Flow's
+# postgres_query/postgres_transaction make DAG 3's and DAG 4's SQL fully
+# declarative -- better than any other YAML-defined tool here. Its http_request
+# makes any HTTP call needing retry semantics require code. Worth stating both
+# ways round in the comparison, because "no code required" is true of exactly
+# one of the two.
+
+name: kruxiaflow_dag4_sub_shipping
+
+activities:
+  - key: ship
+    worker: py-bakeoff
+    activity_name: shipping_call
+    parameters:
+      shipping_url: "{{INPUT.shipping_service_url}}"
+      order_id: "{{INPUT.order_id}}"
+      items: "{{INPUT.items}}"
+      shipping_address: "{{INPUT.shipping_address}}"
+      # Same key on every retry, so a carrier timeout that actually succeeded
+      # server-side cannot produce a second shipment.
+      idempotency_key: "ship-{{INPUT.order_id}}"
+    settings:
+      timeout_seconds: 30
+      retry:
+        max_attempts: 3        # spec: 3 retries + exponential backoff
+        strategy: exponential
+        base_seconds: 2
+        factor: 2.0
+        max_seconds: 20
+    # InvalidAddress is reported retryable=false by the activity, so it fails on
+    # attempt 1 regardless of max_attempts. That is the assertion this
+    # sub-workflow exists to make, and it is worker-side -- there is no
+    # error-type predicate on `retry:`.
+
+  - key: signal_parent_shipped
+    worker: py-bakeoff
+    activity_name: signal_workflow
+    parameters:
+      api_url: "{{INPUT.api_url}}"
+      workflow_id: "{{INPUT.parent_workflow_id}}"
+      activity_key: "{{INPUT.parent_activity_key}}"
+      event_name: "{{INPUT.parent_event_name}}"
+      data:
+        ok: true
+        shipment_id: "{{ship.result.shipment_id}}"
+        tracking_number: "{{ship.result.tracking_number}}"
+        carrier: "{{ship.result.carrier}}"
+        estimated_delivery: "{{ship.result.estimated_delivery}}"
+    settings:
+      retry:
+        max_attempts: 8
+        strategy: exponential
+        base_seconds: 1
+        factor: 2.0
+        max_seconds: 15
+    depends_on:
+      - ship
+
+  # Shipping failed -- either InvalidAddress immediately, or 503/504 after all
+  # attempts. The parent must be told, or it sits in `waiting` until its own
+  # timeout and reports "shipping never answered" instead of "shipping failed".
+  # This is the saga's third trigger path.
+  - key: signal_parent_failed
+    worker: py-bakeoff
+    activity_name: signal_workflow
+    parameters:
+      api_url: "{{INPUT.api_url}}"
+      workflow_id: "{{INPUT.parent_workflow_id}}"
+      activity_key: "{{INPUT.parent_activity_key}}"
+      event_name: "{{INPUT.parent_event_name}}"
+      data:
+        ok: false
+        reason: "shipping failed after retries"
+    settings:
+      retry:
+        max_attempts: 8
+        strategy: exponential
+        base_seconds: 1
+        factor: 2.0
+        max_seconds: 15
+    depends_on:
+      - activity_key: ship
+        conditions:
+          - "{{ship.status == 'failed'}}"

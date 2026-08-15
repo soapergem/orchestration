@@ -1,0 +1,126 @@
+# DAG 4 sub-workflow — InventoryReservationWorkflow (Kruxia Flow)
+#
+# Kruxia Flow has NO sub-workflow construct. Workflow chaining is Deferred
+# upstream (kruxiaflow-internal/docs/features/2026-01-08-workflow-chaining.md),
+# and the sanctioned pattern is "POST /api/v1/workflows from an http_request
+# activity" -- fire and forget. So this is an ordinary peer definition, and the
+# parent/child relationship is built by hand out of two HTTP calls:
+#
+#   parent: http_request POST /api/v1/workflows  (start me, passing its own id)
+#   child:  signal_workflow                       (tell the parent I'm done)
+#
+# The parent's `await_*` activity carries `wait_for_signal` and blocks in
+# `waiting` -- holding no worker -- until that signal lands.
+#
+# What this costs relative to a native construct (Conductor's SUB_WORKFLOW,
+# Temporal's child workflows): the parent cannot see the child's status, cannot
+# cancel it, gets no cascading failure, and the child must be told where to
+# signal. All four of those are free in the two tools this is compared against.
+
+name: kruxiaflow_dag4_sub_inventory_reservation
+
+activities:
+  # Atomic reservation in ONE statement, so the concurrent last-unit race
+  # (RARE-D seeds 2 units) resolves correctly under `serializable`:
+  #
+  #   * `existing` makes it idempotent per order_id -- re-running returns
+  #     already=1 and touches nothing, which is the spec's `idempotent=True`.
+  #   * the UPDATE's `available_quantity >= $qty` predicate is the guard; two
+  #     concurrent reservations for the last unit cannot both match.
+  #   * the INSERT selects FROM upd, so a reservation row exists only if stock
+  #     was actually decremented. No orphan reservations, ever.
+  - key: reserve
+    worker: std
+    activity_name: postgres_transaction
+    parameters:
+      db_url: "{{INPUT.db_url}}"
+      isolation_level: serializable
+      statements:
+        - query: |
+            WITH existing AS (
+              SELECT reservation_id FROM {{INPUT.schema}}.inventory_reservations
+               WHERE order_id = $1 AND sku = $2 AND status = 'reserved'
+            ), upd AS (
+              UPDATE {{INPUT.schema}}.inventory
+                 SET available_quantity = available_quantity - $3,
+                     reserved_quantity  = reserved_quantity  + $3
+               WHERE sku = $2
+                 AND available_quantity >= $3
+                 AND NOT EXISTS (SELECT 1 FROM existing)
+              RETURNING sku
+            ), ins AS (
+              INSERT INTO {{INPUT.schema}}.inventory_reservations
+                (reservation_id, order_id, sku, quantity, status)
+              SELECT $4, $1, $2, $3, 'reserved' FROM upd
+              ON CONFLICT (reservation_id) DO NOTHING
+              RETURNING reservation_id
+            )
+            SELECT
+              (SELECT count(*) FROM existing)::int AS already_reserved,
+              (SELECT count(*) FROM upd)::int      AS reserved,
+              (SELECT count(*) FROM ins)::int      AS rows_written,
+              COALESCE(
+                (SELECT reservation_id FROM existing),
+                (SELECT reservation_id FROM ins)
+              ) AS reservation_id,
+              (SELECT available_quantity FROM {{INPUT.schema}}.inventory WHERE sku = $2) AS remaining
+          params:
+            - "{{INPUT.order_id}}"
+            - "{{INPUT.sku}}"
+            - "{{INPUT.quantity}}"
+            - "{{INPUT.reservation_id}}"
+
+  # Return leg. Retries until the parent is actually waiting -- signals are not
+  # buffered, so an early signal is dropped with a 200 OK. See
+  # worker.py::signal_workflow.
+  - key: signal_parent
+    worker: py-bakeoff
+    activity_name: signal_workflow
+    parameters:
+      api_url: "{{INPUT.api_url}}"
+      workflow_id: "{{INPUT.parent_workflow_id}}"
+      activity_key: "{{INPUT.parent_activity_key}}"
+      event_name: "{{INPUT.parent_event_name}}"
+      data:
+        ok: true
+        reservation_id: "{{INPUT.reservation_id}}"
+        sku: "{{INPUT.sku}}"
+        quantity: "{{INPUT.quantity}}"
+        reserved: "{{reserve.result.results[0].rows[0].reserved}}"
+        already_reserved: "{{reserve.result.results[0].rows[0].already_reserved}}"
+        remaining: "{{reserve.result.results[0].rows[0].remaining}}"
+    settings:
+      retry:
+        max_attempts: 8
+        strategy: exponential
+        base_seconds: 1
+        factor: 2.0
+        max_seconds: 15
+    depends_on:
+      - reserve
+
+  # If the reservation statement itself failed (deadlock, serialization
+  # conflict, missing SKU), the parent must still be released -- otherwise it
+  # sits in `waiting` until its own timeout and reports the wrong cause.
+  - key: signal_parent_failure
+    worker: py-bakeoff
+    activity_name: signal_workflow
+    parameters:
+      api_url: "{{INPUT.api_url}}"
+      workflow_id: "{{INPUT.parent_workflow_id}}"
+      activity_key: "{{INPUT.parent_activity_key}}"
+      event_name: "{{INPUT.parent_event_name}}"
+      data:
+        ok: false
+        reason: "inventory reservation failed"
+    settings:
+      retry:
+        max_attempts: 8
+        strategy: exponential
+        base_seconds: 1
+        factor: 2.0
+        max_seconds: 15
+    depends_on:
+      - activity_key: reserve
+        conditions:
+          - "{{reserve.status == 'failed'}}"
