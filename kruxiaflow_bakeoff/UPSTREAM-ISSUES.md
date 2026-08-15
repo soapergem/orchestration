@@ -19,10 +19,6 @@ lab notebook in [README.md](README.md) carries the full reproduction for each.
 | 5 | Medium | **`POST /signal` answers HTTP 200 when the signal was dropped**, returning `{"signaled": false}`. Signals are not buffered, so one sent before the activity is `waiting` is discarded — and a caller checking the status code sees success. | [`postgres_subscription.rs:64`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/subscription/postgres_subscription.rs#L64) |
 | 6 | Feature | Declarative gaps: no OR-join, no per-activity `optional`/`allowFailure`, no retry jitter, `http_request` cannot participate in a retry policy, and custom-worker logs are captured nowhere. | [`definition.rs:874`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/workflow/definition.rs#L874), [`http.rs:364`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/worker/src/activities/http.rs#L364) |
 
-**Nothing was filed on the public tracker.**
-[`kruxia/kruxiaflow`](https://github.com/kruxia/kruxiaflow) has issues enabled and
-has never received one, so the maintainers were approached directly first.
-
 ## Why this matters to the bake-off
 
 Finding 1 is why **DAG 2 could not be implemented at all** and **DAG 4 was never
