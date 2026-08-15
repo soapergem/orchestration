@@ -10,7 +10,7 @@ The other eleven tools are not re-run.
 ## 2026-08-14
 
 ```
-[17:29] Completed: research -- read kruxiaflow + kruxiaflow-internal, established
+[17:29] Completed: research -- read the kruxiaflow source + its docs, established
         6 capability findings from source | Next: plan review | Progress: -
 [17:31] Completed: plan approved (both partners, all 4 DAGs, differentiator noted
         not built) | Next: Phase 0 infrastructure | Progress: 0/6 phases
@@ -91,7 +91,7 @@ does not have. The provisional score lives in `kruxiaflow-comparison.md` instead
 
 | File | Audience |
 |---|---|
-| `kruxiaflow-internal` branch `bakeoff-findings-2026-08-14` | **Kruxia Flow owner** — 5 bug docs + 1 feature doc + an umbrella note, in that repo's house format |
+| Reported upstream to the Kruxia Flow maintainers | **Kruxia Flow owner** — 5 bug reports + 1 feature request + an umbrella note, with reproductions and suggested fixes |
 | `kruxiaflow_bakeoff/UPSTREAM-ISSUES.md` | pointer/index to the above, so the trail is not lost |
 | `kruxiaflow-comparison.md` | **Orchestration repo owner** — head-to-head vs Temporal and Conductor, provisional scoring |
 | `kruxiaflow_bakeoff/README.md` | lab notebook — 12 findings, DAG 3 evidence table |

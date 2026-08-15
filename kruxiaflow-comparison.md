@@ -13,8 +13,7 @@ because architecturally the two are near-twins.
 > **DAG 3 is fully verified. DAG 2 and DAG 4 are blocked by an engine defect and
 > DAG 1 was not reached.** `wait_for_signal` — the suspend/resume primitive — 
 > cannot complete: a signalled activity always fails
-> (filed upstream as `kruxiaflow-internal` →
-> `docs/bugs/2026-08-14-wait-for-signal-resume-fails.md`). Testing stopped there rather
+> (reported upstream to the Kruxia Flow maintainers). Testing stopped there rather
 > than re-implementing DAG 2 and DAG 4 as polling workarounds, because that
 > would have measured a workaround the tool does not advertise and converted its
 > best category into its worst on the basis of a bug that is a few lines from
@@ -63,7 +62,7 @@ no authentication worth the name in their open-source form.
 | Worker model | HTTP poll; Rust + Python SDKs | HTTP poll; six SDKs |
 | Worker process cost | one process, asyncio | **one OS process per task type** (26 measured at 1.72 GB idle) |
 | Sub-workflows | **none** — chaining is Deferred; fake it with HTTP + signal | `SUB_WORKFLOW` task, native |
-| Dynamic fan-out | **none** — `parallel_for_each` is Proposed, unimplemented | `FORK_JOIN_DYNAMIC`, native |
+| Dynamic fan-out | **none** — no fan-out construct exists in the source | `FORK_JOIN_DYNAMIC`, native |
 | Suspend/resume | `wait_for_signal` + declarative `on_timeout` — **broken in 0.8.3** | `WAIT` task; one unauthenticated POST; works |
 | Wait timeout | declarative `on_timeout: continue\|skip\|fail` — `continue` broken | sweeper-enforced, **fires late** (60s measured at 103s) |
 | Retry classification | **worker-side `retryable` flag** — verified exact | `FAILED_WITH_TERMINAL_ERROR` |
@@ -239,5 +238,5 @@ On this machine `just` is not installed and podman has no VM, so each recipe was
 run as its raw `docker compose` equivalent with `CONTAINER_RUNNER=docker`. Full
 notes, all twelve findings, and the DAG 3 evidence table are in
 `kruxiaflow_bakeoff/README.md`; the upstream-facing bug reports with minimal
-reproductions were filed upstream in `kruxiaflow-internal` (branch
-`bakeoff-findings-2026-08-14`); `kruxiaflow_bakeoff/UPSTREAM-ISSUES.md` indexes them.
+reproductions were reported upstream to the Kruxia Flow maintainers and are
+summarised in `kruxiaflow_bakeoff/UPSTREAM-ISSUES.md`.

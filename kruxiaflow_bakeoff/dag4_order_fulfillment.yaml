@@ -9,10 +9,11 @@
 #
 # HOW COMPOSITION IS FAKED
 #
-# Kruxia Flow has no sub-workflow construct; chaining is Deferred upstream
-# (kruxiaflow-internal/docs/features/2026-01-08-workflow-chaining.md) and the
-# sanctioned pattern is a fire-and-forget POST. Waiting for a child therefore
-# takes a pair of activities:
+# Kruxia Flow has no sub-workflow construct -- nothing on ActivityDefinition
+# (core/src/workflow/definition.rs:632), nothing in the built-in activity
+# registry (worker/src/std_worker.rs). Starting a child is therefore a plain
+# `http_request` POST to the API, and waiting for one takes a pair of
+# activities:
 #
 #   start_X   http_request POST /api/v1/workflows, passing {{WORKFLOW.id}} so
 #             the child knows who to answer

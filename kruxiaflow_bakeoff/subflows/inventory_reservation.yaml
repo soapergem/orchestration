@@ -1,10 +1,9 @@
 # DAG 4 sub-workflow — InventoryReservationWorkflow (Kruxia Flow)
 #
-# Kruxia Flow has NO sub-workflow construct. Workflow chaining is Deferred
-# upstream (kruxiaflow-internal/docs/features/2026-01-08-workflow-chaining.md),
-# and the sanctioned pattern is "POST /api/v1/workflows from an http_request
-# activity" -- fire and forget. So this is an ordinary peer definition, and the
-# parent/child relationship is built by hand out of two HTTP calls:
+# Kruxia Flow has NO sub-workflow construct. There is no such field on
+# ActivityDefinition (core/src/workflow/definition.rs:632) and no such activity
+# in the built-in registry (worker/src/std_worker.rs), so composition has to be
+# built by hand out of two HTTP calls:
 #
 #   parent: http_request POST /api/v1/workflows  (start me, passing its own id)
 #   child:  signal_workflow                       (tell the parent I'm done)

@@ -4,17 +4,18 @@
 engine defect (finding 10) and DAG 1 was not reached. Evaluation stopped
 deliberately at that point rather than measuring workarounds.**
 
-> **The engine defects were filed upstream, in `kruxiaflow-internal`** — they are
-> Kruxia Flow's feedback, not the bake-off's. See
-> **[UPSTREAM-ISSUES.md](UPSTREAM-ISSUES.md)** for the index and where each one
-> landed. The head-to-head against Temporal and Conductor is in
+> **The engine defects were reported upstream to the Kruxia Flow maintainers** —
+> they are Kruxia Flow's feedback, not the bake-off's. See
+> **[UPSTREAM-ISSUES.md](UPSTREAM-ISSUES.md)** for the summary. The head-to-head against Temporal and Conductor is in
 > **[../kruxiaflow-comparison.md](../kruxiaflow-comparison.md)**.
 >
 > What stays in *this* file is the lab notebook: the findings as evidence for
 > scoring, with the reproductions that produced them.
 
 Kruxia Flow v0.8.3 — a Rust durable-execution engine, one binary plus PostgreSQL.
-Source at `../kruxiaflow`, internal docs at `../kruxiaflow-internal`.
+Source: [`kruxia/kruxiaflow`](https://github.com/kruxia/kruxiaflow) — every code
+citation below links to that repo at commit `75f9a77`, the public HEAD when this
+was written.
 
 Unlike the other twelve entries, this one exists to be compared against **two**
 tools rather than scored against all of them: **Temporal** (88 — the category
@@ -140,10 +141,9 @@ class this bake-off keeps finding across tools (Argo retrying a declined card,
 Kestra's missing resume URL), and it is the worst-behaved instance so far
 because it corrupts *data* rather than control flow.
 
-There is a resolved bug report for the same symptom on other types
-(`kruxiaflow-internal/docs/bugs/fixed/2026-01-06-postgres-query-output-null-values.md`),
-fixed by extending this same ladder — so the fix pattern is known and the ladder
-was simply never completed.
+The maintainers have previously fixed the same symptom on a different set of
+types by extending this same ladder, so the fix pattern is established — the
+ladder was simply never completed.
 
 *Workaround used throughout this implementation*: cast every money column
 `::float8` and every timestamp `::text` in the SQL, and do all arithmetic
@@ -185,10 +185,9 @@ comparison:
 
 An activity with two `depends_on` entries waits for **both**. There is no
 `any`/`or` join, so a single shared successor of two mutually exclusive branches
-waits forever — the hang documented in
-`kruxiaflow-internal/docs/bugs/archived/2026-01-08-unconditional-deps-on-exclusive-paths.md`,
-whose resolution was to expose `{{dep.status}}` so authors can write explicit
-conditions, not to add an OR-join.
+waits forever. The sanctioned answer is to write explicit `{{dep.status == ...}}`
+conditions on each incoming edge — which guards an activity but does not
+*converge* paths, so every convergence point must be duplicated per branch.
 
 The practical cost in DAG 3: the failure notification exists **twice**
 (`notify_validation_failure`, `notify_payment_failure`) because one shared
@@ -391,13 +390,12 @@ this comparison because it exercises the fewest orchestration primitives.
 
 ### 12. No dynamic fan-out (established from source, not from a run)
 
-`parallel_for_each` is a *Proposed*, unimplemented feature
-(`kruxiaflow-internal/docs/features/2026-02-07-parallel-iteration.md`); there are
-zero references to it in the Rust tree and no such field on `ActivityDefinition`
-([`core/src/workflow/definition.rs:632`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/workflow/definition.rs#L632)). Parallelism is static — sibling
+There are zero references to any fan-out construct in the Rust tree and no such
+field on `ActivityDefinition` ([`core/src/workflow/definition.rs:632`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/workflow/definition.rs#L632)). Parallelism is static — sibling
 activities with no dependency between them run concurrently — and back-edge
-loops are strictly sequential, with "parallel iterations" listed as post-MVP in
-`docs/loops-guide.md`.
+loops are strictly sequential, with **"Parallel iterations: Multiple iterations
+executing simultaneously"** listed under Future Enhancements (Post-MVP) in
+[`docs/loops-guide.md`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/docs/loops-guide.md#future-enhancements-post-mvp).
 
 So DAG 1's per-CSV map and DAG 2's 30-item fan-out have no orchestrator-level
 expression at all. The honest fallback is one activity doing the fan-out
