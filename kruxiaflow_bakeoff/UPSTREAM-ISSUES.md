@@ -9,13 +9,13 @@ Filed in `kruxiaflow-internal` on branch `bakeoff-findings-2026-08-14`:
 
 | Doc | Severity | One line |
 |---|---|---|
-| `docs/notes/2026-08-14-orchestration-bakeoff-findings.md` | — | Umbrella: context, index, and what worked well |
-| `docs/bugs/2026-08-14-wait-for-signal-resume-fails.md` | **Blocker** | A signalled activity always fails — the resume path never consumes the subscription |
-| `docs/bugs/2026-08-14-signal-template-resolution-poisons-workflow.md` | High | `{{SIGNAL.*}}` in a waiting activity's params hangs the workflow in `created` forever |
-| `docs/bugs/2026-08-14-postgres-query-null-for-numeric-and-timestamptz.md` | High | Money and timestamps silently decode as `null` |
-| `docs/bugs/2026-08-14-latest-tag-is-0.3.0-quickstart-broken.md` | High | The public quickstart cannot work; `latest` is six months stale |
-| `docs/bugs/2026-08-14-signal-api-returns-200-when-dropped.md` | Medium | A dropped signal is reported as HTTP 200 |
-| `docs/features/2026-08-14-declarative-workflow-gaps.md` | Feature | OR-join, `optional`, retry jitter, `http_request` retry classification, worker log capture |
+| [`docs/notes/2026-08-14-orchestration-bakeoff-findings.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/notes/2026-08-14-orchestration-bakeoff-findings.md) | — | Umbrella: context, index, and what worked well |
+| [`docs/bugs/2026-08-14-wait-for-signal-resume-fails.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/bugs/2026-08-14-wait-for-signal-resume-fails.md) | **Blocker** | A signalled activity always fails — the resume path never consumes the subscription |
+| [`docs/bugs/2026-08-14-signal-template-resolution-poisons-workflow.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/bugs/2026-08-14-signal-template-resolution-poisons-workflow.md) | High | `{{SIGNAL.*}}` in a waiting activity's params hangs the workflow in `created` forever |
+| [`docs/bugs/2026-08-14-postgres-query-null-for-numeric-and-timestamptz.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/bugs/2026-08-14-postgres-query-null-for-numeric-and-timestamptz.md) | High | Money and timestamps silently decode as `null` |
+| [`docs/bugs/2026-08-14-latest-tag-is-0.3.0-quickstart-broken.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/bugs/2026-08-14-latest-tag-is-0.3.0-quickstart-broken.md) | High | The public quickstart cannot work; `latest` is six months stale |
+| [`docs/bugs/2026-08-14-signal-api-returns-200-when-dropped.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/bugs/2026-08-14-signal-api-returns-200-when-dropped.md) | Medium | A dropped signal is reported as HTTP 200 |
+| [`docs/features/2026-08-14-declarative-workflow-gaps.md`](https://github.com/kruxia/kruxiaflow-internal/blob/bakeoff-findings-2026-08-14/docs/features/2026-08-14-declarative-workflow-gaps.md) | Feature | OR-join, `optional`, retry jitter, `http_request` retry classification, worker log capture |
 
 **Nothing was filed on the public tracker.** `kruxia/kruxiaflow` has issues
 enabled and has never received one (`totalCount: 0`), so the internal repo is

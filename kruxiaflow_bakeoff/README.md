@@ -80,7 +80,7 @@ good, and only the stale tag made it look otherwise.
 ### 2. `--insecure-dev` governs request auth, not boot requirements
 
 `serve` hard-fails at startup without an OAuth RSA private key *and* a client
-secret regardless of the flag (`kruxiaflow/src/commands/serve.rs:298-306`,
+secret regardless of the flag ([`kruxiaflow/src/commands/serve.rs:298-306`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/kruxiaflow/src/commands/serve.rs#L298-L306),
 `.unwrap()` at :641). So the `keygen` one-shot is mandatory even in dev mode, and
 "no auth needed" is true of the API and not of the deployment. The compose profile
 mirrors upstream's `keygen` + `catalog` one-shots for this reason; both exit
@@ -118,7 +118,7 @@ Verified against 0.8.3. **NUMERIC and TIMESTAMPTZ both come back as JSON
 `null`** — no error, no warning, no log line.
 
 Root cause is direct and structural: `row_to_json`
-(`worker/src/activities/postgres.rs:186-282`) is a hand-written type ladder
+([`worker/src/activities/postgres.rs:186-282`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/worker/src/activities/postgres.rs#L186-L282)) is a hand-written type ladder
 trying `try_get::<T>` for UUID, String, i16, i32, i64, f32, f64, bool and
 `serde_json::Value` in order, ending in
 
@@ -212,7 +212,7 @@ partially failed. That is a real audit-trail cost.
 ### 8. `RetryPolicy` has no jitter
 
 `max_attempts`, `strategy: exponential|fixed`, `base_seconds`, `factor`,
-`max_seconds` — and nothing else (`core/src/workflow/definition.rs:874`). The
+`max_seconds` — and nothing else ([`core/src/workflow/definition.rs:874`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/workflow/definition.rs#L874)). The
 spec asks for backoff **plus jitter**; backoff here is deterministic, so N
 workflows failing on the same downstream outage retry in lockstep. Luigi, of all
 things, hand-rolls FULL jitter in application code and Kruxia Flow cannot express
@@ -261,7 +261,7 @@ Traced step by step against the database:
    `signal_data` becomes `{"approved": true}`. Correct.
 3. The orchestrator re-evaluates the activity as ready and **re-enters the
    scheduling branch that creates the subscription**
-   (`core/src/orchestrator/orchestrator.rs:1522-1535`), which is an
+   ([`core/src/orchestrator/orchestrator.rs:1522-1535`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/orchestrator/orchestrator.rs#L1522-L1535)), which is an
    unconditional `if let Some(wait_settings) = …wait_for_signal { …
    create_subscription(…) }` with no check for an already-satisfied wait. The
    insert violates the uniqueness constraint and the activity fails.
@@ -394,7 +394,7 @@ this comparison because it exercises the fewest orchestration primitives.
 `parallel_for_each` is a *Proposed*, unimplemented feature
 (`kruxiaflow-internal/docs/features/2026-02-07-parallel-iteration.md`); there are
 zero references to it in the Rust tree and no such field on `ActivityDefinition`
-(`core/src/workflow/definition.rs:632`). Parallelism is static — sibling
+([`core/src/workflow/definition.rs:632`](https://github.com/kruxia/kruxiaflow/blob/75f9a77/core/src/workflow/definition.rs#L632)). Parallelism is static — sibling
 activities with no dependency between them run concurrently — and back-edge
 loops are strictly sequential, with "parallel iterations" listed as post-MVP in
 `docs/loops-guide.md`.

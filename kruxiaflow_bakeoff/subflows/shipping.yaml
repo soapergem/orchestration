@@ -6,7 +6,8 @@
 # The interesting part is what is NOT here: a built-in `http_request` activity.
 # It cannot be used for this at all, because it does not fail on a non-2xx --
 # it returns `{status, success, body}` as a SUCCESSFUL output
-# (worker/src/activities/http.rs:307). A 503 therefore "completes", and
+# (`HttpResponse` at worker/src/activities/http.rs:130; the main path returns an
+# unconditional `Ok(...)` at :364). A 503 therefore "completes", and
 # `settings.retry` never fires. So the retry policy below governs a CUSTOM
 # worker activity (worker.py::shipping_call) that re-raises the HTTP result as
 # a classified failure.

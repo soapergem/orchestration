@@ -159,7 +159,9 @@ async def shipping_call(params: dict, ctx: ActivityContext) -> ActivityResult:
     repetition is the finding: **the built-in ``http_request`` activity cannot
     participate in a retry policy at all.** It returns non-2xx as a *successful*
     output carrying ``{status, success, body}``
-    (worker/src/activities/http.rs:307), so a 503 and a 422 both "complete" and
+    (`HttpResponse` at worker/src/activities/http.rs:130; the main path's only
+    non-error exit is an unconditional `Ok(...)` at :364), so a 503 and a 422
+    both "complete" and
     ``settings.retry`` never fires. Any HTTP call in Kruxia Flow that needs
     retry-with-classification must therefore be reimplemented in a custom
     worker -- which quietly undoes a chunk of the "no code required" story that

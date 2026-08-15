@@ -28,7 +28,7 @@ because architecturally the two are near-twins.
 
 ## What Kruxia Flow is
 
-A single ~13 MB Rust binary plus PostgreSQL. The API server, orchestrator,
+A single Rust binary well under 100 MB, plus PostgreSQL. The API server, orchestrator,
 built-in worker pool and cost tracker are threads in one process; Postgres is the
 event store, the activity queue, the definition registry and the blob store.
 There is nothing else to run.
@@ -59,7 +59,7 @@ no authentication worth the name in their open-source form.
 | | Kruxia Flow 0.8.3 | Conductor 3.31.0 |
 |---|---|---|
 | Definition | YAML/JSON, versioned server-side, idempotent by content hash | JSON, versioned server-side |
-| Engine footprint | **one 13 MB binary + Postgres**; ready in <1s | JVM container + Postgres; ~60s start |
+| Engine footprint | **one small static binary + Postgres**; "ready" logged at 0.996s | JVM container + Postgres; compose allows it a 60s healthcheck grace |
 | Worker model | HTTP poll; Rust + Python SDKs | HTTP poll; six SDKs |
 | Worker process cost | one process, asyncio | **one OS process per task type** (26 measured at 1.72 GB idle) |
 | Sub-workflows | **none** — chaining is Deferred; fake it with HTTP + signal | `SUB_WORKFLOW` task, native |
@@ -114,7 +114,7 @@ This is the comparison Kruxia Flow invites, and it is the harder one.
 | Suspend/resume | `wait_for_signal` — **broken in 0.8.3** | signals; first-class; verified here incl. `kill -9` mid-approval |
 | Error handling | condition on `{{dep.status == 'failed'}}`; workflow still ends `failed` | try/catch; a handled failure ends **`Completed`** |
 | Languages | 2 SDKs (Rust, Python) | 6+ |
-| Footprint | **1 binary + Postgres** | 7+ components (or Temporal Cloud) |
+| Footprint | **1 binary + Postgres** | 3 compose services here (server, UI, worker) on the auto-setup image; heavier to self-host properly |
 | Definition registry | **yes — you can ask "what is deployed?"** | **no registry at all** (0 in the visibility count) |
 | Defects found here | 11 engine-level, 1 blocker | **0** |
 
