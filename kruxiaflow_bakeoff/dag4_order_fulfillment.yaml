@@ -2,10 +2,21 @@
 #                                                    (Kruxia Flow, CHAINED shape)
 #
 # This is the composed version: three real sub-workflow definitions in
-# subflows/, started over HTTP and awaited by signal. `dag4_order_fulfillment_flat.yaml`
-# is the same behaviour in ONE definition with the children inlined, so the two
-# can be compared directly -- that comparison is the measurement of what Kruxia
-# Flow's missing sub-workflow construct actually costs.
+# subflows/, started over HTTP and awaited by signal.
+#
+# NOT VERIFIED. This file and all three subflows/ deploy cleanly but have NEVER
+# BEEN RUN, because both the approval step and the child->parent return leg
+# depend on `wait_for_signal`, which cannot complete on 0.8.3 (see
+# UPSTREAM-ISSUES.md finding 1). Read this as a design record of what
+# composition and saga compensation have to look like in a tool with no
+# sub-workflow construct and no OR-join -- not as working code. On the evidence
+# of every other tool in this bake-off, four unrun workflow definitions contain
+# several defects.
+#
+# A flat single-definition variant was planned alongside this one, to measure
+# what the missing sub-workflow construct costs in lines and moving parts. It
+# was not built: with the composed version unrunnable, the comparison would have
+# been between two untested files.
 #
 # HOW COMPOSITION IS FAKED
 #
