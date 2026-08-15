@@ -11,12 +11,12 @@
 #
 # WHY THIS EXISTS
 #
-# The 12 runners are spread across THREE databases, and the earlier recipes
+# The 13 runners are spread across THREE databases, and the earlier recipes
 # hardcoded `compose exec postgres`, so they silently operated on the local pod
 # no matter which runner you named:
 #
 #   local pod :54321        airflow dagster prefect luigi temporal hatchet
-#                           kestra conductor
+#                           kestra conductor kruxiaflow
 #   in-cluster postgres     argo flyte        (bakeoff-postgres, ns orchestrators)
 #   Neon (public)           stepfunctions google_workflows
 #
@@ -52,7 +52,7 @@ INIT_SQL_MOUNTED="/docker-entrypoint-initdb.d/00-init-db.sql"
 ORCH_NS="${ORCH_NS:-orchestrators}"
 CLUSTER_PG_DEPLOY="deploy/bakeoff-postgres"
 
-LOCAL_RUNNERS="airflow dagster prefect luigi temporal hatchet kestra conductor"
+LOCAL_RUNNERS="airflow dagster prefect luigi temporal hatchet kestra conductor kruxiaflow"
 CLUSTER_RUNNERS="argo flyte"
 NEON_RUNNERS="stepfunctions google_workflows"
 ALL_RUNNERS="$LOCAL_RUNNERS $CLUSTER_RUNNERS $NEON_RUNNERS"

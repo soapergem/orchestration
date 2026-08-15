@@ -24,7 +24,7 @@ container_sock := env("CONTAINER_SOCK", `if [ -S /var/run/docker.sock ]; then ec
 # podman-compose (both verified 2026-08-09), so the list has to be explicit.
 #
 # ADD NEW ENGINES HERE when you add a profile to docker-compose.yml.
-all_profiles := "--profile temporal --profile hatchet --profile kestra --profile conductor"
+all_profiles := "--profile temporal --profile hatchet --profile kestra --profile conductor --profile kruxiaflow"
 
 # The engine SERVERS that `up-all` starts, named explicitly.
 #
@@ -39,7 +39,12 @@ all_profiles := "--profile temporal --profile hatchet --profile kestra --profile
 # `--scale temporal-worker=0` was tried first and does NOT reliably suppress a
 # service here (podman-compose started it anyway, 2026-08-09) -- naming the
 # services is the only form that held. ADD NEW ENGINE SERVERS HERE.
-all_engines := "temporal temporal-ui hatchet-engine kestra conductor-server"
+#
+# kruxiaflow's two one-shots (keygen, catalog) are deliberately NOT listed:
+# naming them here would make `up-all` block on services that exit, and the
+# `depends_on: service_completed_successfully` on `kruxiaflow` already pulls
+# them in and orders them correctly.
+all_engines := "temporal temporal-ui hatchet-engine kestra conductor-server kruxiaflow"
 
 # The profile-less backbone, spelled out so `up-all` can be ONE compose command.
 # Doing it as two (`up -d` then `up -d <engines>`) makes the second invocation
@@ -53,7 +58,7 @@ default:
     @just --list | grep -v "^    default$"
 
 # Only ONE profile can be passed, and it must be one defined in
-# docker-compose.yml (temporal|hatchet|kestra|conductor). Use `up-all` for every
+# docker-compose.yml (temporal|hatchet|kestra|conductor|kruxiaflow). Use `up-all` for every
 # engine at once -- they no longer contend for host ports (RUNNING.md §0).
 
 # Start the backbone (postgres + mocks); pass a profile to add one engine.

@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     kestra_password: SecretStr | None = None
     # Conductor OSS has no authentication at all, so no credentials here.
     conductor_url: str = "http://conductor-server:8080"
+    # Kruxia Flow runs with KRUXIAFLOW_INSECURE_DEV=true locally, so the signal
+    # endpoint takes no credentials either. Container-internal port is 8080; the
+    # 8100 in RUNNING.md §0 is the HOST publication of it.
+    kruxiaflow_url: str = "http://kruxiaflow:8080"
 
     model_config = SettingsConfigDict(case_sensitive=False)
 
@@ -52,6 +56,7 @@ class Provider(str, Enum):
     kestra = "kestra"  # resume_data: {execution_id, tenant?}
     conductor = "conductor"  # resume_data: {workflow_id, task_ref_name, base_url?}
     google_workflows = "google_workflows"  # resume_data: {callback_url}, needs a GCP token
+    kruxiaflow = "kruxiaflow"  # resume_data: {workflow_id, activity_key, event_name, base_url?}
 
 
 class ApprovalRequest(BaseModel):
@@ -80,6 +85,12 @@ class ApprovalRequest(BaseModel):
                 self.provider = Provider.stepfunctions
             elif self.resume_data.get("execution_id"):
                 self.provider = Provider.kestra
+            # kruxiaflow MUST be tested before conductor: both carry a
+            # `workflow_id`, so the old ordering would silently route a Kruxia
+            # Flow resume at Conductor and POST an activity signal to a task
+            # endpoint that does not exist. `event_name` is the discriminator.
+            elif self.resume_data.get("event_name"):
+                self.provider = Provider.kruxiaflow
             elif self.resume_data.get("workflow_id"):
                 self.provider = Provider.conductor
             elif self.resume_data.get("callback_url"):
@@ -87,7 +98,8 @@ class ApprovalRequest(BaseModel):
             else:
                 raise ValueError(
                     "cannot infer provider: supply `provider` or a resume_data "
-                    "with task_token / execution_id / workflow_id / callback_url"
+                    "with task_token / execution_id / event_name / workflow_id / "
+                    "callback_url"
                 )
         return self
 
@@ -192,6 +204,70 @@ async def _resume_conductor(resume_data: dict, payload: dict) -> dict:
     }
 
 
+async def _resume_kruxiaflow(resume_data: dict, payload: dict) -> dict:
+    """Signal a suspended Kruxia Flow activity.
+
+    ``POST /api/v1/workflows/{workflow_id}/signal`` with
+    ``{activity_key, event_name, data}``. The activity is parked in ``waiting``
+    holding no worker slot, and this one call releases it with ``data``
+    available to the workflow as the activity's signal payload.
+
+    This is the simplest resume of any provider here, tied with Conductor: one
+    unauthenticated POST, no SDK, no token, no relay process. Unlike Conductor
+    it also needs no task *reference* bookkeeping -- the activity key is already
+    in the workflow definition. Both are unauthenticated for the same reason
+    though: Conductor OSS has no auth at all, whereas Kruxia Flow is running
+    with ``KRUXIAFLOW_INSECURE_DEV=true``. Its default is OAuth2 on every
+    request, so a real deployment would need a bearer token here.
+
+    Approved and rejected both resume normally -- the decision travels in the
+    signal ``data`` and DAG 4 branches on it, matching every other provider.
+    """
+    workflow_id = resume_data.get("workflow_id")
+    activity_key = resume_data.get("activity_key")
+    event_name = resume_data.get("event_name")
+    missing = [
+        name
+        for name, value in (
+            ("workflow_id", workflow_id),
+            ("activity_key", activity_key),
+            ("event_name", event_name),
+        )
+        if not value
+    ]
+    if missing:
+        raise HTTPException(400, f"resume_data missing {' / '.join(missing)}")
+
+    base = (resume_data.get("base_url") or settings.kruxiaflow_url).rstrip("/")
+    url = f"{base}/api/v1/workflows/{workflow_id}/signal"
+    body = {"activity_key": activity_key, "event_name": event_name, "data": payload}
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(url, json=body)
+
+    # HTTP 200 DOES NOT MEAN THE WORKFLOW WAS RESUMED. Kruxia Flow's signal
+    # endpoint returns 200 with {"signaled": false, "message": "No waiting
+    # activity found"} when nothing matched -- the signal is silently dropped
+    # rather than buffered (core/src/subscription/postgres_subscription.rs:64
+    # is a bare UPDATE ... WHERE on an existing subscription row). A resume
+    # fired before the activity reaches `waiting`, or after its timeout already
+    # fired, lands in exactly that case. Reporting only the status code would
+    # make a lost resume look like a delivered one, which is how DAG 4's
+    # "approval timed out" lies about a plumbing failure elsewhere.
+    signaled = False
+    try:
+        signaled = bool(resp.json().get("signaled"))
+    except Exception:  # noqa: BLE001 - non-JSON body is itself a failure signal
+        pass
+
+    return {
+        "action": "kruxiaflow_signal",
+        "event_name": event_name,
+        "callback_status": resp.status_code,
+        "signaled": signaled,
+        "delivered": resp.is_success and signaled,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Google Workflows resume support
 # ---------------------------------------------------------------------------
@@ -278,6 +354,9 @@ async def _dispatch_resume(record: ApprovalRecord) -> dict:
 
     if record.provider == Provider.conductor:
         return await _resume_conductor(record.resume_data, payload)
+
+    if record.provider == Provider.kruxiaflow:
+        return await _resume_kruxiaflow(record.resume_data, payload)
 
     if record.provider == Provider.google_workflows:
         return await _resume_google_workflows(record.resume_data, payload)
